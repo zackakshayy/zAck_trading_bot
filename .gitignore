@@ -1,9 +1,13 @@
 # Configuration files with sensitive data
 config.yaml
-config.yaml
+.env
 rag_service.py
 test_order.py
 test_fno_order.py
+
+# Persisted runtime state
+state/
+ngrok
 
 # Output folder containing trade logs and other artifacts
 output/

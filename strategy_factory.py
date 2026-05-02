@@ -10,6 +10,7 @@ from indicators import (
 
 class BaseStrategy:
     """Base class for all trading strategies."""
+
     def __init__(self, kite, config):
         self.kite = kite
         self.config = config

@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 import time
 from kiteconnect.exceptions import DataException, NetworkException
+from infra import get_instrument_token
 
 class EconomicCalendar:
     """
@@ -93,14 +94,18 @@ class MarketConditionIdentifier:
         self.nifty_token = self._get_instrument_token('NIFTY 50', 'NSE')
 
     def _get_instrument_token(self, name, exchange):
-        """Helper to find instrument token with a retry mechanism."""
-        for i in range(3): # Retry up to 3 times
+        """Helper to find instrument token using the shared session-wide cache."""
+        for attempt in range(3):
             try:
-                instruments = self.kite.instruments(exchange)
-                return [i['instrument_token'] for i in instruments if i['tradingsymbol'] == name][0]
+                return get_instrument_token(self.kite, name, exchange)
+            except KeyError:
+                # Symbol genuinely not found — no benefit to retrying.
+                raise ConnectionError(f"Instrument {name!r} not found on {exchange}.")
             except (DataException, NetworkException) as e:
-                logging.warning(f"Attempt {i+1}/3: Failed to fetch instruments for {exchange}. Retrying... Error: {e}")
-                time.sleep(2 * (i + 1)) # Wait for 2, 4, 6 seconds
+                logging.warning(
+                    f"Attempt {attempt+1}/3: instrument fetch for {exchange} failed: {e}; retrying."
+                )
+                time.sleep(2 * (attempt + 1))
         raise ConnectionError(f"Could not fetch instruments for {exchange} after multiple retries.")
 
     def get_conditions_for_date(self, target_date):

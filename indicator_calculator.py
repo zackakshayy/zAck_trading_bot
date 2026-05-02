@@ -47,5 +47,14 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
         df['bb_bandwidth'] = bbands['BBB_20_2.0']
         df['bb_bandwidth_ma'] = df['bb_bandwidth'].rolling(window=20).mean()
 
-    df.fillna(0, inplace=True) # Clean up any NaNs produced by indicators
+    # PSAR for indicator-based exits (long_psar = trailing stop for long positions).
+    psar = ta.psar(df['high'], df['low'], df['close'], af=0.02, max_af=0.2)
+    if psar is not None and not psar.empty:
+        psar_long_col = next((c for c in psar.columns if c.startswith('PSARl_')), None)
+        psar_short_col = next((c for c in psar.columns if c.startswith('PSARs_')), None)
+        if psar_long_col:
+            df['psar_long'] = psar[psar_long_col]
+        if psar_short_col:
+            df['psar_short'] = psar[psar_short_col]
+
     return df
