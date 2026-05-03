@@ -25,13 +25,23 @@ import pandas_ta as ta
 from kiteconnect import KiteConnect, exceptions
 
 from infra import (
+    append_iv_snapshot,
     atomic_write_json,
+    compute_ivr,
     get_instruments,
     read_json,
     retry_call,
     safe_ltp,
     state_path,
     tick_round,
+)
+from option_chain import (
+    build_chain_snapshot,
+    fetch_chain_quote,
+    find_atm_row,
+    passes_liquidity,
+    realized_vol,
+    select_by_delta,
 )
 from rag_service import RAGService
 
@@ -219,6 +229,10 @@ class OrderExecutionAgent:
 
         self.underlying_token = self._lookup_underlying_token(self.flags["underlying_instrument"])
 
+        # Lazy session-scoped cache for daily bars (used only by realized-vol gate).
+        self._daily_bars_cache = None
+        self._daily_bars_cached_at_date = None
+
     # ---------- helpers ----------
 
     def _lookup_underlying_token(self, name: str) -> int:
@@ -362,6 +376,196 @@ class OrderExecutionAgent:
 
     # ---------- sizing ----------
 
+    async def _fetch_daily_bars(self) -> Optional[pd.DataFrame]:
+        """Cached for the session — used by the IV/RV gate."""
+        today = datetime.date.today()
+        if (self._daily_bars_cache is not None
+                and self._daily_bars_cached_at_date == today):
+            return self._daily_bars_cache
+        rv_lookback = int(self.config.get("option_filters", {}).get("rv_lookback_days", 20))
+        days_back = max(60, rv_lookback * 3)
+        try:
+            hist = await asyncio.to_thread(
+                self.kite.historical_data, self.underlying_token,
+                today - datetime.timedelta(days=days_back), today, "day",
+            )
+            df = pd.DataFrame(hist)
+            if df.empty:
+                self._daily_bars_cache = df
+                self._daily_bars_cached_at_date = today
+                return df
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+            self._daily_bars_cache = df
+            self._daily_bars_cached_at_date = today
+            return df
+        except Exception as e:
+            logging.warning(f"Daily-bars fetch failed: {e}")
+            return None
+
+    def _candidate_symbols(self, atm_strike: float, option_type: str,
+                            expiry_date, span: int = 5) -> list:
+        """Returns up to (2*span+1) tradingsymbols around ATM for one option_type."""
+        step = self._strike_step()
+        targets = {atm_strike + i * step for i in range(-span, span + 1)}
+        df = self.nfo_instruments[
+            (self.nfo_instruments["strike"].isin(targets))
+            & (self.nfo_instruments["instrument_type"] == option_type)
+            & (self.nfo_instruments["expiry_date"] == expiry_date)
+        ]
+        return df["tradingsymbol"].tolist()
+
+    async def _run_chain_analysis(self, spot: float, atm_strike: float,
+                                   option_type: str, expiry_date):
+        """
+        Builds a chain snapshot, runs IV-Rank and IV/RV gates, then picks a strike
+        by delta band (with offset fallback) and a liquidity check.
+
+        Returns (symbol, lot_size, ref_price) on success, or None to abort the trade
+        and let the caller log the reason. None vs falling back to legacy is a
+        deliberate signal: if the chain pipeline is enabled, a gate refusal means
+        skip the trade — not 'try anyway with the legacy path'.
+        """
+        flt = self.config.get("option_filters", {}) or {}
+        rate = float(flt.get("risk_free_rate", 0.07))
+        span = int(flt.get("chain_strikes_each_side", 5))
+
+        symbols = self._candidate_symbols(atm_strike, option_type, expiry_date, span)
+        if not symbols:
+            logging.warning("Chain analysis: no candidate strikes around ATM. Aborting.")
+            return None
+
+        quote_payload = await asyncio.to_thread(fetch_chain_quote, self.kite, symbols)
+        if not quote_payload:
+            logging.warning("Chain analysis: empty quote response. Aborting.")
+            return None
+
+        today = datetime.date.today()
+        dte_days = max(1, (expiry_date - today).days)
+        T_years = dte_days / 365.0
+
+        chain = build_chain_snapshot(quote_payload, self.nfo_instruments,
+                                      spot, T_years, rate)
+        if chain.empty:
+            logging.warning("Chain analysis: snapshot DataFrame empty. Aborting.")
+            return None
+
+        # ---------- ATM IV record + IVR gate ----------
+        atm_row = find_atm_row(chain, option_type, atm_strike)
+        if atm_row is None or atm_row.get("iv") is None:
+            # Fall back to nearest available strike for the IV reading.
+            with_iv = chain[(chain["instrument_type"] == option_type) & chain["iv"].notna()].copy()
+            if not with_iv.empty:
+                with_iv["dist"] = (with_iv["strike"] - atm_strike).abs()
+                atm_row = with_iv.sort_values("dist").iloc[0]
+        atm_iv = float(atm_row["iv"]) if (atm_row is not None and atm_row.get("iv") is not None) else None
+
+        if atm_iv:
+            try:
+                append_iv_snapshot(self.flags["underlying_instrument"],
+                                    today.isoformat(), atm_iv, spot, atm_strike)
+            except Exception as e:
+                logging.debug(f"append_iv_snapshot failed (non-fatal): {e}")
+
+            ivr_max = float(flt.get("ivr_max_for_long", 60.0))
+            lookback = int(flt.get("ivr_lookback_days", 60))
+            min_samples = int(flt.get("ivr_min_samples", 10))
+            ivr, samples = compute_ivr(self.flags["underlying_instrument"],
+                                        atm_iv, lookback, min_samples)
+            if ivr is not None:
+                if ivr > ivr_max:
+                    logging.warning(
+                        f"IVR gate: today's ATM IV {atm_iv:.3f} = {ivr:.1f}IVR "
+                        f"(>{ivr_max:.0f}, samples={samples}). Skipping entry."
+                    )
+                    return None
+                logging.info(f"IVR check: {ivr:.1f} <= {ivr_max:.0f} (samples={samples}). OK.")
+            else:
+                logging.info(f"IVR gate bypassed: insufficient history ({samples} samples).")
+
+            # ---------- IV/RV gate ----------
+            iv_rv_max = float(flt.get("iv_rv_max_ratio", 0))
+            if iv_rv_max > 0:
+                bars = await self._fetch_daily_bars()
+                if bars is not None and not bars.empty:
+                    closes = bars.sort_values("date")["close"].reset_index(drop=True)
+                    rv = realized_vol(closes, int(flt.get("rv_lookback_days", 20)))
+                    if rv and rv > 0:
+                        ratio = atm_iv / rv
+                        if ratio > iv_rv_max:
+                            logging.warning(
+                                f"IV/RV gate: IV {atm_iv:.3f} / RV {rv:.3f} = {ratio:.2f} "
+                                f"> max {iv_rv_max:.2f}. Skipping (options too expensive)."
+                            )
+                            return None
+                        logging.info(f"IV/RV check: {ratio:.2f} <= {iv_rv_max:.2f}. OK.")
+
+        # ---------- Strike selection: delta-targeted with offset fallback ----------
+        chosen = None
+        if flt.get("use_delta_targeting", True):
+            chosen = select_by_delta(
+                chain, option_type,
+                float(flt.get("target_delta_low", 0.40)),
+                float(flt.get("target_delta_high", 0.55)),
+            )
+            if chosen is not None:
+                logging.info(
+                    f"Delta-targeted pick: {chosen['tradingsymbol']} "
+                    f"strike={chosen['strike']} delta={chosen['delta']:.2f}"
+                )
+        if chosen is None:
+            # Offset fallback (existing strike_offset_steps behaviour).
+            step = self._strike_step()
+            offset = int(self.flags.get("strike_offset_steps", 0))
+            if offset:
+                fallback_strike = (atm_strike - offset * step) if option_type == "CE" \
+                    else (atm_strike + offset * step)
+            else:
+                fallback_strike = atm_strike
+            row = chain[
+                (chain["instrument_type"] == option_type)
+                & (chain["strike"] == fallback_strike)
+            ]
+            if row.empty:
+                row = chain[
+                    (chain["instrument_type"] == option_type)
+                    & (chain["strike"] == atm_strike)
+                ]
+            if row.empty:
+                logging.warning("Chain analysis: no offset/ATM strike in snapshot. Aborting.")
+                return None
+            chosen = row.iloc[0]
+            logging.info(
+                f"Offset fallback pick: {chosen['tradingsymbol']} "
+                f"strike={chosen['strike']} delta={chosen.get('delta')}"
+            )
+
+        # ---------- Liquidity filter on the chosen strike ----------
+        ok, reason = passes_liquidity(
+            chosen,
+            max_spread_pct=float(flt.get("max_spread_percent", 2.0)),
+            min_oi=int(flt.get("min_open_interest", 100000)),
+            max_age_seconds=float(flt.get("max_quote_age_seconds", 5)),
+        )
+        if not ok:
+            logging.warning(f"Liquidity gate: {chosen['tradingsymbol']} rejected — {reason}.")
+            return None
+
+        # Find lot_size from instruments df.
+        meta = self.nfo_instruments[
+            self.nfo_instruments["tradingsymbol"] == chosen["tradingsymbol"]
+        ]
+        if meta.empty:
+            logging.warning(f"Chain analysis: lot_size not found for {chosen['tradingsymbol']}.")
+            return None
+        lot_size = int(meta.iloc[0]["lot_size"])
+
+        ref_price = float(chosen["mid"]) if chosen["mid"] > 0 else float(chosen["last"])
+        if ref_price <= 0:
+            logging.warning(f"Chain analysis: zero reference price for {chosen['tradingsymbol']}.")
+            return None
+
+        return chosen["tradingsymbol"], lot_size, ref_price
+
     async def _get_trade_details(self, direction):
         try:
             # Fetch underlying LTP and margins concurrently — independent calls.
@@ -379,17 +583,8 @@ class OrderExecutionAgent:
             atm_strike = round(ltp / step) * step
             option_type = "CE" if direction == "BUY" else "PE"
 
-            # Strike offset: +N moves N steps ITM, -N moves N steps OTM.
-            offset_steps = int(self.flags.get("strike_offset_steps", 0))
-            if offset_steps:
-                target_strike = (atm_strike - offset_steps * step) if option_type == "CE" \
-                    else (atm_strike + offset_steps * step)
-            else:
-                target_strike = atm_strike
-
             today = datetime.date.today()
             min_dte = int(self.flags.get("min_days_to_expiry", 0))
-            # nfo_instruments already has expiry_date pre-parsed.
             valid_expiries = sorted({
                 d for d in self.nfo_instruments["expiry_date"].unique()
                 if (d - today).days >= min_dte
@@ -399,28 +594,59 @@ class OrderExecutionAgent:
                 return None, 0, 0
             expiry_date = valid_expiries[0]
 
-            target = self.nfo_instruments[
-                (self.nfo_instruments["strike"] == target_strike)
-                & (self.nfo_instruments["instrument_type"] == option_type)
-                & (self.nfo_instruments["expiry_date"] == expiry_date)
-            ]
-            if target.empty:
-                logging.warning(
-                    f"No option for {self._root} {target_strike}{option_type} expiry {expiry_date}; "
-                    f"falling back to ATM {atm_strike}."
+            symbol = None
+            lot_size = 0
+            ref_price = 0.0
+
+            # ---------- Chain-analysis pathway ----------
+            option_filters = self.config.get("option_filters", {}) or {}
+            if option_filters.get("enable", False):
+                result = await self._run_chain_analysis(
+                    spot=float(ltp),
+                    atm_strike=float(atm_strike),
+                    option_type=option_type,
+                    expiry_date=expiry_date,
                 )
+                if result is None:
+                    # An enabled chain pipeline that refuses == skip the trade.
+                    return None, 0, 0
+                symbol, lot_size, ref_price = result
+
+            # ---------- Legacy pathway (when option_filters disabled) ----------
+            if symbol is None:
+                offset_steps = int(self.flags.get("strike_offset_steps", 0))
+                if offset_steps:
+                    target_strike = (atm_strike - offset_steps * step) if option_type == "CE" \
+                        else (atm_strike + offset_steps * step)
+                else:
+                    target_strike = atm_strike
+
                 target = self.nfo_instruments[
-                    (self.nfo_instruments["strike"] == atm_strike)
+                    (self.nfo_instruments["strike"] == target_strike)
                     & (self.nfo_instruments["instrument_type"] == option_type)
                     & (self.nfo_instruments["expiry_date"] == expiry_date)
                 ]
                 if target.empty:
-                    logging.warning(f"No fallback ATM either; aborting sizing.")
+                    logging.warning(
+                        f"No option for {self._root} {target_strike}{option_type} expiry "
+                        f"{expiry_date}; falling back to ATM {atm_strike}."
+                    )
+                    target = self.nfo_instruments[
+                        (self.nfo_instruments["strike"] == atm_strike)
+                        & (self.nfo_instruments["instrument_type"] == option_type)
+                        & (self.nfo_instruments["expiry_date"] == expiry_date)
+                    ]
+                    if target.empty:
+                        logging.warning(f"No fallback ATM either; aborting sizing.")
+                        return None, 0, 0
+                symbol = target.iloc[0]["tradingsymbol"]
+                lot_size = int(target.iloc[0]["lot_size"])
+                ref_price = safe_ltp(self.kite, f"NFO:{symbol}") or 0
+                if ref_price <= 0:
+                    logging.warning(f"Option LTP unavailable for {symbol}; skipping.")
                     return None, 0, 0
 
-            symbol = target.iloc[0]["tradingsymbol"]
-            lot_size = int(target.iloc[0]["lot_size"])
-
+            # ---------- Sizing (shared by both pathways) ----------
             equity = (margins or {}).get("equity", {}).get("available", {})
             capital = (
                 equity.get("live_balance")
@@ -435,28 +661,22 @@ class OrderExecutionAgent:
             risk_pct = float(self.flags["risk_per_trade_percent"])
             risk_amount = capital * (risk_pct / 100.0)
 
-            option_price = safe_ltp(self.kite, f"NFO:{symbol}")
-            if option_price is None or option_price <= 0:
-                logging.warning(f"Option LTP unavailable for {symbol}; skipping.")
-                return None, 0, 0
-
             sl_pct = float(self.flags.get("stop_loss_percent", 25.0)) / 100.0
             min_sl_pts = float(self.flags.get("min_stop_loss_points", 2.0))
-            risk_per_share = max(option_price * sl_pct, min_sl_pts)
+            risk_per_share = max(ref_price * sl_pct, min_sl_pts)
 
             lots_by_risk = int(risk_amount / max(risk_per_share * lot_size, 1e-6))
             num_lots = max(1, lots_by_risk)
             quantity = num_lots * lot_size
 
-            # Capital-cap so we don't try to buy more premium than we hold.
-            max_qty_by_capital = int(capital / max(option_price, 1e-6))
+            max_qty_by_capital = int(capital / max(ref_price, 1e-6))
             if quantity > max_qty_by_capital:
                 logging.warning(f"Capping qty {quantity} -> {max_qty_by_capital} (capital cap).")
                 quantity = max(lot_size, (max_qty_by_capital // lot_size) * lot_size)
 
             logging.info(
                 f"Sizing: symbol={symbol} lot={lot_size} qty={quantity} "
-                f"risk_amt={risk_amount:.0f} opt_ltp={option_price:.2f} "
+                f"risk_amt={risk_amount:.0f} ref_price={ref_price:.2f} "
                 f"risk_per_share={risk_per_share:.2f}"
             )
             return symbol, quantity, lot_size

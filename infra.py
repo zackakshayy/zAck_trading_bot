@@ -206,3 +206,63 @@ def save_daily_pnl(date_str: str, pnl: float) -> None:
         data = {}
     data[date_str] = float(pnl)
     atomic_write_json(DAILY_PNL_FILE, data)
+
+
+# ---------------------------------------------------------------------------
+# ATM IV history (per underlying, dated) + IV-Rank computation
+# ---------------------------------------------------------------------------
+
+IV_HISTORY_FILE = state_path("iv_history.json")
+IV_HISTORY_MAX_DAYS = 250  # cap file size; ~1 trading year
+
+
+def load_iv_history(underlying: str) -> list:
+    data = read_json(IV_HISTORY_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return []
+    raw = data.get(underlying, [])
+    return raw if isinstance(raw, list) else []
+
+
+def append_iv_snapshot(underlying: str, date_str: str, iv: float,
+                        spot: float, atm_strike: float) -> None:
+    """At most one entry per (underlying, date_str) — last write wins."""
+    data = read_json(IV_HISTORY_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    history = data.get(underlying, []) or []
+    if not isinstance(history, list):
+        history = []
+    history = [h for h in history if isinstance(h, dict) and h.get("date") != date_str]
+    history.append({
+        "date": date_str,
+        "iv": float(iv),
+        "spot": float(spot),
+        "atm_strike": float(atm_strike),
+    })
+    history.sort(key=lambda h: h.get("date", ""))
+    if len(history) > IV_HISTORY_MAX_DAYS:
+        history = history[-IV_HISTORY_MAX_DAYS:]
+    data[underlying] = history
+    atomic_write_json(IV_HISTORY_FILE, data)
+
+
+def compute_ivr(underlying: str, current_iv: float,
+                lookback_days: int = 60, min_samples: int = 10):
+    """
+    Returns (IVR_percent, samples_used) where IVR is current vs (min,max) of the
+    last `lookback_days` samples. Returns (None, n) when sample count is below
+    `min_samples` or when min == max (no spread).
+    """
+    history = load_iv_history(underlying)
+    if not history:
+        return None, 0
+    sample = history[-lookback_days:]
+    ivs = [float(h["iv"]) for h in sample if isinstance(h, dict) and "iv" in h]
+    if len(ivs) < min_samples:
+        return None, len(ivs)
+    iv_min, iv_max = min(ivs), max(ivs)
+    if iv_max <= iv_min:
+        return None, len(ivs)
+    ivr = (current_iv - iv_min) / (iv_max - iv_min) * 100.0
+    return max(0.0, min(100.0, ivr)), len(ivs)

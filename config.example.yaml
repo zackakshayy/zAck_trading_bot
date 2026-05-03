@@ -1,0 +1,104 @@
+email_settings:
+  receiver_email: xxxxx@gmail.com
+  send_daily_report: true
+  sender_email: yyyyy@gmail.com
+  sender_password: ${EMAIL_APP_PASSWORD}
+  smtp_port: 587
+  smtp_server: smtp.gmail.com
+google_api:
+  api_key: ${GOOGLE_API_KEY}
+news_api:
+  api_key: ${NEWS_API_KEY}
+openai_api:
+  api_key: ${OPENAI_API_KEY}
+risk_management:
+  atr_multiplier: 2.0
+  enable_daily_loss_limit: true
+  enable_volatility_adjustment: true
+  high_vix_risk_reduction_factor: 0.5
+  high_vix_threshold: 22.0
+  max_daily_loss_percent: 2.5
+strategy_signals:
+  use_cpr_breakout: true
+  use_ema_20_crossover: true
+  use_ema_50_crossover: true
+  use_rsi_divergence: true
+trading_flags:
+  backtest_years: 2
+  chart_timeframe: 5minute
+  ema_cross_lookback: 2500
+  enable_natural_language_prompt: true
+  enable_parallel_processing: true
+  enable_gemini_loss_analysis: true
+  manual_sentiment_override: true
+  max_trades_per_day: 3
+  max_vix_level: 25.0
+  order_variety: regular
+  paper_trading: true
+  product_type: MIS
+  rag_min_trading_days: 1
+  risk_per_trade_percent: 1.0
+  run_startup_backtest: false
+  stop_loss_percent: 25.0
+  strategy_reassessment_period_minutes: 15
+  underlying_instrument: NIFTY 50
+  use_rag: true
+  win_rate_threshold: 55.0
+  min_stop_loss_points: 7.0
+  risk_reward_ratio: 2.0
+  min_days_to_expiry: 2
+  limit_order_slippage_percent: 0.5
+  # Entry-time gating. Default skip-the-noise window after the open is 09:15 -> 09:30.
+  # The bot pulls this forward to 09:15 automatically when:
+  #   (a) today is a known macro event day (FED / RBI / etc.), OR
+  #   (b) the open gap vs prior close >= early_entry_gap_threshold_percent.
+  entry_start_time: "09:30"
+  entry_cutoff_time: "14:30"
+  early_entry_gap_threshold_percent: 0.4
+  # Strike selection: 0 = ATM, +N = N steps ITM, -N = N steps OTM.
+  # 1-step ITM gives delta ~0.55-0.60 on Nifty -> better risk/reward & lower theta than ATM.
+  strike_offset_steps: 1
+trailing_stop_loss:
+  indicator_exit_type: PSAR
+  ma_period: 9
+  percentage: 15.0
+  type: PERCENTAGE
+  use_indicator_exit: true
+  psar_step: 0.02
+  psar_max: 0.2
+strike_steps:
+  NIFTY: 50
+  BANKNIFTY: 100
+  FINNIFTY: 50
+  MIDCPNIFTY: 25
+  SENSEX: 100
+# Option-chain analytics: liquidity filter + IV-Rank gate + IV/RV gate +
+# delta-targeted strike selection. Disable by flipping `enable: false` to fall
+# back to the legacy ATM/offset path with no chain checks.
+option_filters:
+  enable: true
+  # Liquidity (gate the chosen strike, not just ATM)
+  max_spread_percent: 2.0
+  min_open_interest: 50000
+  max_quote_age_seconds: 5
+  # IV-Rank: skip new long-premium entries when today's ATM IV is in the top
+  # `(100 - ivr_max_for_long)` percent of the recent IV range.
+  ivr_max_for_long: 60
+  ivr_lookback_days: 60
+  ivr_min_samples: 10        # below this many samples in history, the gate is bypassed
+  # IV vs realized vol: skip when implied vastly exceeds realized.
+  iv_rv_max_ratio: 1.3       # set 0 to disable
+  rv_lookback_days: 20
+  # Strike selection: target a delta band (works around any IV regime). Falls
+  # back to strike_offset_steps if the chain has no Greeks.
+  use_delta_targeting: true
+  target_delta_low: 0.40
+  target_delta_high: 0.55
+  # Risk-free rate used in Black-Scholes (India 10-yr ~7%).
+  risk_free_rate: 0.07
+  # How many strikes each side of ATM to fetch for the snapshot.
+  chain_strikes_each_side: 5
+zerodha:
+  access_token: ${ZERODHA_ACCESS_TOKEN}
+  api_key: ${ZERODHA_API_KEY}
+  api_secret: ${ZERODHA_API_SECRET}
