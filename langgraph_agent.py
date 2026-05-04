@@ -5,23 +5,100 @@ import aiohttp
 from typing import TypedDict
 from rag_service import RAGService
 
+
+# ---------------------------------------------------------------------------
+# Regime-based deterministic fallback
+# ---------------------------------------------------------------------------
+# Mapped from market_conditions set -> recommended strategy. Used when the LLM
+# is unavailable (rate limit, network, invalid response) and we must still pick
+# something *defensible* without the LLM doing the regime reasoning for us.
+#
+# Order matters: the first rule whose condition-set is a subset of today's
+# conditions wins. Place stricter / more specific rules first.
+REGIME_FALLBACK_RULES = [
+    # Macro event days — dedicated strategy regardless of VIX/IV
+    ({"EVENT_FED_MEETING"}, "Opening_Range_Breakout"),
+    ({"EVENT_RBI_POLICY"},  "Opening_Range_Breakout"),
+    # High volatility regimes — favour reversal / vol-cluster plays
+    ({"VIX_HIGH", "IV_HIGH"},     "Volatility_Cluster_Reversal"),
+    ({"VIX_HIGH"},                "Volatility_Cluster_Reversal"),
+    ({"VIX_MEDIUM", "IV_HIGH"},   "Reversal_Detector"),
+    # Calm regimes — favour trend-following / breakout
+    ({"VIX_LOW", "IV_LOW"},       "Breakout_Prev_Day_HL"),
+    ({"VIX_LOW"},                 "EMA_Cross_RSI"),
+    ({"VIX_MEDIUM", "IV_LOW"},    "Momentum_VWAP_RSI"),
+    ({"VIX_MEDIUM"},              "Gemini_Default"),
+]
+
+
+def regime_fallback_strategy(market_conditions: set) -> str | None:
+    """First matching rule wins. Returns None if no rule matches."""
+    if not market_conditions:
+        return None
+    for required, strategy in REGIME_FALLBACK_RULES:
+        if required.issubset(market_conditions):
+            return strategy
+    return None
+
+
 class LangGraphAgent:
     """AI agent using Google's Gemini API to recommend a strategy from a full suite."""
+
     def __init__(self, config, rag_service: RAGService):
         self.config = config
         self.rag_service = rag_service
         self.api_key = config.get('google_api', {}).get('api_key', "")
         self.model_name = "gemini-2.0-flash"
 
+    def _smart_fallback(self, market_conditions: set) -> str:
+        """
+        Two-layer fallback when the LLM is unavailable:
+          1. If a regime rule matches, use it.
+          2. Else pick the strategy with best recent risk-adjusted score
+             (computed by RAGService over the recency window).
+          3. Else 'Gemini_Default' as last-resort.
+        """
+        regime_pick = regime_fallback_strategy(market_conditions)
+        if regime_pick:
+            logging.info(
+                f"[Fallback] Regime rule matched conditions={set(market_conditions)} -> {regime_pick}"
+            )
+            return regime_pick
+
+        try:
+            stats = self.rag_service.compute_strategy_stats()
+        except Exception as e:
+            logging.warning(f"[Fallback] compute_strategy_stats failed: {e}")
+            stats = {}
+
+        if stats:
+            best = max(stats.items(), key=lambda kv: kv[1]['score'])
+            best_name, best_meta = best
+            if best_meta['score'] > 0:
+                logging.info(
+                    f"[Fallback] Best recent score: '{best_name}' "
+                    f"(score={best_meta['score']:.2f}, n={best_meta['trades']})"
+                )
+                return best_name
+            logging.info(
+                f"[Fallback] No strategy has positive recent score; using Gemini_Default."
+            )
+        else:
+            logging.info(
+                "[Fallback] No regime match, no recent stats available; using Gemini_Default."
+            )
+        return "Gemini_Default"
+
     async def get_recommended_strategy(self, market_conditions: set, user_prompt: str = None, rag_context: str = None):
         """
         Gets a strategy recommendation from the Gemini API, optionally augmented with
-        RAG context.
+        RAG context. On any failure, falls back to a regime-rule + recent-score chain
+        instead of a hardcoded Gemini_Default.
         """
         if not self.api_key:
-            logging.error("[Gemini Agent] Google API key not found. Defaulting strategy.")
-            return "Gemini_Default"
-            
+            logging.error("[Gemini Agent] Google API key not found. Using smart fallback.")
+            return self._smart_fallback(market_conditions)
+
         logging.info(f"[Gemini Agent] Market Conditions: {market_conditions}. Recommending strategy...")
 
         prompt_sections = [
@@ -79,12 +156,17 @@ class LangGraphAgent:
                 "MA_Crossover", "RSI_Divergence", "Reversal_Detector"
             ]
             if recommended_strategy not in valid_strategies:
-                logging.warning(f"[Gemini Agent] LLM recommended unknown strategy: '{recommended_strategy}'. Defaulting.")
-                recommended_strategy = "Gemini_Default"
-            
+                logging.warning(
+                    f"[Gemini Agent] LLM returned unknown strategy: '{recommended_strategy}'. "
+                    f"Falling back to regime/score-based pick."
+                )
+                return self._smart_fallback(market_conditions)
+
             logging.info(f"[Gemini Agent] AI Recommended Strategy: {recommended_strategy}")
             return recommended_strategy
 
         except Exception as e:
-            logging.error(f"[Gemini Agent] Error calling Gemini API: {e}. Defaulting to Gemini_Default.")
-            return "Gemini_Default"
+            logging.error(
+                f"[Gemini Agent] Error calling Gemini API: {e}. Using smart fallback."
+            )
+            return self._smart_fallback(market_conditions)

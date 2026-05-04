@@ -1,4 +1,4 @@
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import pandas as pd
 
 def calculate_all_indicators(df: pd.DataFrame, config: dict):

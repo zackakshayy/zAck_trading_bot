@@ -2,8 +2,8 @@
 kiteconnect==4.0.0
 pandas==2.2.2
 numpy==1.26.4
-# pandas-ta
-# TA-Lib
+pandas-ta-classic
+TA-Lib
 openpyxl==3.1.2
 
 #AI and Sentiment Analysis

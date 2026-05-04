@@ -4,7 +4,7 @@ import logging
 from strategy_factory import get_strategy
 from market_context import MarketConditionIdentifier
 import time
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import os # Import os
 
 def fetch_historical_data_in_chunks(kite, token, from_date, to_date, timeframe):

@@ -21,7 +21,7 @@ from typing import Optional
 
 import aiohttp
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 from kiteconnect import KiteConnect, exceptions
 
 from infra import (
@@ -953,8 +953,15 @@ class PositionManagementAgent:
             entry_time = pd.to_datetime(trade_details["Timestamp"]) - datetime.timedelta(minutes=10)
             exit_time = pd.to_datetime(trade_details["Timestamp"])
             if underlying_df is not None and not underlying_df.empty:
-                window = underlying_df[
-                    (underlying_df.index >= entry_time) & (underlying_df.index <= exit_time)
+                # Kite returns IST-aware timestamps; the trade_details Timestamp is naive.
+                # Normalise both to naive before comparing to avoid pandas' refusal to
+                # compare across tz-aware vs tz-naive types.
+                df_for_window = underlying_df
+                if getattr(df_for_window.index, "tz", None) is not None:
+                    df_for_window = df_for_window.copy()
+                    df_for_window.index = df_for_window.index.tz_localize(None)
+                window = df_for_window[
+                    (df_for_window.index >= entry_time) & (df_for_window.index <= exit_time)
                 ]
                 cols = [c for c in ["open", "high", "low", "close", "volume", "rsi"]
                         if c in window.columns]

@@ -1,6 +1,6 @@
 import logging
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import datetime
 from indicators import (
     calculate_cpr, calculate_rsi, check_rsi_divergence, 
