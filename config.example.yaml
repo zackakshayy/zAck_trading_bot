@@ -1,8 +1,29 @@
+# =============================================================================
+# zAck Trading Bot — example config
+# =============================================================================
+# Copy this file to `config.yaml` and edit for your account:
+#     cp config.example.yaml config.yaml
+#
+# Two ways to fill in secrets (API keys, broker secrets, email password):
+#
+#   1. (Recommended) Keep the ${VAR_NAME} placeholders and put real values in
+#      a `.env` file in this directory. python-dotenv substitutes them at
+#      startup. .env is gitignored — secrets stay off git.
+#      See `.env.example` for the variable names.
+#
+#   2. (Simpler, less safe) Replace each ${VAR_NAME} with the real string.
+#      `config.yaml` is also gitignored, but laptop backups (Time Machine,
+#      iCloud) WILL capture it. Rotate keys immediately if it leaks.
+#
+# Anything sensitive (real keys, real password) must NEVER be committed to
+# this example file. Only placeholders.
+# =============================================================================
+
 email_settings:
   receiver_email: xxxxx@gmail.com
   send_daily_report: true
   sender_email: yyyyy@gmail.com
-  sender_password: ${EMAIL_APP_PASSWORD}
+  sender_password: ${EMAIL_APP_PASSWORD}    # Gmail App Password (16 chars), NOT your account password
   smtp_port: 587
   smtp_server: smtp.gmail.com
 google_api:
@@ -72,6 +93,12 @@ strike_steps:
   FINNIFTY: 50
   MIDCPNIFTY: 25
   SENSEX: 100
+# Strategy-selection RAG: only consider trades from the recency window, and
+# only count strategies with enough recent trades. Stops the LLM and the
+# regime/score fallback from anchoring on stale data from older bot versions.
+rag:
+  recency_window_days: 30
+  min_trades_per_strategy: 3
 # Option-chain analytics: liquidity filter + IV-Rank gate + IV/RV gate +
 # delta-targeted strike selection. Disable by flipping `enable: false` to fall
 # back to the legacy ATM/offset path with no chain checks.
