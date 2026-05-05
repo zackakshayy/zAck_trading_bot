@@ -24,3 +24,4 @@ __pycache__/
 # IDE-specific folders
 .idea/
 .vscode/
+.DS_Store
