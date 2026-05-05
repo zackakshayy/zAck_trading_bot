@@ -56,6 +56,39 @@ class SentimentAgent:
             logging.error(f"SentimentAgent: Could not fetch news from API: {e}")
             return None
 
+    def get_top_headlines(self, n: int = 10) -> list:
+        """
+        Returns up to `n` most recent valid headlines with their individual
+        polarity scores — for showing the operator what is actually driving the
+        automated sentiment read before they confirm or override it.
+
+        Each entry: {title, source, published_at, polarity}.
+        Polarity in [-1.0, +1.0]: positive = bullish-leaning text.
+        """
+        articles = self._get_news_articles()
+        if not articles or not articles.get('articles'):
+            return []
+        out = []
+        for a in articles['articles']:
+            title = a.get('title') or ''
+            if not title or title == "[Removed]":
+                continue
+            description = a.get('description') or ''
+            content = f"{title}. {description}".strip()
+            try:
+                polarity = float(TextBlob(content).sentiment.polarity)
+            except Exception:
+                polarity = 0.0
+            out.append({
+                "title": title,
+                "source": (a.get('source') or {}).get('name', ''),
+                "published_at": a.get('publishedAt', ''),
+                "polarity": polarity,
+            })
+            if len(out) >= n:
+                break
+        return out
+
     def get_market_sentiment(self):
         """
         Calculates sentiment using a weighted average based on news recency

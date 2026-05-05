@@ -99,6 +99,14 @@ strike_steps:
 rag:
   recency_window_days: 30
   min_trades_per_strategy: 3
+# Expiry-day overrides — auto-applied on any day where a contract of the
+# configured underlying expires (detected from the live instrument list).
+# Reduces risk on the day the broader market is being whipsawed by gamma trades.
+expiry_day_overrides:
+  enable: true
+  risk_reduction_factor: 0.5      # halve risk per trade
+  max_trades: 1                   # at most one trade on expiry day
+  entry_cutoff_time: "13:00"      # tighter than the regular 14:30 cutoff
 # Option-chain analytics: liquidity filter + IV-Rank gate + IV/RV gate +
 # delta-targeted strike selection. Disable by flipping `enable: false` to fall
 # back to the legacy ATM/offset path with no chain checks.

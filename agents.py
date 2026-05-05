@@ -245,6 +245,30 @@ class OrderExecutionAgent:
     def _strike_step(self) -> int:
         return int(self.strike_steps.get(self._root, 50))
 
+    def is_weekly_expiry_today(self) -> bool:
+        """
+        True if today is an expiry date for any of this underlying's contracts.
+        Detects from the actual instruments list (robust to NSE changing the
+        weekly-expiry weekday), not by hardcoding Tue/Thu.
+        """
+        today = datetime.date.today()
+        try:
+            return bool((self.nfo_instruments["expiry_date"] == today).any())
+        except Exception:
+            return False
+
+    def expiry_risk_factor(self) -> float:
+        """
+        Returns the risk-reduction factor in effect on expiry day, or 1.0 otherwise.
+        Reads from config.expiry_day_overrides (defaults: enabled, factor 0.5).
+        """
+        cfg = (self.config.get("expiry_day_overrides") or {})
+        if not cfg.get("enable", True):
+            return 1.0
+        if not self.is_weekly_expiry_today():
+            return 1.0
+        return float(cfg.get("risk_reduction_factor", 0.5))
+
     def _tick_size_for(self, symbol: str) -> float:
         """Use the broker-reported tick size if present; default to 0.05 for NFO."""
         row = self.nfo_instruments[self.nfo_instruments["tradingsymbol"] == symbol]
@@ -659,6 +683,13 @@ class OrderExecutionAgent:
                 return None, 0, 0
 
             risk_pct = float(self.flags["risk_per_trade_percent"])
+            expiry_factor = self.expiry_risk_factor()
+            if expiry_factor < 1.0:
+                logging.info(
+                    f"Expiry-day risk override: scaling risk_pct by {expiry_factor} "
+                    f"({risk_pct:.2f}% -> {risk_pct * expiry_factor:.2f}%)"
+                )
+                risk_pct *= expiry_factor
             risk_amount = capital * (risk_pct / 100.0)
 
             sl_pct = float(self.flags.get("stop_loss_percent", 25.0)) / 100.0

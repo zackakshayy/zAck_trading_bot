@@ -36,7 +36,7 @@ except ImportError:
 
 # Suppress the repeated UserWarning from pandas_ta for cleaner logs
 warnings.filterwarnings(
-    "once",
+    "ignore",
     category=UserWarning,
     message=".*Converting to PeriodArray/Index representation will drop timezone information.*"
 )
@@ -233,6 +233,13 @@ class TradingBotOrchestrator:
             return f"before effective entry start {start.strftime('%H:%M')}"
 
         cutoff = self._parse_hhmm(flags.get('entry_cutoff_time'))
+        # On expiry day, use the tighter expiry-day cutoff if configured.
+        if getattr(self, "is_expiry_day", False):
+            exp_cfg = self.config.get('expiry_day_overrides', {}) or {}
+            if exp_cfg.get('enable', True):
+                exp_cutoff = self._parse_hhmm(exp_cfg.get('entry_cutoff_time'))
+                if exp_cutoff and (cutoff is None or exp_cutoff < cutoff):
+                    cutoff = exp_cutoff
         if cutoff and now >= cutoff:
             return f"past entry_cutoff_time {cutoff.strftime('%H:%M')}"
 
@@ -340,16 +347,11 @@ class TradingBotOrchestrator:
             if 'UNKNOWN' in todays_conditions:
                 self.no_trade_reason = "Could not determine market conditions."; return False
 
-            # 2. Determine Sentiment
-            if self.config['trading_flags'].get('manual_sentiment_override', False):
-                self.day_sentiment = self._get_manual_sentiment_input("Manual sentiment override is ACTIVE.")
-            else:
-                self.day_sentiment = self.sentiment_agent.get_market_sentiment()
-                if self.day_sentiment == "Neutral":
-                    self.day_sentiment = self._get_manual_sentiment_input("Automated sentiment is 'Neutral'. Manual override required.")
-
+            # 2. Determine Sentiment — automated read first, optional human override.
+            self.day_sentiment = self._resolve_sentiment()
             if self.day_sentiment == "Neutral":
-                self.no_trade_reason = "Market sentiment is Neutral (confirmed manually)."; return False
+                self.no_trade_reason = "Market sentiment is Neutral. No new entries today."
+                return False
             
             logging.info(f"Today's Market Conditions: {todays_conditions} | Final Sentiment: {self.day_sentiment}")
 
@@ -393,26 +395,50 @@ class TradingBotOrchestrator:
             # 6. Finalize Setup
             initialize_trade_log()
 
-            # CPR from the most recent trading day strictly before `today` —
-            # robust against weekends/holidays where iloc[-2:-1] would silently slip.
-            token = self.order_agent.underlying_token
-            hist = await asyncio.to_thread(
-                self.kite.historical_data,
-                token, today - datetime.timedelta(days=10), today, "day",
-            )
-            day_df = pd.DataFrame(hist)
-            if not day_df.empty:
-                day_df["date_only"] = pd.to_datetime(day_df["date"]).dt.date
-                prior = day_df[day_df["date_only"] < today].tail(1)
-                if not prior.empty:
-                    self.position_agent.cpr_pivots = calculate_cpr(prior)
-                    logging.info("CPR pivots calculated for the day.")
+            # CPR from the most recent trading day strictly before `today`.
+            # Fails gracefully on network blips: a transient outage during this
+            # one fetch must not kill the whole startup, because most strategies
+            # don't even use CPR (Momentum_VWAP_RSI, Supertrend_MACD, EMA_Cross_RSI,
+            # Reversal_Detector, etc.). Strategies that DO use CPR will simply
+            # skip when pivots is empty.
+            self.position_agent.cpr_pivots = {}
+            try:
+                token = self.order_agent.underlying_token
+                hist = None
+                for attempt in range(2):
+                    try:
+                        hist = await asyncio.to_thread(
+                            self.kite.historical_data,
+                            token, today - datetime.timedelta(days=10), today, "day",
+                        )
+                        break
+                    except Exception as fetch_err:
+                        if attempt == 0:
+                            logging.warning(
+                                f"CPR fetch attempt 1 failed ({fetch_err}); retrying in 3s."
+                            )
+                            await asyncio.sleep(3)
+                        else:
+                            raise
+
+                day_df = pd.DataFrame(hist or [])
+                if not day_df.empty:
+                    day_df["date_only"] = pd.to_datetime(day_df["date"]).dt.date
+                    prior = day_df[day_df["date_only"] < today].tail(1)
+                    if not prior.empty:
+                        self.position_agent.cpr_pivots = calculate_cpr(prior)
+                        logging.info("CPR pivots calculated for the day.")
+                    else:
+                        logging.warning(
+                            "No prior-day data; CPR-dependent strategies will skip."
+                        )
                 else:
-                    logging.warning("No prior-day data available; CPR-dependent strategies will skip.")
-                    self.position_agent.cpr_pivots = {}
-            else:
-                logging.warning("Empty daily history; CPR pivots unavailable.")
-                self.position_agent.cpr_pivots = {}
+                    logging.warning("Empty daily history; CPR pivots unavailable.")
+            except Exception as e:
+                logging.error(
+                    f"CPR pivot fetch failed (non-fatal): {e}. "
+                    f"Continuing without CPR — strategies that need pivots will skip."
+                )
             
             self.bot_state = "AWAITING_SIGNAL"
             self.awaiting_signal_since = datetime.datetime.now() # Reset the reassessment timer
@@ -431,37 +457,104 @@ class TradingBotOrchestrator:
         except Exception:
             return False
 
-    def _get_manual_sentiment_input(self, reason: str):
+    def _resolve_sentiment(self):
         """
-        Resolves manual sentiment without ever blocking the asyncio loop on a missing TTY.
-        Resolution order:
-          1. config['daily_overrides']['sentiment'] (or env DAILY_SENTIMENT)
-          2. interactive prompt — only if stdin is a TTY
-          3. fall back to 'Neutral' (which will halt the day's trading further upstream)
+        Compute today's sentiment via a hybrid flow:
+
+          1. Hard override from config['daily_overrides']['sentiment'] or
+             DAILY_SENTIMENT env var — used directly, no prompt. (For unattended runs.)
+          2. Run automated sentiment via SentimentAgent (NewsAPI + TextBlob).
+          3. If trading_flags.manual_sentiment_override is True AND we have a TTY:
+             show the automated read, ask the operator to confirm or override.
+             Press Enter -> accept automated. Type a sentiment -> use that. Invalid
+             input re-prompts.
+          4. If no TTY (headless run) or manual override is disabled in config:
+             use the automated read silently.
         """
-        logging.warning(reason)
         valid = {"Very Bullish", "Bullish", "Bearish", "Very Bearish", "Neutral"}
 
-        override = (
+        # 1. Hard config/env override — wins over everything (used for unattended runs).
+        hard_override = (
             (self.config.get("daily_overrides", {}) or {}).get("sentiment")
             or os.environ.get("DAILY_SENTIMENT")
         )
-        if override and override in valid:
-            logging.info(f"Manual sentiment resolved from config/env: {override}")
-            return override
+        if hard_override and hard_override in valid:
+            logging.info(f"Sentiment hard-override from config/env: {hard_override}")
+            return hard_override
 
-        if self._is_interactive_tty():
-            while True:
-                manual_input = input(f"Please enter market sentiment {sorted(valid)}: ").strip()
-                if manual_input in valid:
-                    return manual_input
-                logging.warning(f"Invalid input. Please choose from {sorted(valid)}.")
+        # 2. Automated read.
+        try:
+            automated = self.sentiment_agent.get_market_sentiment()
+        except Exception as e:
+            logging.warning(f"Automated sentiment failed ({e}); defaulting to 'Neutral'.")
+            automated = "Neutral"
+        logging.info(f"Automated sentiment read: {automated}")
 
-        logging.error(
-            "Manual sentiment required but no TTY and no daily_overrides.sentiment / "
-            "DAILY_SENTIMENT env var set. Defaulting to 'Neutral' (will halt entries)."
-        )
-        return "Neutral"
+        manual_enabled = self.config['trading_flags'].get('manual_sentiment_override', True)
+        if not manual_enabled:
+            logging.info(f"manual_sentiment_override=false → using automated sentiment '{automated}'.")
+            return automated
+
+        # 3. Interactive confirm/override (only on a real TTY).
+        if not self._is_interactive_tty():
+            logging.info(f"No TTY → using automated sentiment '{automated}' without confirmation.")
+            return automated
+
+        # Surface the headlines that drove the automated read so the operator can
+        # sanity-check it. Polarity is per-article; the bot's overall verdict is a
+        # recency-weighted average of these.
+        try:
+            headlines = self.sentiment_agent.get_top_headlines(n=10)
+        except Exception as e:
+            logging.debug(f"Could not fetch top headlines (non-fatal): {e}")
+            headlines = []
+
+        if headlines:
+            print("\n" + "=" * 78)
+            print("Top headlines driving the automated sentiment read:")
+            print("=" * 78)
+            n_pos = n_neg = n_neu = 0
+            for h in headlines:
+                p = h["polarity"]
+                if p > 0.05:
+                    marker = "[+]"
+                    n_pos += 1
+                elif p < -0.05:
+                    marker = "[-]"
+                    n_neg += 1
+                else:
+                    marker = "[~]"
+                    n_neu += 1
+                title = h["title"]
+                if len(title) > 100:
+                    title = title[:97] + "..."
+                src = f"  ({h['source']})" if h.get("source") else ""
+                print(f"  {marker} {p:+.3f}  {title}{src}")
+            print("-" * 78)
+            print(f"  {len(headlines)} headlines analysed:  +{n_pos} bullish  {n_neg} bearish  ~{n_neu} neutral")
+            print("=" * 78)
+
+        prompt_options = sorted(valid)
+        while True:
+            try:
+                user_input = input(
+                    f"\nAutomated sentiment: {automated}\n"
+                    f"Press Enter to accept, or type one of {prompt_options} to override: "
+                ).strip()
+            except EOFError:
+                logging.info(f"EOF on stdin → using automated sentiment '{automated}'.")
+                return automated
+
+            if not user_input:
+                logging.info(f"Operator accepted automated sentiment: {automated}")
+                return automated
+            if user_input in valid:
+                logging.info(f"Operator overrode {automated} → {user_input}")
+                return user_input
+            logging.warning(
+                f"Invalid input '{user_input}'. Choose from {prompt_options} "
+                f"or press Enter to accept '{automated}'."
+            )
 
     async def display_market_closed_info(self):
         """Fetches and displays EOD info when the bot is run outside trading hours."""
@@ -576,6 +669,27 @@ class TradingBotOrchestrator:
         await self._capture_starting_capital()
         await self._compute_effective_entry_start()
 
+        # ---------- Expiry-day banner + active overrides ----------
+        self.is_expiry_day = False
+        try:
+            self.is_expiry_day = self.order_agent.is_weekly_expiry_today()
+        except Exception as e:
+            logging.debug(f"Expiry-day check failed (non-fatal): {e}")
+        if self.is_expiry_day:
+            exp_cfg = self.config.get('expiry_day_overrides', {}) or {}
+            print("\n" + "=" * 78)
+            print("  Today's the weekly expiry day, so consider trading safely.")
+            print("=" * 78)
+            if exp_cfg.get('enable', True):
+                print("  Expiry-day overrides ACTIVE:")
+                print(f"    Risk per trade x {float(exp_cfg.get('risk_reduction_factor', 0.5))}")
+                print(f"    Max trades today: {int(exp_cfg.get('max_trades', 1))}")
+                print(f"    Entry cutoff:    {exp_cfg.get('entry_cutoff_time', '13:00')}")
+            else:
+                print("  Expiry-day overrides are disabled in config.yaml.")
+            print("=" * 78 + "\n")
+            logging.warning("Today is weekly expiry day; expiry-day overrides applied.")
+
         is_paper = self.config['trading_flags']['paper_trading']
         logging.info(f"Bot running in {'PAPER TRADING' if is_paper else 'LIVE TRADING'} mode.")
         if resumed:
@@ -588,7 +702,12 @@ class TradingBotOrchestrator:
                     # Hard gates that must pass before considering any new entry.
                     if await self._is_daily_loss_breached():
                         self.bot_state = "STOPPED"; continue
-                    if self.trades_today_count >= self.config['trading_flags']['max_trades_per_day']:
+                    max_trades = int(self.config['trading_flags']['max_trades_per_day'])
+                    if getattr(self, "is_expiry_day", False):
+                        exp_cfg = self.config.get('expiry_day_overrides', {}) or {}
+                        if exp_cfg.get('enable', True):
+                            max_trades = min(max_trades, int(exp_cfg.get('max_trades', max_trades)))
+                    if self.trades_today_count >= max_trades:
                         self.bot_state = "STOPPED"; continue
 
                     # Soft gate: in a no-trade window we just sleep and try again later.
