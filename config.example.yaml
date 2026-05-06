@@ -107,6 +107,13 @@ expiry_day_overrides:
   risk_reduction_factor: 0.5      # halve risk per trade
   max_trades: 1                   # at most one trade on expiry day
   entry_cutoff_time: "13:00"      # tighter than the regular 14:30 cutoff
+# Sentiment-refresh policy: capture sentiment + NL-prompt ONCE at startup,
+# reuse on every strategy reassessment unless the market has materially shifted.
+sentiment_refresh:
+  enable: true
+  spot_change_pct: 1.0     # underlying moved this much from baseline -> re-prompt
+  vix_change_pct: 25.0     # VIX changed this much from baseline -> re-prompt
+  on_sentiment_flip: true  # automated news-sentiment regime flipped -> re-prompt
 # Option-chain analytics: liquidity filter + IV-Rank gate + IV/RV gate +
 # delta-targeted strike selection. Disable by flipping `enable: false` to fall
 # back to the legacy ATM/offset path with no chain checks.

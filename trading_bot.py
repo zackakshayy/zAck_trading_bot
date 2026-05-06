@@ -129,6 +129,14 @@ class TradingBotOrchestrator:
         self._bars_cached_at_bar = None
         # Track whether the bot should fail-stop on the next iteration (e.g. token expiry).
         self._abort = False
+        # Sentiment + NL-prompt cache. Captured ONCE on first setup; reused on
+        # every reassessment unless the market has materially shifted (drift in
+        # spot / VIX / automated news-sentiment regime).
+        self._cached_sentiment = None
+        self._cached_nl_prompt = None
+        self._sentiment_baseline_spot = None
+        self._sentiment_baseline_vix = None
+        self._sentiment_baseline_auto = None
 
     def authenticate(self, request_token_override=None):
         """
@@ -167,7 +175,7 @@ class TradingBotOrchestrator:
             return False
 
     async def _capture_starting_capital(self):
-        """Snapshot capital once per day for the daily-loss circuit breaker."""
+        """Snapshot capital at session start for the daily-loss circuit breaker."""
         try:
             margins = await asyncio.to_thread(self.kite.margins)
             equity = margins.get('equity', {}).get('available', {})
@@ -177,6 +185,149 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.warning(f"Could not snapshot starting capital: {e}")
             self.starting_capital = 0.0
+
+    async def _refresh_starting_capital(self) -> None:
+        """
+        Re-snapshot available capital so the daily-loss limit tracks any mid-day
+        deposits/withdrawals. Called before each signal-evaluation cycle and at
+        the start of each strategy-reassessment.
+
+        Logs only on material changes (>= ₹100) to avoid polluting the loop with
+        identical "capital baseline = X" lines every 5 seconds. The actual
+        self.starting_capital field is always updated to the latest value so the
+        daily-loss-limit math uses fresh data.
+        """
+        try:
+            margins = await asyncio.to_thread(self.kite.margins)
+            equity = (margins or {}).get('equity', {}).get('available', {})
+            cap = (
+                equity.get('live_balance')
+                or equity.get('cash')
+                or equity.get('net')
+                or 0
+            )
+            new_capital = float(cap or 0)
+            if new_capital <= 0:
+                return  # transient broker glitch; keep the previous baseline
+            prev = self.starting_capital or 0.0
+            if abs(new_capital - prev) >= 100.0:
+                rm = self.config.get('risk_management', {})
+                limit = (
+                    new_capital
+                    * float(rm.get('max_daily_loss_percent', 2.5))
+                    / 100.0
+                )
+                logging.info(
+                    f"Capital baseline refreshed: {prev:,.2f} -> {new_capital:,.2f} "
+                    f"(new daily-loss limit: {limit:,.2f})"
+                )
+            self.starting_capital = new_capital
+        except Exception as e:
+            logging.debug(f"Capital refresh skipped (non-fatal): {e}")
+
+    # ----- Sentiment-refresh policy -----------------------------------------
+
+    async def _should_refresh_sentiment(self):
+        """
+        Returns (should_refresh: bool, reason: str). Decides whether the
+        operator should be re-prompted for sentiment + NL-prompt by comparing
+        current spot / VIX / automated-news-sentiment against the baseline
+        captured the last time the operator confirmed.
+        """
+        # No prior capture? First time through — must capture.
+        if self._cached_sentiment is None:
+            return True, "first capture"
+
+        cfg = self.config.get('sentiment_refresh', {}) or {}
+        if not cfg.get('enable', True):
+            return False, ""
+
+        reasons = []
+
+        # 1. Underlying-spot drift
+        spot_thresh = float(cfg.get('spot_change_pct', 1.0))
+        if self._sentiment_baseline_spot and self.order_agent is not None:
+            try:
+                token = self.order_agent.underlying_token
+                data = await asyncio.to_thread(self.kite.ltp, str(token))
+                spot_now = float((data or {}).get(str(token), {}).get('last_price', 0))
+                if spot_now > 0:
+                    pct = abs(spot_now - self._sentiment_baseline_spot) / self._sentiment_baseline_spot * 100.0
+                    if pct >= spot_thresh:
+                        reasons.append(
+                            f"underlying moved {pct:.2f}% "
+                            f"({self._sentiment_baseline_spot:.2f} -> {spot_now:.2f}, "
+                            f"threshold {spot_thresh}%)"
+                        )
+            except Exception as e:
+                logging.debug(f"Spot drift check failed: {e}")
+
+        # 2. VIX drift
+        vix_thresh = float(cfg.get('vix_change_pct', 25.0))
+        if self._sentiment_baseline_vix and self.market_condition_identifier:
+            try:
+                vix_token = self.market_condition_identifier.vix_token
+                data = await asyncio.to_thread(self.kite.ltp, str(vix_token))
+                vix_now = float((data or {}).get(str(vix_token), {}).get('last_price', 0))
+                if vix_now > 0:
+                    pct = abs(vix_now - self._sentiment_baseline_vix) / self._sentiment_baseline_vix * 100.0
+                    if pct >= vix_thresh:
+                        reasons.append(
+                            f"VIX moved {pct:.2f}% "
+                            f"({self._sentiment_baseline_vix:.2f} -> {vix_now:.2f}, "
+                            f"threshold {vix_thresh}%)"
+                        )
+            except Exception as e:
+                logging.debug(f"VIX drift check failed: {e}")
+
+        # 3. Automated news-sentiment regime flip (BULL <-> BEAR)
+        if cfg.get('on_sentiment_flip', True) and self._sentiment_baseline_auto:
+            try:
+                new_auto = self.sentiment_agent.get_market_sentiment()
+                def _regime(s):
+                    if s in ('Bullish', 'Very Bullish'): return 'BULL'
+                    if s in ('Bearish', 'Very Bearish'): return 'BEAR'
+                    return 'NEUTRAL'
+                old_r, new_r = _regime(self._sentiment_baseline_auto), _regime(new_auto)
+                if old_r != new_r and old_r != 'NEUTRAL' and new_r != 'NEUTRAL':
+                    reasons.append(
+                        f"automated news-sentiment regime flipped "
+                        f"({self._sentiment_baseline_auto} -> {new_auto})"
+                    )
+            except Exception as e:
+                logging.debug(f"Auto-sentiment flip check failed: {e}")
+
+        if reasons:
+            return True, "; ".join(reasons)
+        return False, ""
+
+    async def _snapshot_sentiment_context(self):
+        """Records spot / VIX / auto-sentiment baseline for future drift comparisons."""
+        try:
+            if self.order_agent is not None:
+                token = self.order_agent.underlying_token
+                data = await asyncio.to_thread(self.kite.ltp, str(token))
+                self._sentiment_baseline_spot = float(
+                    (data or {}).get(str(token), {}).get('last_price', 0) or 0
+                ) or None
+        except Exception as e:
+            logging.debug(f"Could not snapshot baseline spot: {e}")
+            self._sentiment_baseline_spot = None
+        try:
+            if self.market_condition_identifier is not None:
+                vix_token = self.market_condition_identifier.vix_token
+                data = await asyncio.to_thread(self.kite.ltp, str(vix_token))
+                self._sentiment_baseline_vix = float(
+                    (data or {}).get(str(vix_token), {}).get('last_price', 0) or 0
+                ) or None
+        except Exception as e:
+            logging.debug(f"Could not snapshot baseline VIX: {e}")
+            self._sentiment_baseline_vix = None
+        try:
+            self._sentiment_baseline_auto = self.sentiment_agent.get_market_sentiment()
+        except Exception as e:
+            logging.debug(f"Could not snapshot baseline auto-sentiment: {e}")
+            self._sentiment_baseline_auto = None
 
     async def _is_daily_loss_breached(self) -> bool:
         rm = self.config.get('risk_management', {})
@@ -339,7 +490,13 @@ class TradingBotOrchestrator:
         """
         self.bot_state = "SETUP"
         logging.info("--- Running Bot Setup & Strategy Assessment ---")
-        
+
+        # On reassessment runs (when a starting baseline already exists), refresh
+        # capital so the strategy decision and any downstream gates work off
+        # current account state, not the morning snapshot.
+        if self.starting_capital is not None and self.starting_capital > 0:
+            await self._refresh_starting_capital()
+
         try:
             today = datetime.date.today()
             # 1. Get Market Conditions
@@ -347,26 +504,60 @@ class TradingBotOrchestrator:
             if 'UNKNOWN' in todays_conditions:
                 self.no_trade_reason = "Could not determine market conditions."; return False
 
-            # 2. Determine Sentiment — automated read first, optional human override.
-            self.day_sentiment = self._resolve_sentiment()
+            # 2. Determine Sentiment — capture ONCE, reuse on reassessment unless
+            # the market has materially shifted (spot/VIX drift or news-sentiment flip).
+            should_refresh, refresh_reason = await self._should_refresh_sentiment()
+
+            if should_refresh:
+                if self._cached_sentiment is not None:
+                    # We're re-prompting (not first capture). Loud notice so the
+                    # operator knows why the bot is asking again.
+                    logging.warning(
+                        f"Re-prompting operator: significant market shift since last "
+                        f"sentiment capture — {refresh_reason}"
+                    )
+                    if self._is_interactive_tty():
+                        print("\n" + "!" * 78)
+                        print("  Significant market shift detected:")
+                        print(f"    {refresh_reason}")
+                        print("  Please reconfirm market sentiment.")
+                        print("!" * 78)
+
+                self.day_sentiment = self._resolve_sentiment()
+                self._cached_sentiment = self.day_sentiment
+                await self._snapshot_sentiment_context()
+            else:
+                logging.info(
+                    f"Reusing cached sentiment '{self._cached_sentiment}' — "
+                    f"no material market shift since last capture."
+                )
+                self.day_sentiment = self._cached_sentiment
+
             if self.day_sentiment == "Neutral":
                 self.no_trade_reason = "Market sentiment is Neutral. No new entries today."
                 return False
-            
+
             logging.info(f"Today's Market Conditions: {todays_conditions} | Final Sentiment: {self.day_sentiment}")
 
-            # 3. Get User Prompt — non-blocking: prefer config / env override, then TTY only.
-            user_prompt = ""
+            # 3. Get User Prompt — captured once when sentiment is captured. Reused
+            # on subsequent reassessments unless we're refreshing (i.e. there was a
+            # market shift big enough to ask for both inputs again).
             if self.config['trading_flags'].get('enable_natural_language_prompt', False):
-                user_prompt = (
-                    (self.config.get("daily_overrides", {}) or {}).get("nl_prompt", "")
-                    or os.environ.get("DAILY_NL_PROMPT", "")
-                )
-                if not user_prompt and self._is_interactive_tty():
-                    try:
-                        user_prompt = input("Enter trading observation or preference (or press Enter): ")
-                    except EOFError:
-                        user_prompt = ""
+                if should_refresh:
+                    user_prompt = (
+                        (self.config.get("daily_overrides", {}) or {}).get("nl_prompt", "")
+                        or os.environ.get("DAILY_NL_PROMPT", "")
+                    )
+                    if not user_prompt and self._is_interactive_tty():
+                        try:
+                            user_prompt = input("Enter trading observation or preference (or press Enter): ")
+                        except EOFError:
+                            user_prompt = ""
+                    self._cached_nl_prompt = user_prompt
+                else:
+                    user_prompt = self._cached_nl_prompt or ""
+            else:
+                user_prompt = ""
 
             # 4. Conditional RAG Context
             rag_context = None
@@ -699,6 +890,9 @@ class TradingBotOrchestrator:
         while self.is_market_open():
             try:
                 if self.bot_state == "AWAITING_SIGNAL":
+                    # Refresh capital baseline so the daily-loss limit and
+                    # downstream sizing reflect any mid-day deposits/withdrawals.
+                    await self._refresh_starting_capital()
                     # Hard gates that must pass before considering any new entry.
                     if await self._is_daily_loss_breached():
                         self.bot_state = "STOPPED"; continue
