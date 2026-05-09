@@ -726,6 +726,9 @@ class TradingBotOrchestrator:
             print("=" * 78)
 
         prompt_options = sorted(valid)
+        # Case-insensitive + whitespace-tolerant lookup. Maps "bullish",
+        # "BULLISH", "very  bullish" etc. all to the canonical form.
+        canonical_by_norm = {" ".join(s.split()).lower(): s for s in valid}
         while True:
             try:
                 user_input = input(
@@ -739,12 +742,16 @@ class TradingBotOrchestrator:
             if not user_input:
                 logging.info(f"Operator accepted automated sentiment: {automated}")
                 return automated
-            if user_input in valid:
-                logging.info(f"Operator overrode {automated} → {user_input}")
-                return user_input
+
+            normalized = " ".join(user_input.split()).lower()
+            canonical = canonical_by_norm.get(normalized)
+            if canonical:
+                logging.info(f"Operator overrode {automated} → {canonical}")
+                return canonical
+
             logging.warning(
                 f"Invalid input '{user_input}'. Choose from {prompt_options} "
-                f"or press Enter to accept '{automated}'."
+                f"(case-insensitive) or press Enter to accept '{automated}'."
             )
 
     async def display_market_closed_info(self):

@@ -1,18 +1,24 @@
 """
-SentimentAgent — NIFTY-relevant news sentiment.
+News-driven sentiment for the Nifty-50 trading bot.
 
-Earlier version pulled "India" / "Attack" / "FED" as standalone tokens, which
-matched plenty of unrelated global news. This version is structured around the
-actual NIFTY 50 constituents + Indian-market macro terms, restricts NewsAPI to
-a whitelist of Indian financial domains, matches keywords in the *title* (not
-the article body), and applies a post-fetch relevance filter as a safety net.
+Two layers of relevance:
 
-Cache: per-day file with a 1-hour TTL — keeps NewsAPI quota under control
-(free tier = 100 reqs/day; we use 3 reqs per cache miss × ~7 misses = ~21/day).
+  1. AT FETCH TIME — query NewsAPI with focused boolean OR over Nifty-50
+     constituents + macro/India-specific terms, biased toward Indian financial
+     news domains. Casts a reasonably wide net.
+
+  2. AT FILTER TIME — every fetched article is checked against a Nifty/India
+     keyword set; articles that mention none of them are dropped. This catches
+     the "Bharti Airtel" → "Brittney Griner won game" type false positives that
+     NewsAPI's relevance ranking lets through.
+
+The cache (1-hour TTL) stores ONLY the post-filtered articles, so downstream
+consumers (`get_market_sentiment`, `get_top_headlines`) work off relevant data
+without having to re-filter each call.
 """
-import logging
 import datetime
 import json
+import logging
 import os
 import time
 
@@ -21,104 +27,102 @@ from textblob import TextBlob
 
 
 # ---------------------------------------------------------------------------
-# NIFTY 50 relevance corpus
+# Static constants — Nifty 50 universe + relevance keywords + domain bias
 # ---------------------------------------------------------------------------
-# Every keyword here is a phrase strict enough that a hit implies Indian-market
-# context. Single broad words ("India", "Election") are deliberately avoided.
 
-NIFTY_50_CONSTITUENTS = [
+# Heavyweight Nifty 50 names — the ~30 stocks that move the index most
+# (top weights from NSE Indices factsheets, kept ASCII-only for query safety).
+NIFTY_50_KEY_NAMES = [
     "Reliance Industries", "HDFC Bank", "ICICI Bank", "Infosys", "TCS",
-    "Larsen Toubro", "L&T", "Bharti Airtel", "ITC", "Kotak Mahindra Bank",
-    "Hindustan Unilever", "Bajaj Finance", "Maruti Suzuki", "Mahindra Mahindra",
-    "Asian Paints", "Sun Pharma", "Tata Motors", "Tata Steel", "Wipro",
-    "NTPC", "Power Grid", "UltraTech Cement", "Titan Company", "Nestle India",
-    "Adani Enterprises", "Adani Ports", "JSW Steel", "ONGC", "Coal India",
-    "Tech Mahindra", "HCL Technologies", "Bajaj Finserv", "State Bank of India",
-    "Axis Bank", "Hindalco", "Britannia Industries", "Cipla", "Dr Reddy",
-    "Eicher Motors", "Grasim Industries", "Hero MotoCorp", "IndusInd Bank",
-    "Trent Limited", "BPCL", "Apollo Hospitals", "Tata Consumer", "Bajaj Auto",
-    "Shriram Finance", "LTIMindtree", "HDFC Life", "SBI Life",
+    "Larsen & Toubro", "Bharti Airtel", "ITC", "Kotak Mahindra Bank",
+    "Hindustan Unilever", "Axis Bank", "State Bank of India",
+    "Bajaj Finance", "Asian Paints", "Maruti Suzuki", "Sun Pharma",
+    "Mahindra & Mahindra", "Tata Motors", "Nestle India", "Wipro",
+    "UltraTech Cement", "Power Grid", "NTPC", "Tata Steel", "JSW Steel",
+    "Adani Enterprises", "Adani Ports", "Coal India", "ONGC",
+    "HCL Technologies", "Tech Mahindra", "Cipla", "Bajaj Finserv",
+    "Eicher Motors", "Britannia", "Hero MotoCorp", "Bajaj Auto",
+    "Grasim Industries", "Tata Consumer", "IndusInd Bank", "SBI Life",
+    "HDFC Life",
 ]
 
-# Macro / index phrases — strict, Indian-market only.
-MACRO_AND_INDEX_TERMS = [
-    "Nifty 50", "Nifty50", "Sensex", "BSE Sensex",
-    "Indian stock market", "Indian markets", "Indian equities",
-    "NSE India", "BSE India",
-    "RBI", "Reserve Bank of India", "repo rate", "MPC meeting",
-    "Indian economy", "Indian GDP",
-    "FII inflow", "FII outflow", "foreign portfolio investor",
-    "Union Budget", "Lok Sabha election", "Modi government",
-    "FOMC", "Fed rate decision",
+# Macro / index / regulator keywords used in the boolean OR query.
+MARKET_TERMS = [
+    "Nifty 50", "Nifty50", "Sensex", "BSE India", "NSE India",
+    "RBI", "Reserve Bank of India", "Indian stock market",
+    "Indian economy", "FII flows", "DII flows", "rupee dollar",
+    "FED rate", "repo rate", "Indian budget", "SEBI",
 ]
 
-# Whitelisted Indian financial news domains (NewsAPI `domains` filter).
-INDIAN_FINANCIAL_DOMAINS = [
+# Post-fetch relevance filter. An article must contain at least ONE of these
+# substrings (case-insensitive) in title+description to be retained. Mix of
+# index/regulator names + first-name fragments of major constituents.
+_CONSTITUENT_FRAGMENTS = [c.lower().split()[0] for c in NIFTY_50_KEY_NAMES]
+
+# "Strong" anchors — substrings that on their own definitively place the article
+# in Nifty/India financial context. Articles containing any of these pass the
+# filter unconditionally.
+STRONG_ANCHORS = sorted(set([
+    "nifty", "sensex", "bse", "nse", "rbi", "sebi",
+    "fii flows", "dii flows", "dalal street",
+    "indian markets", "indian economy", "indian stock",
+    "indian shares", "indian equities", "rupee",
+    "ambani", "adani",
+]))
+
+# "Weak" anchors — single-word stock surnames that *may* appear in non-financial
+# contexts (e.g. "Bharti" as a person's name in a film). When only weak anchors
+# match, we additionally require a FINANCIAL_CONTEXT keyword in the same article.
+WEAK_ANCHORS = sorted(set([
+    "indian", "india", "mumbai", "tata", "bajaj", "mahindra",
+] + _CONSTITUENT_FRAGMENTS))
+
+# Financial-context keywords. Disambiguates weak anchors like "Tata" from a
+# personal surname to "Tata Motors / Tata Group". Article must contain at least
+# one of these alongside a weak anchor to qualify.
+FINANCIAL_CONTEXT = sorted(set([
+    "stock", "stocks", "shares", "share price", "equity", "equities",
+    "market", "markets", "index", "trading", "trader", "trade",
+    "earnings", "profit", "loss", "revenue", "results", "quarterly",
+    "q1", "q2", "q3", "q4",
+    "crore", "lakh", "rupee", "rupees", " rs ", "₹",
+    "bse", "nse", "ipo", "broker", "investor", "investment",
+    "bourse", "fund", "yield", "rate", "policy",
+]))
+
+# Convenience union for legacy callers.
+RELEVANCE_KEYWORDS = sorted(set(STRONG_ANCHORS + WEAK_ANCHORS))
+
+# Indian-financial-news domain bias (NewsAPI 'domains' arg, comma-separated).
+# Used as a soft filter — if the domain query returns too few articles we
+# fall back to an unrestricted fetch with the same query and post-filter.
+INDIAN_FINANCIAL_DOMAINS = ",".join([
+    "moneycontrol.com",
     "economictimes.indiatimes.com",
     "livemint.com",
     "business-standard.com",
-    "thehindubusinessline.com",
     "financialexpress.com",
-    "moneycontrol.com",
-    "ndtvprofit.com",
+    "thehindu.com",
+    "indianexpress.com",
+    "businesstoday.in",
     "cnbctv18.com",
-    "bloombergquint.com",
+    "ndtv.com",
     "reuters.com",
     "bloomberg.com",
-]
+    "bloombergquint.com",
+])
 
-# Common short-forms that headlines frequently use ("Reliance" instead of
-# "Reliance Industries", "HDFC" instead of "HDFC Bank", etc.). Hand-curated to
-# stay specific — we deliberately omit ambiguous tokens like "Tata" alone (too
-# many unrelated subsidiaries) and require multi-word context for those.
-_NIFTY_STEM_TOKENS = [
-    # Conglomerates / specific
-    "reliance", "infosys", "wipro", "ntpc", "ongc", "ltimindtree",
-    # Banks (each maps unambiguously to NIFTY 50 constituents)
-    "hdfc", "icici", "axis bank", "kotak", "indusind", "sbi",
-    "state bank", "yes bank",
-    # Telecom / single-word stocks
-    "airtel", "bharti",
-    # Pharma
-    "sun pharma", "dr reddy", "cipla", "apollo hospitals",
-    # Consumer / paints
-    "asian paints", "hindustan unilever", "britannia", "nestle india",
-    "itc limited", "titan company", "trent ltd", "trent limited",
-    # Autos (avoid bare "Tata")
-    "maruti", "mahindra mahindra", "eicher motors", "hero motocorp",
-    "tata motors", "tata steel", "tata consumer",
-    # Bajaj group (specify which one)
-    "bajaj finance", "bajaj finserv", "bajaj auto",
-    # Cement / metals
-    "ultratech", "grasim", "hindalco", "jsw steel",
-    # Tech
-    "tech mahindra", "hcl tech",
-    # Adani (specify which one)
-    "adani enterprises", "adani ports",
-    # Energy
-    "bpcl", "power grid", "coal india",
-    # Other
-    "shriram finance", "hdfc life", "sbi life",
-]
+# How many heavyweight constituents to put in the OR query (NewsAPI has a
+# 500-char query limit; 15 names + 16 macro terms keeps us well under).
+_CONSTITUENT_QUERY_DEPTH = 15
 
-# Lowercase keyword set used by the post-fetch relevance filter.
-_RELEVANCE_KEYWORDS = {s.lower() for s in NIFTY_50_CONSTITUENTS + MACRO_AND_INDEX_TERMS}
-_RELEVANCE_KEYWORDS.update(s.lower() for s in _NIFTY_STEM_TOKENS)
-_RELEVANCE_KEYWORDS.update({
-    "nifty", "sensex", "rbi", "nse", "bse",
-    "indian market", "indian stocks", "indian shares", "indian rupee",
-})
+# Minimum filtered-article count below which we re-fetch without the domain
+# restriction. NewsAPI domains can be patchy on indexing; this is the safety net.
+_MIN_FILTERED_FOR_DOMAIN_FETCH = 12
 
 
 class SentimentAgent:
-    """
-    Fetches NIFTY-relevant news from a whitelist of Indian financial domains,
-    runs a polarity score over recent headlines, and reports a recency-weighted
-    market-sentiment verdict. Caches the merged article list per day with a
-    1-hour TTL so NewsAPI quota stays under control.
-    """
-
-    CACHE_EXPIRATION_SECONDS = 3600  # 1 hour
+    """Fetches Nifty-relevant news and computes a recency-weighted sentiment."""
 
     def __init__(self, config):
         self.config = config
@@ -126,145 +130,144 @@ class SentimentAgent:
         self.cache_dir = "news_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    # ------------------------------------------------------------------ #
-    # NewsAPI plumbing
-    # ------------------------------------------------------------------ #
+    # ---------- query builders ----------
 
-    def _fetch_one_query(self, q: str, from_date, to_date,
-                          use_qintitle: bool = True,
-                          use_domain_filter: bool = True) -> list:
+    def _build_query(self, max_chars: int = 480) -> str:
         """
-        One defensive NewsAPI call. Returns the 'articles' list or [] on failure.
-        Defaults to title-only matching + domain whitelist for maximum precision.
+        Boolean-OR of macro terms + heavyweight constituents, capped to NewsAPI's
+        free-tier 500-char query budget. Macro terms go in first (high priority);
+        constituents are appended until the budget is consumed.
         """
-        try:
-            kwargs = dict(
-                language="en",
-                sort_by="publishedAt",
-                page_size=100,
-                from_param=from_date.isoformat(),
-                to=to_date.isoformat(),
-            )
-            if use_domain_filter:
-                kwargs["domains"] = ",".join(INDIAN_FINANCIAL_DOMAINS)
-            if use_qintitle:
-                kwargs["qintitle"] = q
-            else:
-                kwargs["q"] = q
-            response = self.newsapi.get_everything(**kwargs)
-            return (response or {}).get("articles", []) or []
-        except Exception as e:
-            logging.warning(
-                f"SentimentAgent: news query failed (q='{q[:80]}...'): {e}"
-            )
-            return []
+        terms = [f'"{t}"' for t in MARKET_TERMS]
+        candidates = [f'"{c}"' for c in NIFTY_50_KEY_NAMES]
+        for cand in candidates:
+            tentative = " OR ".join(terms + [cand])
+            if len(tentative) > max_chars:
+                break
+            terms.append(cand)
+        return " OR ".join(terms)
+
+    # ---------- relevance filter ----------
 
     @staticmethod
     def _is_relevant(article: dict) -> bool:
-        """Drop anything that doesn't mention at least one NIFTY-relevant keyword."""
-        title = (article.get('title') or '').lower()
-        desc = (article.get('description') or '').lower()
-        text = f"{title} {desc}"
-        return any(kw in text for kw in _RELEVANCE_KEYWORDS)
+        """
+        Strict two-tier relevance:
+          1. If a STRONG_ANCHOR matches -> keep.
+          2. Else if a WEAK_ANCHOR matches AND a FINANCIAL_CONTEXT term also
+             matches -> keep. (Disambiguates "Bharti's latest film" from
+             "Bharti Airtel beats Q4 estimates".)
+          3. Else drop.
+        """
+        text = (
+            (article.get('title') or '') + ' '
+            + (article.get('description') or '') + ' '
+            + (article.get('content') or '')
+        ).lower()
+        if any(kw in text for kw in STRONG_ANCHORS):
+            return True
+        if any(kw in text for kw in WEAK_ANCHORS):
+            return any(ctx in text for ctx in FINANCIAL_CONTEXT)
+        return False
 
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+    def _filter_relevant(self, articles: list) -> list:
+        if not articles:
+            return []
+        return [a for a in articles if self._is_relevant(a)]
+
+    # ---------- raw NewsAPI calls ----------
+
+    def _fetch_from_api(self, query: str, from_date, to_date,
+                       domains: str | None = None) -> list:
+        kwargs = dict(
+            q=query,
+            language='en',
+            sort_by='publishedAt',
+            page_size=100,
+            from_param=from_date.isoformat(),
+            to=to_date.isoformat(),
+        )
+        if domains:
+            kwargs['domains'] = domains
+        try:
+            resp = self.newsapi.get_everything(**kwargs)
+        except Exception as e:
+            logging.error(f"SentimentAgent: NewsAPI call failed (domains={bool(domains)}): {e}")
+            return []
+        return resp.get('articles', []) or []
+
+    # ---------- cache + main fetch ----------
 
     def _get_news_articles(self):
         """
-        Build a NIFTY-relevant news payload by combining three targeted queries,
-        deduplicating by URL, and post-filtering for relevance. Result is cached
-        per day with a 1-hour TTL.
-
-        Returns the standard newsapi-python payload shape:
-            {"status": "ok", "totalResults": int, "articles": [...]}
-        so existing consumers (get_market_sentiment, get_top_headlines,
-        display_market_closed_info) keep working unchanged.
+        Returns a dict with key 'articles' containing post-filtered relevant
+        articles. Cached to disk for 1 hour to avoid hammering NewsAPI.
         """
         today = datetime.date.today()
         from_date = today - datetime.timedelta(days=2)
-        cache_file_path = os.path.join(self.cache_dir, f"news_{today.isoformat()}.json")
+        cache_path = os.path.join(self.cache_dir, f"news_{today.isoformat()}.json")
+        CACHE_EXPIRATION_SECONDS = 3600
 
-        # Cache hit?
-        if (os.path.exists(cache_file_path)
-                and (time.time() - os.path.getmtime(cache_file_path)) < self.CACHE_EXPIRATION_SECONDS):
-            logging.info(
-                f"SentimentAgent: Loading recent news from cache "
-                f"(less than {int(self.CACHE_EXPIRATION_SECONDS / 60)} minutes old)."
-            )
+        if (os.path.exists(cache_path)
+                and (time.time() - os.path.getmtime(cache_path)) < CACHE_EXPIRATION_SECONDS):
             try:
-                with open(cache_file_path, 'r') as f:
-                    return json.load(f)
+                with open(cache_path, 'r') as f:
+                    cached = json.load(f)
+                logging.info(
+                    f"SentimentAgent: loaded {len(cached.get('articles', []))} cached "
+                    f"relevant articles (< 60min old)."
+                )
+                return cached
             except Exception as e:
                 logging.warning(f"SentimentAgent: cache read failed ({e}); refetching.")
 
-        logging.info("SentimentAgent: Fetching fresh news (NIFTY-relevant only)...")
+        query = self._build_query()
+        logging.info("SentimentAgent: fetching fresh news (Indian financial domain bias)...")
 
-        # Three batch queries. Splitting constituents keeps each query's URL
-        # under NewsAPI's per-request length cap.
-        queries = [
-            " OR ".join(f'"{t}"' for t in MACRO_AND_INDEX_TERMS),
-            " OR ".join(f'"{c}"' for c in NIFTY_50_CONSTITUENTS[:25]),
-            " OR ".join(f'"{c}"' for c in NIFTY_50_CONSTITUENTS[25:]),
-        ]
+        # 1st pass: domain-restricted
+        articles = self._fetch_from_api(query, from_date, today,
+                                         domains=INDIAN_FINANCIAL_DOMAINS)
+        relevant = self._filter_relevant(articles)
+        domain_count = len(relevant)
 
-        unique_by_url = {}
-        for q in queries:
-            for article in self._fetch_one_query(q, from_date, today):
-                url = article.get('url')
-                if url and url not in unique_by_url:
-                    unique_by_url[url] = article
-
-        # Title-only match plus domain restriction is strict; the post-filter
-        # is a safety net for anything that still slips through (e.g., an
-        # Economic Times piece that mentions "FOMC" but is really about US tech).
-        relevant = [a for a in unique_by_url.values() if self._is_relevant(a)]
-        relevant.sort(key=lambda a: a.get('publishedAt', ''), reverse=True)
+        # 2nd pass (fallback) if domain-restricted was thin
+        if len(relevant) < _MIN_FILTERED_FOR_DOMAIN_FETCH:
+            logging.info(
+                f"SentimentAgent: domain-restricted yielded {len(relevant)} relevant "
+                f"articles (< {_MIN_FILTERED_FOR_DOMAIN_FETCH}); fetching unrestricted."
+            )
+            extra = self._fetch_from_api(query, from_date, today, domains=None)
+            extra_relevant = self._filter_relevant(extra)
+            # Dedupe by URL (NewsAPI articles always have a 'url' field).
+            seen = {a.get('url') for a in relevant if a.get('url')}
+            for a in extra_relevant:
+                u = a.get('url')
+                if u and u not in seen:
+                    relevant.append(a)
+                    seen.add(u)
 
         logging.info(
-            f"SentimentAgent: fetched {len(unique_by_url)} unique articles, "
-            f"{len(relevant)} kept after relevance filter."
+            f"SentimentAgent: kept {len(relevant)} relevant articles "
+            f"(domain-restricted: {domain_count}, after fallback: {len(relevant) - domain_count})."
         )
 
-        # If the strict path returned nothing, retry once without the domain
-        # whitelist — the user's NewsAPI plan may not index those domains.
-        # The relevance filter still keeps things NIFTY-only.
-        if not relevant:
-            logging.warning(
-                "SentimentAgent: 0 relevant articles from whitelisted domains; "
-                "retrying without domain filter."
-            )
-            unique_by_url.clear()
-            for q in queries:
-                for article in self._fetch_one_query(q, from_date, today,
-                                                     use_qintitle=True,
-                                                     use_domain_filter=False):
-                    url = article.get('url')
-                    if url and url not in unique_by_url:
-                        unique_by_url[url] = article
-            relevant = [a for a in unique_by_url.values() if self._is_relevant(a)]
-            relevant.sort(key=lambda a: a.get('publishedAt', ''), reverse=True)
-            logging.info(
-                f"SentimentAgent: fallback fetch -> {len(unique_by_url)} unique, "
-                f"{len(relevant)} relevant."
-            )
-
         payload = {
-            "status": "ok",
-            "totalResults": len(relevant),
-            "articles": relevant,
+            'articles': relevant,
+            'totalResults': len(relevant),
+            'fetchedAt': datetime.datetime.now().isoformat(),
         }
         try:
-            with open(cache_file_path, 'w') as f:
+            with open(cache_path, 'w') as f:
                 json.dump(payload, f)
         except Exception as e:
-            logging.warning(f"SentimentAgent: cache write failed (non-fatal): {e}")
+            logging.warning(f"SentimentAgent: cache write failed: {e}")
         return payload
+
+    # ---------- public API ----------
 
     def get_top_headlines(self, n: int = 10) -> list:
         """
-        Returns up to `n` most recent valid headlines with their individual
+        Returns up to `n` most recent relevant headlines with their individual
         polarity scores — for showing the operator what is actually driving the
         automated sentiment read before they confirm or override it.
 
@@ -297,43 +300,44 @@ class SentimentAgent:
 
     def get_market_sentiment(self):
         """
-        Calculates sentiment using a recency-weighted average of TextBlob
-        polarity scores over the (already NIFTY-filtered) headlines.
+        Recency-weighted average polarity over the relevant article set.
+        Returns one of: Very Bullish / Bullish / Neutral / Bearish / Very Bearish.
         """
-        top_headlines = self._get_news_articles()
-        if not top_headlines or not top_headlines.get('articles'):
-            logging.warning("SentimentAgent: No NIFTY-relevant news articles found.")
+        top = self._get_news_articles()
+        if not top or not top.get('articles'):
+            logging.warning("SentimentAgent: no relevant articles after filtering.")
             return "Neutral"
 
-        sentiment_scores = []
-        for article in top_headlines['articles']:
-            title = article.get('title', '')
+        scores = []
+        for article in top['articles']:
+            title = article.get('title') or ''
             if not title or title == "[Removed]":
                 continue
             content = f"{title}. {article.get('description', '')}"
-            sentiment_scores.append(TextBlob(content).sentiment.polarity)
+            try:
+                scores.append(float(TextBlob(content).sentiment.polarity))
+            except Exception:
+                continue
 
-        if not sentiment_scores:
-            logging.warning("SentimentAgent: No valid headlines to analyze.")
+        if not scores:
+            logging.warning("SentimentAgent: no scorable headlines.")
             return "Neutral"
 
-        # Weights decay linearly from N (newest) to 1 (oldest).
-        n = len(sentiment_scores)
-        weighted_sum = 0.0
-        total_weight = 0
-        for i, score in enumerate(sentiment_scores):
-            weight = n - i
-            weighted_sum += score * weight
-            total_weight += weight
-        avg_sentiment = weighted_sum / total_weight if total_weight else 0.0
-
+        # Linear-decay weighted average. Articles arrive newest-first.
+        n = len(scores)
+        weighted_sum = sum(score * (n - i) for i, score in enumerate(scores))
+        total_weight = sum(range(1, n + 1))
+        avg = weighted_sum / total_weight if total_weight else 0.0
         logging.info(
-            f"SentimentAgent: Weighted average sentiment score is {avg_sentiment:.3f} "
-            f"over {n} NIFTY-relevant articles."
+            f"SentimentAgent: weighted avg sentiment over {n} relevant headlines = {avg:+.3f}"
         )
 
-        if avg_sentiment > 0.4:    return "Very Bullish"
-        if avg_sentiment > 0.05:   return "Bullish"
-        if avg_sentiment < -0.4:   return "Very Bearish"
-        if avg_sentiment < -0.05:  return "Bearish"
+        if avg > 0.4:
+            return "Very Bullish"
+        if avg > 0.05:
+            return "Bullish"
+        if avg < -0.4:
+            return "Very Bearish"
+        if avg < -0.05:
+            return "Bearish"
         return "Neutral"
