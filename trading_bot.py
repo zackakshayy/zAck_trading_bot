@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import select
 import sys
 import yaml
 import time
@@ -137,6 +138,9 @@ class TradingBotOrchestrator:
         self._sentiment_baseline_spot = None
         self._sentiment_baseline_vix = None
         self._sentiment_baseline_auto = None
+        # Daily-report idempotency flag — set the first time the report is sent
+        # (whether by normal market-close or by an early shutdown).
+        self._report_sent = False
 
     def authenticate(self, request_token_override=None):
         """
@@ -523,7 +527,7 @@ class TradingBotOrchestrator:
                         print("  Please reconfirm market sentiment.")
                         print("!" * 78)
 
-                self.day_sentiment = self._resolve_sentiment()
+                self.day_sentiment = await self._resolve_sentiment()
                 self._cached_sentiment = self.day_sentiment
                 await self._snapshot_sentiment_context()
             else:
@@ -549,10 +553,14 @@ class TradingBotOrchestrator:
                         or os.environ.get("DAILY_NL_PROMPT", "")
                     )
                     if not user_prompt and self._is_interactive_tty():
-                        try:
-                            user_prompt = input("Enter trading observation or preference (or press Enter): ")
-                        except EOFError:
-                            user_prompt = ""
+                        timeout = float(self.config['trading_flags'].get(
+                            'operator_input_timeout_seconds', 20))
+                        result = await self._input_with_timeout(
+                            "Enter trading observation or preference (or press Enter): ",
+                            timeout=timeout,
+                        )
+                        # None (timeout) and "" (empty) both mean "no observation".
+                        user_prompt = result if result else ""
                     self._cached_nl_prompt = user_prompt
                 else:
                     user_prompt = self._cached_nl_prompt or ""
@@ -648,7 +656,60 @@ class TradingBotOrchestrator:
         except Exception:
             return False
 
-    def _resolve_sentiment(self):
+    async def _input_with_timeout(self, prompt: str, timeout: float = 20.0):
+        """
+        Reads a line from stdin with a timeout. Returns the stripped input
+        line, "" if the user just pressed Enter, or None if no input arrived
+        within `timeout` seconds (the bot will then take its own decision).
+
+        Implementation note: uses POSIX select() in a worker thread so the
+        asyncio event loop stays responsive and no thread is leaked on timeout
+        (select doesn't consume any data — readline() is only called if input
+        is actually ready).
+        """
+        if not self._is_interactive_tty():
+            return None  # headless: caller falls back to its default
+
+        print(prompt, end='', flush=True)
+
+        def _wait_for_line():
+            try:
+                ready, _, _ = select.select([sys.stdin], [], [], timeout)
+            except Exception as e:
+                logging.debug(f"select() on stdin failed: {e}")
+                return None
+            if not ready:
+                return None
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                return None
+            return line if line else None  # readline returns "" on EOF
+
+        line = await asyncio.to_thread(_wait_for_line)
+        if line is None:
+            print(f"\n  [no response in {int(timeout)}s — bot will take its own decision]")
+            logging.info(f"Operator input timeout ({int(timeout)}s); bot using its own default.")
+            return None
+        return line.rstrip("\n").strip()
+
+    def _send_shutdown_report_once(self):
+        """
+        Sends the daily P&L report, idempotently. Fires at end-of-day, on
+        Ctrl+C, on early-stop conditions (token expiry, daily-loss breach),
+        or on any unhandled exception. If a report has already been sent
+        this session, this is a no-op.
+        """
+        if self._report_sent:
+            return
+        self._report_sent = True
+        try:
+            send_daily_report(self.config, str(datetime.date.today()))
+            logging.info("Daily report sent.")
+        except Exception as e:
+            logging.error(f"Failed to send shutdown report: {e}", exc_info=True)
+
+    async def _resolve_sentiment(self):
         """
         Compute today's sentiment via a hybrid flow:
 
@@ -729,17 +790,20 @@ class TradingBotOrchestrator:
         # Case-insensitive + whitespace-tolerant lookup. Maps "bullish",
         # "BULLISH", "very  bullish" etc. all to the canonical form.
         canonical_by_norm = {" ".join(s.split()).lower(): s for s in valid}
-        while True:
-            try:
-                user_input = input(
-                    f"\nAutomated sentiment: {automated}\n"
-                    f"Press Enter to accept, or type one of {prompt_options} to override: "
-                ).strip()
-            except EOFError:
-                logging.info(f"EOF on stdin → using automated sentiment '{automated}'.")
-                return automated
+        timeout = float(self.config['trading_flags'].get('operator_input_timeout_seconds', 20))
 
-            if not user_input:
+        while True:
+            user_input = await self._input_with_timeout(
+                f"\nAutomated sentiment: {automated}\n"
+                f"Press Enter to accept, or type one of {prompt_options} to override: ",
+                timeout=timeout,
+            )
+
+            if user_input is None:
+                # Timeout — bot accepts its own automated read.
+                logging.info(f"Sentiment auto-resolved on timeout: {automated}")
+                return automated
+            if user_input == "":
                 logging.info(f"Operator accepted automated sentiment: {automated}")
                 return automated
 
@@ -850,8 +914,22 @@ class TradingBotOrchestrator:
         """The main event loop for the trading bot."""
         if not self.is_market_open():
             await self.display_market_closed_info()
-            return
+            return  # No report — bot never attempted trading.
 
+        try:
+            await self._run_inner()
+        except (KeyboardInterrupt, asyncio.CancelledError, SystemExit) as e:
+            logging.info(f"Bot shutdown signal: {type(e).__name__}.")
+        except Exception as e:
+            logging.error(f"Unhandled exception in run(): {e}", exc_info=True)
+        finally:
+            # Always send the daily report on exit — Ctrl+C, token expiry,
+            # daily-loss breach, crash, normal market close. Whatever trades
+            # happened today get emailed; if none, a "no trades" report goes out.
+            self._send_shutdown_report_once()
+
+    async def _run_inner(self):
+        """The actual trading orchestration — wrapped by run() in a try/finally."""
         # Reconcile any persisted open position from a previous session before setup.
         try:
             resumed = await self.position_agent.reconcile_open_position()
@@ -861,8 +939,7 @@ class TradingBotOrchestrator:
 
         if not await self.setup():
             logging.warning(f"Setup failed. Reason: {self.no_trade_reason or 'Unknown'}. Bot will exit.")
-            send_daily_report(self.config, str(datetime.date.today()))
-            return
+            return  # Finally block in run() will send the report.
 
         await self._capture_starting_capital()
         await self._compute_effective_entry_start()
@@ -982,7 +1059,8 @@ class TradingBotOrchestrator:
                 await asyncio.sleep(15)
         
         logging.info("Market is now closed. Shutting down trading loop.")
-        send_daily_report(self.config, str(datetime.date.today()))
+        # Report is sent by the finally block in run() — no need to call here.
+
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()

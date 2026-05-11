@@ -69,6 +69,9 @@ trading_flags:
   risk_reward_ratio: 2.0
   min_days_to_expiry: 2
   limit_order_slippage_percent: 0.5
+  # Operator-prompt timeout. If no keystroke for this many seconds, the bot
+  # takes its own decision (accepts automated sentiment / skips NL prompt).
+  operator_input_timeout_seconds: 20
   # Entry-time gating. Default skip-the-noise window after the open is 09:15 -> 09:30.
   # The bot pulls this forward to 09:15 automatically when:
   #   (a) today is a known macro event day (FED / RBI / etc.), OR
