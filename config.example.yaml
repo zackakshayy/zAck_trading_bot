@@ -132,6 +132,15 @@ strike_steps:
 rag:
   recency_window_days: 30
   min_trades_per_strategy: 3
+# Deterministic strategy selector — no LLM required. 5-layer cascade:
+#   1. Hard pins (event days / weekly expiry)
+#   2. Open-gap override (gap-and-go days)
+#   3. Indicator overrides (BB squeeze / NR7 / RSI extreme / volume spike / Supertrend flip)
+#   4. Regime table (VIX x IV x Sentiment)
+#   5. Last-resort default
+strategy_selector:
+  use_llm: false            # if true, consult Gemini first; cascade is fallback
+  gap_override_pct: 0.8     # |open gap %| threshold for Layer-2 override
 # Expiry-day overrides — auto-applied on any day where a contract of the
 # configured underlying expires (detected from the live instrument list).
 # Reduces risk on the day the broader market is being whipsawed by gamma trades.

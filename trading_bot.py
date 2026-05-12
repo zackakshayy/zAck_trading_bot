@@ -132,6 +132,9 @@ class TradingBotOrchestrator:
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
+        # Signed open-gap % vs prior close (set by _compute_effective_entry_start
+        # once market is open; consumed by the strategy selector's Layer-2 override).
+        self.open_gap_pct = None
         # Cache for the underlying intraday bar data (refreshed only when a new bar closes).
         self._bars_cache = None
         self._bars_cached_at_bar = None
@@ -459,10 +462,13 @@ class TradingBotOrchestrator:
                             prev_close = float(prev.iloc[0]['close'])
                             ltp_data = await asyncio.to_thread(self.kite.ltp, str(token))
                             ltp = ltp_data[str(token)]['last_price']
-                            gap_pct = abs(ltp - prev_close) / prev_close * 100.0
+                            signed_gap_pct = (ltp - prev_close) / prev_close * 100.0
+                            # Stash signed gap for the strategy selector (Layer 2).
+                            self.open_gap_pct = signed_gap_pct
+                            gap_pct = abs(signed_gap_pct)
                             if gap_pct >= threshold:
                                 chosen = early_start
-                                reason = (f"open-gap {gap_pct:.2f}% >= threshold {threshold}% "
+                                reason = (f"open-gap {signed_gap_pct:+.2f}% >= threshold {threshold}% "
                                           f"(prev_close={prev_close:.2f}, ltp={ltp:.2f})")
                 except Exception as e:
                     logging.debug(f"Open-gap check failed (using default start): {e}")
@@ -663,8 +669,34 @@ class TradingBotOrchestrator:
             else:
                 logging.info("RAG is disabled in config.yaml.")
             
-            # 5. Select Strategy
-            best_strategy_name = await self.langgraph_agent.get_recommended_strategy(todays_conditions, user_prompt, rag_context)
+            # 5. Select Strategy — pass full context so the deterministic cascade
+            # can apply hard pins / open-gap override / indicator overrides /
+            # regime table without ever needing the LLM. Missing data simply
+            # skips the relevant cascade layer.
+            is_expiry_day_now = False
+            try:
+                if self.order_agent is not None:
+                    is_expiry_day_now = self.order_agent.is_weekly_expiry_today()
+            except Exception:
+                pass
+
+            bars_for_selector = None
+            try:
+                # Bars are cached intraday — cheap to ask for again. None pre-open.
+                if self.is_market_open() and self.order_agent is not None:
+                    bars_for_selector = await self._get_underlying_bars()
+            except Exception as e:
+                logging.debug(f"Bars-for-selector fetch failed (non-fatal): {e}")
+
+            best_strategy_name = await self.langgraph_agent.get_recommended_strategy(
+                market_conditions=todays_conditions,
+                sentiment=self.day_sentiment,
+                is_expiry_day=is_expiry_day_now,
+                open_gap_pct=self.open_gap_pct,
+                underlying_bars=bars_for_selector,
+                user_prompt=user_prompt,
+                rag_context=rag_context,
+            )
             self.active_strategy_name = best_strategy_name
             self.active_strategy = get_strategy(best_strategy_name, self.kite, self.config)
             

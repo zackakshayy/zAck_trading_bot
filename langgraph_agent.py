@@ -2,45 +2,178 @@ import logging
 import json
 import asyncio
 import aiohttp
-from typing import TypedDict
+from typing import Optional, Tuple
+
+import pandas as pd
+
 from rag_service import RAGService
 
 
 # ---------------------------------------------------------------------------
-# Regime-based deterministic fallback
+# DETERMINISTIC STRATEGY SELECTOR (5-layer cascade)
 # ---------------------------------------------------------------------------
-# Mapped from market_conditions set -> recommended strategy. Used when the LLM
-# is unavailable (rate limit, network, invalid response) and we must still pick
-# something *defensible* without the LLM doing the regime reasoning for us.
+# No LLM required. Same shape a discretionary trader would use:
+#   1. Hard pins (event days, expiry day)
+#   2. Open-gap override (gap-and-go days have a dedicated strategy)
+#   3. Indicator overrides (on-screen patterns force their own strategy)
+#   4. Regime table (3-D lookup over VIX x IV x Sentiment-family)
+#   5. Last-resort default
 #
-# Order matters: the first rule whose condition-set is a subset of today's
-# conditions wins. Place stricter / more specific rules first.
-REGIME_FALLBACK_RULES = [
-    # Macro event days — dedicated strategy regardless of VIX/IV
-    ({"EVENT_FED_MEETING"}, "Opening_Range_Breakout"),
-    ({"EVENT_RBI_POLICY"},  "Opening_Range_Breakout"),
-    # High volatility regimes — favour reversal / vol-cluster plays
-    ({"VIX_HIGH", "IV_HIGH"},     "Volatility_Cluster_Reversal"),
-    ({"VIX_HIGH"},                "Volatility_Cluster_Reversal"),
-    ({"VIX_MEDIUM", "IV_HIGH"},   "Reversal_Detector"),
-    # Calm regimes — favour higher-frequency setups that actually fire often.
-    # NR7 catches compression-then-expansion breakouts on quiet days.
-    # VWAP_Reversion fires multiple times per day on a trending session.
-    ({"VIX_LOW", "IV_LOW"},       "NR7_Compression"),
-    ({"VIX_LOW"},                 "VWAP_Reversion"),
-    ({"VIX_MEDIUM", "IV_LOW"},    "VWAP_Reversion"),
-    ({"VIX_MEDIUM"},              "Gemini_Default"),
-]
+# pick_strategy_deterministic() returns (strategy_name, reason). All inputs
+# beyond market_conditions + sentiment are optional — missing data simply
+# skips that layer rather than failing.
+# ---------------------------------------------------------------------------
 
 
-def regime_fallback_strategy(market_conditions: set) -> str | None:
-    """First matching rule wins. Returns None if no rule matches."""
-    if not market_conditions:
+def _detect_indicator_override(df) -> Optional[Tuple[str, str]]:
+    """
+    Returns (strategy_name, reason) if a strong on-screen pattern is detected
+    in the underlying-bar dataframe; else None. First match wins.
+
+    Each check needs the relevant indicator columns to be present and non-NaN.
+    `calculate_all_indicators()` populates all of these so passing a df from
+    `_get_underlying_bars()` is sufficient.
+    """
+    if df is None or len(df) < 8:
         return None
-    for required, strategy in REGIME_FALLBACK_RULES:
-        if required.issubset(market_conditions):
-            return strategy
+
+    last = df.iloc[-1]
+
+    # 1. Bollinger-band compression: bandwidth materially below its own MA.
+    if "bb_bandwidth" in df.columns and "bb_bandwidth_ma" in df.columns:
+        bw, bw_ma = last.get("bb_bandwidth"), last.get("bb_bandwidth_ma")
+        if pd.notna(bw) and pd.notna(bw_ma) and bw_ma > 0 and bw < 0.7 * bw_ma:
+            return (
+                "BB_Squeeze_Breakout",
+                f"BB-bandwidth compression (bw={bw:.3f} < 0.7 x MA={bw_ma:.3f})",
+            )
+
+    # 2. NR7: the narrowest of the last 8 bars is within the last 3 (fresh).
+    try:
+        ranges_8 = (df["high"] - df["low"]).iloc[-8:]
+        if not ranges_8.isna().any():
+            min_idx_in_8 = int(ranges_8.values.argmin())
+            if min_idx_in_8 >= 5:  # narrowest bar is among the last 3 of the 8-window
+                return (
+                    "NR7_Compression",
+                    f"Fresh NR7 compression (narrowest bar in last 3, "
+                    f"range={float(ranges_8.min()):.2f})",
+                )
+    except Exception:
+        pass
+
+    # 3. RSI extreme on the underlying (textbook reversal zone).
+    rsi = last.get("rsi")
+    if pd.notna(rsi):
+        rsi_f = float(rsi)
+        if rsi_f > 78 or rsi_f < 22:
+            return (
+                "Reversal_Detector",
+                f"RSI extreme ({rsi_f:.1f}) — outside (22, 78)",
+            )
+
+    # 4. Volume spike vs 20-bar MA (smart-money footprint).
+    vol = last.get("volume")
+    vol_ma = last.get("volume_ma")
+    if pd.notna(vol) and pd.notna(vol_ma) and vol_ma > 0 and float(vol) > 2.0 * float(vol_ma):
+        return (
+            "Volume_Spread_Analysis",
+            f"Volume spike (vol={float(vol):.0f} > 2x MA={float(vol_ma):.0f})",
+        )
+
+    # 5. Supertrend flipped on the last completed bar.
+    if "supertrend_direction" in df.columns and len(df) >= 2:
+        last_st = df.iloc[-1].get("supertrend_direction")
+        prev_st = df.iloc[-2].get("supertrend_direction")
+        if pd.notna(last_st) and pd.notna(prev_st) and last_st != 0 and prev_st != 0 and last_st != prev_st:
+            return (
+                "Supertrend_MACD",
+                f"Supertrend flipped ({int(prev_st)} -> {int(last_st)})",
+            )
+
     return None
+
+
+def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
+    """
+    3-D table lookup. Sentiment-family bucketing:
+      Bull = {Bullish, Very Bullish}
+      Bear = {Bearish, Very Bearish}
+      Neutral handled upstream (no trade today).
+    Returns the strategy name, or None if conditions don't match any cell.
+    """
+    is_bull = sentiment in ("Bullish", "Very Bullish")
+    is_bear = sentiment in ("Bearish", "Very Bearish")
+    if not (is_bull or is_bear):
+        return None
+
+    if "VIX_HIGH" in market_conditions:
+        # All VIX_HIGH cells route to the same strategy — high vol = vol-cluster reversal.
+        return "Volatility_Cluster_Reversal"
+
+    iv_high = "IV_HIGH" in market_conditions
+
+    if "VIX_MEDIUM" in market_conditions:
+        if not iv_high:  # IV_LOW or unspecified
+            return "VWAP_Reversion"
+        return "EMA_Cross_RSI" if is_bull else "Supertrend_MACD"
+
+    if "VIX_LOW" in market_conditions:
+        if not iv_high:
+            return "BB_Squeeze_Breakout" if is_bull else "NR7_Compression"
+        return "Volume_Spread_Analysis" if is_bull else "RSI_Divergence"
+
+    return None
+
+
+def pick_strategy_deterministic(
+    market_conditions: set,
+    sentiment: str,
+    is_expiry_day: bool = False,
+    open_gap_pct: Optional[float] = None,
+    underlying_bars=None,
+    config: Optional[dict] = None,
+) -> Tuple[str, str]:
+    """
+    Returns (strategy_name, reason). 5-layer priority cascade — first match wins.
+    """
+    cfg = (config or {}).get("strategy_selector", {}) or {}
+    gap_threshold = float(cfg.get("gap_override_pct", 0.8))
+
+    # ----- Layer 1: hard pins -----
+    if "EVENT_FED_MEETING" in market_conditions:
+        return ("Opening_Range_Breakout", "Hard pin: FOMC meeting day")
+    if "EVENT_RBI_POLICY" in market_conditions:
+        return ("Opening_Range_Breakout", "Hard pin: RBI policy day")
+    if is_expiry_day:
+        return (
+            "RSI_Divergence",
+            "Hard pin: weekly expiry day (mean-reversion bias on gamma whipsaw)",
+        )
+
+    # ----- Layer 2: open-gap override -----
+    if open_gap_pct is not None and abs(open_gap_pct) >= gap_threshold:
+        return (
+            "Breakout_Prev_Day_HL",
+            f"Open-gap override: {open_gap_pct:+.2f}% (|gap| >= {gap_threshold}%)",
+        )
+
+    # ----- Layer 3: indicator overrides -----
+    ind_pick = _detect_indicator_override(underlying_bars)
+    if ind_pick:
+        strat, why = ind_pick
+        return (strat, f"Indicator override: {why}")
+
+    # ----- Layer 4: regime table -----
+    regime_pick = _regime_table_pick(market_conditions, sentiment)
+    if regime_pick:
+        return (
+            regime_pick,
+            f"Regime table: VIX/IV/Sentiment match -> {sorted(market_conditions)} + {sentiment}",
+        )
+
+    # ----- Layer 5: last resort -----
+    return ("Gemini_Default", "Last-resort default (no other layer matched)")
 
 
 class LangGraphAgent:
@@ -52,54 +185,46 @@ class LangGraphAgent:
         self.api_key = config.get('google_api', {}).get('api_key', "")
         self.model_name = "gemini-2.0-flash"
 
-    def _smart_fallback(self, market_conditions: set) -> str:
-        """
-        Two-layer fallback when the LLM is unavailable:
-          1. If a regime rule matches, use it.
-          2. Else pick the strategy with best recent risk-adjusted score
-             (computed by RAGService over the recency window).
-          3. Else 'Gemini_Default' as last-resort.
-        """
-        regime_pick = regime_fallback_strategy(market_conditions)
-        if regime_pick:
-            logging.info(
-                f"[Fallback] Regime rule matched conditions={set(market_conditions)} -> {regime_pick}"
-            )
-            return regime_pick
+    def _deterministic_pick(self, market_conditions, sentiment, is_expiry_day,
+                             open_gap_pct, underlying_bars) -> str:
+        """Wrap pick_strategy_deterministic with consistent logging."""
+        strat, reason = pick_strategy_deterministic(
+            market_conditions=market_conditions,
+            sentiment=sentiment,
+            is_expiry_day=is_expiry_day,
+            open_gap_pct=open_gap_pct,
+            underlying_bars=underlying_bars,
+            config=self.config,
+        )
+        logging.info(f"[Selector] Deterministic pick: {strat} — {reason}")
+        return strat
 
-        try:
-            stats = self.rag_service.compute_strategy_stats()
-        except Exception as e:
-            logging.warning(f"[Fallback] compute_strategy_stats failed: {e}")
-            stats = {}
-
-        if stats:
-            best = max(stats.items(), key=lambda kv: kv[1]['score'])
-            best_name, best_meta = best
-            if best_meta['score'] > 0:
-                logging.info(
-                    f"[Fallback] Best recent score: '{best_name}' "
-                    f"(score={best_meta['score']:.2f}, n={best_meta['trades']})"
-                )
-                return best_name
-            logging.info(
-                f"[Fallback] No strategy has positive recent score; using Gemini_Default."
-            )
-        else:
-            logging.info(
-                "[Fallback] No regime match, no recent stats available; using Gemini_Default."
-            )
-        return "Gemini_Default"
-
-    async def get_recommended_strategy(self, market_conditions: set, user_prompt: str = None, rag_context: str = None):
+    async def get_recommended_strategy(
+        self,
+        market_conditions: set,
+        sentiment: str = "Neutral",
+        is_expiry_day: bool = False,
+        open_gap_pct: Optional[float] = None,
+        underlying_bars=None,
+        user_prompt: str = None,
+        rag_context: str = None,
+    ):
         """
-        Gets a strategy recommendation from the Gemini API, optionally augmented with
-        RAG context. On any failure, falls back to a regime-rule + recent-score chain
-        instead of a hardcoded Gemini_Default.
+        Returns a strategy name. Decision path:
+          - If `strategy_selector.use_llm` is False (default) OR no Gemini key
+            available: skip LLM entirely, return the deterministic cascade's pick.
+          - If `use_llm` is True: try the LLM with the rich prompt below; on any
+            failure (rate limit, network, invalid response) fall back to the
+            deterministic cascade.
         """
-        if not self.api_key:
-            logging.error("[Gemini Agent] Google API key not found. Using smart fallback.")
-            return self._smart_fallback(market_conditions)
+        cfg = (self.config.get("strategy_selector", {}) or {})
+        use_llm = bool(cfg.get("use_llm", False))
+
+        if not use_llm or not self.api_key:
+            return self._deterministic_pick(
+                market_conditions, sentiment, is_expiry_day,
+                open_gap_pct, underlying_bars,
+            )
 
         logging.info(f"[Gemini Agent] Market Conditions: {market_conditions}. Recommending strategy...")
 
@@ -163,15 +288,21 @@ class LangGraphAgent:
             if recommended_strategy not in valid_strategies:
                 logging.warning(
                     f"[Gemini Agent] LLM returned unknown strategy: '{recommended_strategy}'. "
-                    f"Falling back to regime/score-based pick."
+                    f"Falling back to deterministic cascade."
                 )
-                return self._smart_fallback(market_conditions)
+                return self._deterministic_pick(
+                    market_conditions, sentiment, is_expiry_day,
+                    open_gap_pct, underlying_bars,
+                )
 
             logging.info(f"[Gemini Agent] AI Recommended Strategy: {recommended_strategy}")
             return recommended_strategy
 
         except Exception as e:
             logging.error(
-                f"[Gemini Agent] Error calling Gemini API: {e}. Using smart fallback."
+                f"[Gemini Agent] Error calling Gemini API: {e}. Using deterministic cascade."
             )
-            return self._smart_fallback(market_conditions)
+            return self._deterministic_pick(
+                market_conditions, sentiment, is_expiry_day,
+                open_gap_pct, underlying_bars,
+            )
