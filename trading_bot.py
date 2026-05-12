@@ -479,6 +479,51 @@ class TradingBotOrchestrator:
             return False
         return market_open <= now <= market_close
 
+    def is_pre_market_window(self) -> bool:
+        """
+        True when we're in the pre-market warm-up window on a trading day
+        (default 08:50 IST -> 09:15 IST). Lets the bot do auth, sentiment
+        capture, strategy selection, etc. in advance so it's ready to fire
+        at the open instead of starting cold at 09:15.
+        """
+        now_dt = datetime.datetime.now()
+        if now_dt.weekday() >= 5:
+            return False
+        if is_nse_holiday(now_dt.date()):
+            return False
+        flags = self.config.get('trading_flags', {}) or {}
+        start = self._parse_hhmm(flags.get('pre_market_start_time', '08:50')) \
+            or datetime.time(8, 50)
+        return start <= now_dt.time() < datetime.time(9, 15)
+
+    async def _wait_for_market_open(self):
+        """
+        Async sleep until 09:15:30 IST (a few seconds past open so the LTP
+        feed has actually printed at least one tick before any gap-based
+        decisions run). Logs once per minute so the wait is visible in the
+        terminal; sleeps in 5-second chunks so Ctrl+C remains responsive.
+        """
+        target = datetime.datetime.combine(
+            datetime.date.today(), datetime.time(9, 15, 30)
+        )
+        print("\n" + "=" * 78)
+        print("  Pre-market setup complete. Holding until market opens at 09:15 IST...")
+        print("=" * 78)
+        last_announced_min = -1
+        while True:
+            now = datetime.datetime.now()
+            remaining = (target - now).total_seconds()
+            if remaining <= 0:
+                break
+            mins_left = int(remaining // 60)
+            if mins_left != last_announced_min:
+                secs = int(remaining - mins_left * 60)
+                logging.info(f"Pre-market hold: market opens in {mins_left}m {secs}s.")
+                last_announced_min = mins_left
+            await asyncio.sleep(min(5.0, max(1.0, remaining)))
+        print("\n  Market is now open. Entering trading loop.\n")
+        logging.info("Pre-market hold released; market is open.")
+
     def get_next_trading_day(self):
         """Calculates the next NSE trading day (skips weekends and holidays)."""
         today = datetime.date.today()
@@ -486,6 +531,21 @@ class TradingBotOrchestrator:
         while next_day.weekday() >= 5 or is_nse_holiday(next_day):
             next_day += datetime.timedelta(days=1)
         return next_day
+
+    def _next_market_open_str(self) -> str:
+        """
+        Returns 'today at 9:15 AM' if today is a trading day and we're still
+        before 9:15, else 'next trading day at 9:15 AM' phrasing for the
+        closed-info banner.
+        """
+        now_dt = datetime.datetime.now()
+        today = now_dt.date()
+        if (now_dt.weekday() < 5
+                and not is_nse_holiday(today)
+                and now_dt.time() < datetime.time(9, 15)):
+            return "today at 9:15 AM"
+        next_day = self.get_next_trading_day()
+        return f"{next_day.strftime('%A, %d %B')} at 9:15 AM"
 
     async def setup(self):
         """
@@ -844,8 +904,10 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.error(f"Could not fetch post-market data: {e}")
         
-        next_day_str = self.get_next_trading_day().strftime('%A, %d %B')
-        print(f"\nMarket is closed right now, enjoy your day and come back on {next_day_str} at 9:15 AM to trade like a Warrior!\n")
+        print(
+            f"\nMarket is closed right now, enjoy your day and come back "
+            f"{self._next_market_open_str()} to trade like a Warrior!\n"
+        )
 
     @staticmethod
     def _timeframe_minutes(timeframe: str) -> int:
@@ -912,9 +974,18 @@ class TradingBotOrchestrator:
 
     async def run(self):
         """The main event loop for the trading bot."""
-        if not self.is_market_open():
+        # Accept startup during market hours OR the pre-market warm-up window
+        # (default 08:50 -> 09:15 IST). Anything else -> closed-info banner.
+        if not (self.is_market_open() or self.is_pre_market_window()):
             await self.display_market_closed_info()
             return  # No report — bot never attempted trading.
+
+        if self.is_pre_market_window() and not self.is_market_open():
+            now_str = datetime.datetime.now().strftime('%H:%M:%S')
+            print("\n" + "=" * 78)
+            print(f"  Pre-market start at {now_str} — running setup ahead of 09:15 open.")
+            print("=" * 78)
+            logging.info("Started during pre-market window; running setup in advance.")
 
         try:
             await self._run_inner()
@@ -942,9 +1013,8 @@ class TradingBotOrchestrator:
             return  # Finally block in run() will send the report.
 
         await self._capture_starting_capital()
-        await self._compute_effective_entry_start()
 
-        # ---------- Expiry-day banner + active overrides ----------
+        # ---------- Expiry-day detection + banner (no LTP needed; safe pre-market) ----------
         self.is_expiry_day = False
         try:
             self.is_expiry_day = self.order_agent.is_weekly_expiry_today()
@@ -964,6 +1034,17 @@ class TradingBotOrchestrator:
                 print("  Expiry-day overrides are disabled in config.yaml.")
             print("=" * 78 + "\n")
             logging.warning("Today is weekly expiry day; expiry-day overrides applied.")
+
+        # If we started in pre-market, hold here until the actual open. All
+        # setup (auth, sentiment, strategy pick, expiry detection) is done;
+        # we just sleep until 09:15:30 IST so the open-gap check below has
+        # a real LTP to compare against.
+        if not self.is_market_open() and self.is_pre_market_window():
+            await self._wait_for_market_open()
+
+        # Compute effective entry start AFTER the market is open so the open
+        # gap check uses real LTP (gap = 0 in pre-market — would be a no-op).
+        await self._compute_effective_entry_start()
 
         is_paper = self.config['trading_flags']['paper_trading']
         logging.info(f"Bot running in {'PAPER TRADING' if is_paper else 'LIVE TRADING'} mode.")

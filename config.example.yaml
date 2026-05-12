@@ -72,6 +72,10 @@ trading_flags:
   # Operator-prompt timeout. If no keystroke for this many seconds, the bot
   # takes its own decision (accepts automated sentiment / skips NL prompt).
   operator_input_timeout_seconds: 20
+  # Pre-market warm-up window. If started at/after this time on a trading
+  # day, the bot does auth + setup + sentiment capture in advance and waits
+  # until 09:15 IST to enter the trading loop.
+  pre_market_start_time: "08:50"
   # Entry-time gating. Default skip-the-noise window after the open is 09:15 -> 09:30.
   # The bot pulls this forward to 09:15 automatically when:
   #   (a) today is a known macro event day (FED / RBI / etc.), OR
