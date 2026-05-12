@@ -23,10 +23,12 @@ REGIME_FALLBACK_RULES = [
     ({"VIX_HIGH", "IV_HIGH"},     "Volatility_Cluster_Reversal"),
     ({"VIX_HIGH"},                "Volatility_Cluster_Reversal"),
     ({"VIX_MEDIUM", "IV_HIGH"},   "Reversal_Detector"),
-    # Calm regimes — favour trend-following / breakout
-    ({"VIX_LOW", "IV_LOW"},       "Breakout_Prev_Day_HL"),
-    ({"VIX_LOW"},                 "EMA_Cross_RSI"),
-    ({"VIX_MEDIUM", "IV_LOW"},    "Momentum_VWAP_RSI"),
+    # Calm regimes — favour higher-frequency setups that actually fire often.
+    # NR7 catches compression-then-expansion breakouts on quiet days.
+    # VWAP_Reversion fires multiple times per day on a trending session.
+    ({"VIX_LOW", "IV_LOW"},       "NR7_Compression"),
+    ({"VIX_LOW"},                 "VWAP_Reversion"),
+    ({"VIX_MEDIUM", "IV_LOW"},    "VWAP_Reversion"),
     ({"VIX_MEDIUM"},              "Gemini_Default"),
 ]
 
@@ -125,13 +127,15 @@ class LangGraphAgent:
 3.  **'Volatility_Cluster_Reversal'**: A counter-trend strategy for high volatility.
 4.  **'Volume_Spread_Analysis'**: Detects smart money activity.
 5.  **'EMA_Cross_RSI'**: A classic, fast-acting momentum strategy.
-6.  **'Momentum_VWAP_RSI'**: A momentum strategy using VWAP.
+6.  **'Momentum_VWAP_RSI'**: A momentum strategy using VWAP + RSI confirmation.
 7.  **'Breakout_Prev_Day_HL'**: A breakout strategy on previous day's high/low.
 8.  **'Opening_Range_Breakout'**: A classic ORB strategy.
 9.  **'BB_Squeeze_Breakout'**: A volatility breakout strategy.
 10. **'MA_Crossover'**: A simple moving average crossover strategy.
 11. **'RSI_Divergence'**: A pure reversal strategy on RSI divergence.
 12. **'Reversal_Detector'**: A specialized reversal strategy for overextended trends.
+13. **'VWAP_Reversion'**: HIGH-FREQUENCY intraday VWAP-reclaim play — fires multiple times per day in a trending session. Best on directional days with normal-to-low vol.
+14. **'NR7_Compression'**: Compression-then-expansion breakout — looks for the narrowest range bar of the last 7 and buys/sells the breakout on volume. Best on low-volatility, low-IV days.
 """
         )
         prompt_sections.append("\nBased on all the above information, which single strategy name from the list has the highest probability of success today? Return only the name.")
@@ -150,10 +154,11 @@ class LangGraphAgent:
             recommended_strategy = result["candidates"][0]["content"]["parts"][0]["text"].strip().replace("'", "").split('\n')[-1]
 
             valid_strategies = [
-                "Gemini_Default", "Supertrend_MACD", "Volatility_Cluster_Reversal", 
+                "Gemini_Default", "Supertrend_MACD", "Volatility_Cluster_Reversal",
                 "Volume_Spread_Analysis", "EMA_Cross_RSI", "Momentum_VWAP_RSI",
                 "Breakout_Prev_Day_HL", "Opening_Range_Breakout", "BB_Squeeze_Breakout",
-                "MA_Crossover", "RSI_Divergence", "Reversal_Detector"
+                "MA_Crossover", "RSI_Divergence", "Reversal_Detector",
+                "VWAP_Reversion", "NR7_Compression",
             ]
             if recommended_strategy not in valid_strategies:
                 logging.warning(

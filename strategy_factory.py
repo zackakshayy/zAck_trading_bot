@@ -474,21 +474,165 @@ class Reversal_Detector_Strategy(BaseStrategy):
             return f"Awaiting BUY signal: Overextended downtrend detected. Looking for bullish RSI divergence and a confirmation break above 9-EMA."
         return f"Awaiting signal for {self.name}: Waiting for a sustained, overextended trend to form."
 
+class VWAP_Reversion_Strategy(BaseStrategy):
+    """
+    Intraday VWAP-pullback play, designed to fire MULTIPLE times per day in a
+    trending session.
+
+    Bullish day:
+      - BUY when the prior bar closed at or below VWAP AND the current bar
+        closes above VWAP (a "reclaim").
+      - Momentum filter: RSI > 45 (not deep oversold).
+
+    Bearish day: mirror image (VWAP loss + RSI < 55).
+
+    Avoids buying breakouts at the high — instead buys the dip back to the
+    institutional anchor and reclaim. Pairs well with the trailing-SL setup.
+    """
+    def __init__(self, kite, config):
+        super().__init__(kite, config)
+        self.name = "VWAP_Reversion"
+
+    def generate_signals(self, day_df, sentiment, index=None, **kwargs):
+        if index is None:
+            index = len(day_df) - 1
+        if index < 2:
+            return 'HOLD'
+        if 'vwap' not in day_df.columns or 'rsi' not in day_df.columns:
+            return 'HOLD'
+
+        current = day_df.iloc[index]
+        prev = day_df.iloc[index - 1]
+
+        if pd.isna(current.get('vwap')) or pd.isna(prev.get('vwap')):
+            return 'HOLD'
+        if pd.isna(current.get('rsi')):
+            return 'HOLD'
+
+        # Bullish reclaim: prior bar at/under VWAP, current bar closes above it.
+        if sentiment in ['Bullish', 'Very Bullish']:
+            reclaimed = (prev['close'] <= prev['vwap']) and (current['close'] > current['vwap'])
+            momentum_ok = current['rsi'] > 45
+            if reclaimed and momentum_ok:
+                logging.info(f"[{self.name}] BUY: VWAP reclaim (prev close <= VWAP, "
+                             f"current close > VWAP) with RSI {current['rsi']:.1f} > 45.")
+                return 'BUY'
+
+        # Bearish loss: prior bar at/above VWAP, current bar closes below it.
+        if sentiment in ['Bearish', 'Very Bearish']:
+            lost = (prev['close'] >= prev['vwap']) and (current['close'] < current['vwap'])
+            momentum_ok = current['rsi'] < 55
+            if lost and momentum_ok:
+                logging.info(f"[{self.name}] SELL: VWAP loss (prev close >= VWAP, "
+                             f"current close < VWAP) with RSI {current['rsi']:.1f} < 55.")
+                return 'SELL'
+
+        return 'HOLD'
+
+    def get_status_message(self, day_df, sentiment, **kwargs):
+        vwap = day_df.iloc[-1].get('vwap', 0) if len(day_df) else 0
+        if sentiment in ['Bullish', 'Very Bullish']:
+            return (f"Awaiting BUY: price to pull back to/under VWAP ({vwap:.2f}) "
+                    f"and reclaim it on the next bar, RSI > 45.")
+        return (f"Awaiting SELL: price to lift above VWAP ({vwap:.2f}) and lose "
+                f"it on the next bar, RSI < 55.")
+
+
+class NR7_Compression_Breakout_Strategy(BaseStrategy):
+    """
+    Compression-then-expansion play. Fires when:
+
+      1. The narrowest of the last 7 completed bars (NR7) appeared within the
+         last 3 bars (fresh compression — not stale).
+      2. The current bar closes ABOVE the NR7 bar's high (BUY) or BELOW its
+         low (SELL).
+      3. The breakout is confirmed by volume > 1.2 × 20-bar volume MA.
+      4. Sentiment direction matches.
+
+    Compression-day breakouts have higher expectancy than chop-day breakouts.
+    """
+    def __init__(self, kite, config):
+        super().__init__(kite, config)
+        self.name = "NR7_Compression"
+
+    def generate_signals(self, day_df, sentiment, index=None, **kwargs):
+        if index is None:
+            index = len(day_df) - 1
+        if index < 8:
+            return 'HOLD'
+        if 'volume_ma' not in day_df.columns:
+            return 'HOLD'
+
+        # 7 completed bars BEFORE the current one
+        window = day_df.iloc[index - 7:index]
+        if window.empty or len(window) < 7:
+            return 'HOLD'
+        ranges = window['high'] - window['low']
+        if ranges.isna().any():
+            return 'HOLD'
+        nr7_idx_in_window = int(ranges.values.argmin())
+        bars_since_nr7 = len(window) - 1 - nr7_idx_in_window  # 0 = most recent of the 7
+        if bars_since_nr7 > 3:
+            return 'HOLD'  # compression too stale
+
+        nr7_bar = window.iloc[nr7_idx_in_window]
+        current = day_df.iloc[index]
+        if pd.isna(current.get('volume_ma')) or current.get('volume_ma', 0) <= 0:
+            return 'HOLD'
+        volume_confirm = current.get('volume', 0) > (current['volume_ma'] * 1.2)
+        if not volume_confirm:
+            return 'HOLD'
+
+        if sentiment in ['Bullish', 'Very Bullish'] and current['close'] > nr7_bar['high']:
+            logging.info(
+                f"[{self.name}] BUY: close {current['close']:.2f} > NR7 high "
+                f"{nr7_bar['high']:.2f} on volume {current['volume']:.0f} "
+                f"vs MA {current['volume_ma']:.0f}."
+            )
+            return 'BUY'
+        if sentiment in ['Bearish', 'Very Bearish'] and current['close'] < nr7_bar['low']:
+            logging.info(
+                f"[{self.name}] SELL: close {current['close']:.2f} < NR7 low "
+                f"{nr7_bar['low']:.2f} on volume {current['volume']:.0f} "
+                f"vs MA {current['volume_ma']:.0f}."
+            )
+            return 'SELL'
+
+        return 'HOLD'
+
+    def get_status_message(self, day_df, sentiment, **kwargs):
+        if len(day_df) < 8:
+            return f"Awaiting signal for {self.name}: need at least 8 bars of history."
+        # Locate the NR7 bar in the most recent 7-bar window for the status line
+        window = day_df.iloc[-8:-1]
+        ranges = window['high'] - window['low']
+        if ranges.empty or ranges.isna().any():
+            return f"Awaiting signal for {self.name}: data incomplete."
+        nr7_bar = window.iloc[int(ranges.values.argmin())]
+        if sentiment in ['Bullish', 'Very Bullish']:
+            return (f"Awaiting BUY: price to close above NR7-bar high "
+                    f"{nr7_bar['high']:.2f} on volume > 1.2x MA.")
+        return (f"Awaiting SELL: price to close below NR7-bar low "
+                f"{nr7_bar['low']:.2f} on volume > 1.2x MA.")
+
+
 def get_strategy(name, kite, config):
     """Factory function to get a strategy instance by name."""
     strategies = {
-        "Gemini_Default": Gemini_Default_Strategy, 
+        "Gemini_Default": Gemini_Default_Strategy,
         "Supertrend_MACD": Supertrend_MACD_Strategy,
         "Volatility_Cluster_Reversal": VolatilityClusterStrategy,
-        "Volume_Spread_Analysis": VSA_Strategy, 
+        "Volume_Spread_Analysis": VSA_Strategy,
         "Momentum_VWAP_RSI": Momentum_VWAP_RSI_Strategy,
         "Breakout_Prev_Day_HL": Breakout_Prev_Day_HL_Strategy,
         "Opening_Range_Breakout": Opening_Range_Breakout_Strategy,
         "BB_Squeeze_Breakout": Bollinger_Band_Squeeze_Strategy,
-        "MA_Crossover": MA_Crossover_Strategy, 
+        "MA_Crossover": MA_Crossover_Strategy,
         "RSI_Divergence": RSI_Divergence_Strategy,
         "EMA_Cross_RSI": EMACrossRSIStrategy,
-        "Reversal_Detector": Reversal_Detector_Strategy, # New strategy added
+        "Reversal_Detector": Reversal_Detector_Strategy,
+        "VWAP_Reversion": VWAP_Reversion_Strategy,
+        "NR7_Compression": NR7_Compression_Breakout_Strategy,
     }
     strategy_class = strategies.get(name)
     if not strategy_class: raise ValueError(f"Strategy '{name}' not found.")

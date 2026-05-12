@@ -131,8 +131,10 @@ option_filters:
   ivr_max_for_long: 60
   ivr_lookback_days: 60
   ivr_min_samples: 10        # below this many samples in history, the gate is bypassed
-  # IV vs realized vol: skip when implied vastly exceeds realized.
-  iv_rv_max_ratio: 1.3       # set 0 to disable
+  # IV vs realized vol: skip when implied vastly exceeds realized. Indian
+  # options structurally trade ~1.3-1.5x of realized (overnight gap premium +
+  # put skew), so 1.3 rejects most days. 1.5 is the realistic cutoff.
+  iv_rv_max_ratio: 1.5       # set 0 to disable
   rv_lookback_days: 20
   # Strike selection: target a delta band (works around any IV regime). Falls
   # back to strike_offset_steps if the chain has no Greeks.
