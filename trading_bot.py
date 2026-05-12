@@ -12,6 +12,7 @@ import asyncio
 from kiteconnect import KiteConnect, exceptions
 from agents import OrderExecutionAgent, PositionManagementAgent
 from sentiment_agent import SentimentAgent
+from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
 from strategy_factory import get_strategy
 from backtester import run_backtest
@@ -100,7 +101,13 @@ class TradingBotOrchestrator:
         # Initialize core services
         self.rag_service = RAGService(config)
         self.langgraph_agent = LangGraphAgent(config, self.rag_service)
-        self.sentiment_agent = SentimentAgent(config)
+        # YouTube verdict agent (constructed first; the SentimentAgent blends
+        # its cached verdicts into the daily sentiment score).
+        self.youtube_agent = YouTubeSentimentAgent(
+            config,
+            gemini_api_key=(config.get('google_api') or {}).get('api_key', ''),
+        )
+        self.sentiment_agent = SentimentAgent(config, youtube_agent=self.youtube_agent)
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -568,6 +575,16 @@ class TradingBotOrchestrator:
             if 'UNKNOWN' in todays_conditions:
                 self.no_trade_reason = "Could not determine market conditions."; return False
 
+            # 1b. Trigger the YouTube sentiment fetch BEFORE we look at sentiment.
+            # Cached for the day after the first call, so reassessment runs are
+            # cheap (single cache read, no LLM calls). Best-effort: failures here
+            # don't block setup — sentiment will just fall back to news-only.
+            if self.youtube_agent and not self.youtube_agent.is_ready():
+                try:
+                    await self.youtube_agent.fetch_today()
+                except Exception as e:
+                    logging.warning(f"YouTube sentiment fetch failed (non-fatal): {e}")
+
             # 2. Determine Sentiment — capture ONCE, reuse on reassessment unless
             # the market has materially shifted (spot/VIX drift or news-sentiment flip).
             should_refresh, refresh_reason = await self._should_refresh_sentiment()
@@ -811,6 +828,44 @@ class TradingBotOrchestrator:
         if not self._is_interactive_tty():
             logging.info(f"No TTY → using automated sentiment '{automated}' without confirmation.")
             return automated
+
+        # Surface YouTube analyst verdicts (if any) BEFORE the news headlines so
+        # the operator can see exactly what every input is saying.
+        try:
+            yt_verdicts = (
+                self.youtube_agent.get_verdicts()
+                if self.youtube_agent and self.youtube_agent.is_ready()
+                else []
+            )
+        except Exception:
+            yt_verdicts = []
+        if yt_verdicts:
+            print("\n" + "=" * 78)
+            print("YouTube analyst views (last 18 hours, sponsor segments stripped):")
+            print("=" * 78)
+            for v in yt_verdicts:
+                name = v.get("channel_display_name", "")
+                direction = v.get("direction", "Neutral")
+                conf = float(v.get("confidence", 0) or 0)
+                exc = float(v.get("excitement_level", 0) or 0)
+                weight = float(v.get("channel_weight", 10) or 10)
+                strip_method = v.get("sponsor_strip_method", "?")
+                lv = v.get("specific_levels") or {}
+                lv_bits = []
+                if lv.get("nifty_target"): lv_bits.append(f"target {lv['nifty_target']}")
+                if lv.get("support"):      lv_bits.append(f"support {lv['support']}")
+                if lv.get("resistance"):   lv_bits.append(f"resistance {lv['resistance']}")
+                lv_str = f"  [{', '.join(lv_bits)}]" if lv_bits else ""
+                print(
+                    f"  {name:30} | {direction:14}  conf={conf:.2f}  "
+                    f"excite={exc:.2f}  wgt={weight:.0f}  [{strip_method}]{lv_str}"
+                )
+                thesis = v.get("key_thesis") or ""
+                if thesis:
+                    if len(thesis) > 130:
+                        thesis = thesis[:127] + "..."
+                    print(f"    \"{thesis}\"")
+            print("=" * 78)
 
         # Surface the headlines that drove the automated read so the operator can
         # sanity-check it. Polarity is per-article; the bot's overall verdict is a

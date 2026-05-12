@@ -124,11 +124,15 @@ _MIN_FILTERED_FOR_DOMAIN_FETCH = 12
 class SentimentAgent:
     """Fetches Nifty-relevant news and computes a recency-weighted sentiment."""
 
-    def __init__(self, config):
+    def __init__(self, config, youtube_agent=None):
         self.config = config
         self.newsapi = NewsApiClient(api_key=config['news_api']['api_key'])
         self.cache_dir = "news_cache"
         os.makedirs(self.cache_dir, exist_ok=True)
+        # Optional YouTubeSentimentAgent. When set and ready, get_market_sentiment
+        # blends its verdicts with the news-derived score using the
+        # `youtube_sentiment.overall_weight_vs_news` config multiplier.
+        self.youtube_agent = youtube_agent
 
     # ---------- query builders ----------
 
@@ -298,16 +302,14 @@ class SentimentAgent:
                 break
         return out
 
-    def get_market_sentiment(self):
+    def _news_weighted_average(self):
         """
-        Recency-weighted average polarity over the relevant article set.
-        Returns one of: Very Bullish / Bullish / Neutral / Bearish / Very Bearish.
+        Internal: returns (avg, sample_count) for the news polarity score,
+        using the same linear-decay weighting (newest articles count most).
         """
         top = self._get_news_articles()
         if not top or not top.get('articles'):
-            logging.warning("SentimentAgent: no relevant articles after filtering.")
-            return "Neutral"
-
+            return 0.0, 0
         scores = []
         for article in top['articles']:
             title = article.get('title') or ''
@@ -318,26 +320,82 @@ class SentimentAgent:
                 scores.append(float(TextBlob(content).sentiment.polarity))
             except Exception:
                 continue
-
         if not scores:
-            logging.warning("SentimentAgent: no scorable headlines.")
-            return "Neutral"
-
-        # Linear-decay weighted average. Articles arrive newest-first.
+            return 0.0, 0
         n = len(scores)
         weighted_sum = sum(score * (n - i) for i, score in enumerate(scores))
         total_weight = sum(range(1, n + 1))
-        avg = weighted_sum / total_weight if total_weight else 0.0
-        logging.info(
-            f"SentimentAgent: weighted avg sentiment over {n} relevant headlines = {avg:+.3f}"
-        )
+        return (weighted_sum / total_weight if total_weight else 0.0), n
 
-        if avg > 0.4:
+    def _youtube_weighted_average(self):
+        """
+        Internal: returns (avg, sample_count) for the YouTube verdict set.
+        Score per verdict = direction_score × confidence; weighted by the
+        per-channel `weight`. Returns (0.0, 0) if no YouTube agent or no
+        cached verdicts yet.
+        """
+        if not self.youtube_agent or not self.youtube_agent.is_ready():
+            return 0.0, 0
+        from youtube_sentiment import verdict_to_score  # local import to avoid cycles at import time
+        verdicts = self.youtube_agent.get_verdicts()
+        if not verdicts:
+            return 0.0, 0
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for v in verdicts:
+            score = verdict_to_score(v)
+            weight = float(v.get('channel_weight', 10) or 10)
+            if weight <= 0:
+                continue
+            weighted_sum += score * weight
+            total_weight += weight
+        return (weighted_sum / total_weight if total_weight else 0.0), len(verdicts)
+
+    def get_market_sentiment(self):
+        """
+        Combined weighted sentiment from news + YouTube analyst verdicts.
+        News and YouTube each produce their own weighted-average; the two
+        averages are then blended using `youtube_sentiment.overall_weight_vs_news`
+        (default 2.0 — YouTube collectively gets 2x the weight of news).
+
+        Returns one of: Very Bullish / Bullish / Neutral / Bearish / Very Bearish.
+        """
+        news_avg, news_n = self._news_weighted_average()
+        yt_avg, yt_n = self._youtube_weighted_average()
+
+        if news_n == 0 and yt_n == 0:
+            logging.warning("SentimentAgent: no news or YouTube data; defaulting to Neutral.")
+            return "Neutral"
+
+        yt_cfg = self.config.get('youtube_sentiment', {}) or {}
+        yt_overall_weight = float(yt_cfg.get('overall_weight_vs_news', 2.0))
+
+        if yt_n == 0:
+            final_avg = news_avg
+            logging.info(
+                f"SentimentAgent: news-only avg = {final_avg:+.3f} (over {news_n} headlines)."
+            )
+        elif news_n == 0:
+            final_avg = yt_avg
+            logging.info(
+                f"SentimentAgent: YouTube-only avg = {final_avg:+.3f} (over {yt_n} verdicts)."
+            )
+        else:
+            news_w, yt_w = 1.0, yt_overall_weight
+            final_avg = (news_w * news_avg + yt_w * yt_avg) / (news_w + yt_w)
+            logging.info(
+                f"SentimentAgent: combined sentiment - "
+                f"news avg {news_avg:+.3f} (n={news_n}) | "
+                f"yt avg {yt_avg:+.3f} (n={yt_n}, weight={yt_overall_weight}x) | "
+                f"final {final_avg:+.3f}"
+            )
+
+        if final_avg > 0.4:
             return "Very Bullish"
-        if avg > 0.05:
+        if final_avg > 0.05:
             return "Bullish"
-        if avg < -0.4:
+        if final_avg < -0.4:
             return "Very Bearish"
-        if avg < -0.05:
+        if final_avg < -0.05:
             return "Bearish"
         return "Neutral"
