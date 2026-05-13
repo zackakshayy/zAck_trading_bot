@@ -135,6 +135,12 @@ class TradingBotOrchestrator:
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
         # once market is open; consumed by the strategy selector's Layer-2 override).
         self.open_gap_pct = None
+        # Strategy cooldown bookkeeping. A strategy gets added to `_cooled_strategies`
+        # when it was active for a full reassessment window without producing a
+        # single non-HOLD signal — re-picking it on the next setup is wasteful.
+        # The selector will skip cooled strategies until the bot restarts (tomorrow).
+        self._cooled_strategies: set = set()
+        self._signals_seen_for_active_strategy: int = 0
         # Cache for the underlying intraday bar data (refreshed only when a new bar closes).
         self._bars_cache = None
         self._bars_cached_at_bar = None
@@ -694,9 +700,25 @@ class TradingBotOrchestrator:
                 is_expiry_day=is_expiry_day_now,
                 open_gap_pct=self.open_gap_pct,
                 underlying_bars=bars_for_selector,
+                exclude_strategies=self._cooled_strategies,
                 user_prompt=user_prompt,
                 rag_context=rag_context,
             )
+            if not best_strategy_name:
+                # All cascade layers exhausted by cooldown — no strategy to run.
+                self.no_trade_reason = (
+                    f"All strategies exhausted (cooled today: "
+                    f"{sorted(self._cooled_strategies)}). No strategy left to try."
+                )
+                logging.error(self.no_trade_reason)
+                return False
+            # Reset the per-strategy signal counter when the strategy changes.
+            if best_strategy_name != self.active_strategy_name:
+                self._signals_seen_for_active_strategy = 0
+                logging.info(
+                    f"Strategy changed: '{self.active_strategy_name}' -> "
+                    f"'{best_strategy_name}'."
+                )
             self.active_strategy_name = best_strategy_name
             self.active_strategy = get_strategy(best_strategy_name, self.kite, self.config)
             
@@ -1166,6 +1188,18 @@ class TradingBotOrchestrator:
                     # Strategy reassessment timer.
                     reassessment_period = self.config['trading_flags'].get('strategy_reassessment_period_minutes', 60)
                     if self.awaiting_signal_since and (datetime.datetime.now() - self.awaiting_signal_since).total_seconds() > reassessment_period * 60:
+                        # Cool down the current strategy if it produced zero
+                        # non-HOLD signals during this window — re-picking the
+                        # same strategy is wasteful and selector will skip it.
+                        if (self.active_strategy_name
+                                and self._signals_seen_for_active_strategy == 0
+                                and self.active_strategy_name not in self._cooled_strategies):
+                            self._cooled_strategies.add(self.active_strategy_name)
+                            logging.warning(
+                                f"Cooling down '{self.active_strategy_name}' for the day: "
+                                f"produced 0 non-HOLD signals in {reassessment_period} min. "
+                                f"Cooled set: {sorted(self._cooled_strategies)}"
+                            )
                         logging.warning(f"No trade signal for over {reassessment_period} minutes. Re-assessing strategy...")
                         if not await self.setup():
                             self.bot_state = "STOPPED"; continue
@@ -1182,6 +1216,11 @@ class TradingBotOrchestrator:
                     )
 
                     if signal != 'HOLD':
+                        # The strategy fired *something* — bumps the per-strategy
+                        # signal counter so reassessment doesn't cool it down.
+                        # We still gate the trade below; cooldown only triggers
+                        # on strategies that produce zero non-HOLD signals.
+                        self._signals_seen_for_active_strategy += 1
                         is_primary_signal = (signal == 'BUY' and self.day_sentiment in ['Bullish', 'Very Bullish']) or (signal == 'SELL' and self.day_sentiment in ['Bearish', 'Very Bearish'])
                         if getattr(self.active_strategy, 'is_reversal_trade', False) or is_primary_signal:
                             # VIX gate is intentionally checked at the moment of intent so it doesn't
@@ -1220,6 +1259,26 @@ class TradingBotOrchestrator:
                 await self._aligned_sleep()
             except exceptions.TokenException as e:
                 logging.error(f"Zerodha session expired or invalidated: {e}. Halting bot.")
+                self._abort = True
+                break
+            except exceptions.PermissionException as e:
+                # App-level config issue (IP not whitelisted, API perms missing).
+                # Retrying every signal cycle won't fix it — bail out, send the
+                # daily report (no trades), and surface the cause to the operator.
+                logging.error(
+                    f"Zerodha permission error: {e}. "
+                    f"Most likely your Kite Connect app's IP whitelist is empty "
+                    f"or doesn't include your current public IP. Visit "
+                    f"https://developers.kite.trade/apps to fix. Halting bot."
+                )
+                if self._is_interactive_tty():
+                    print("\n" + "!" * 78)
+                    print("  Kite Connect PERMISSION ERROR — bot is halting.")
+                    print(f"  {e}")
+                    print("  Fix: add your public IP to the app's whitelist at")
+                    print("       https://developers.kite.trade/apps")
+                    print(f"       Find your IP via: curl -s ifconfig.me")
+                    print("!" * 78 + "\n")
                 self._abort = True
                 break
             except Exception as e:

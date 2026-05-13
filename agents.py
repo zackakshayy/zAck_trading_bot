@@ -104,6 +104,12 @@ def _execute_order_sync(api_key: str, access_token: str, order_params: dict) -> 
         # Re-raise so the orchestrator sees auth failure and can stop.
         logging.error(f"WORKER: TokenException placing order: {e}")
         raise
+    except exceptions.PermissionException as e:
+        # Re-raise: this is a Kite-app config problem (IP whitelist, API
+        # permissions). Retrying every signal cycle won't help and burns API
+        # quota; halt and let the operator fix the developer-console setting.
+        logging.error(f"WORKER: PermissionException placing order: {e}")
+        raise
     except Exception as e:
         logging.error(f"WORKER: Unexpected error placing order: {e}", exc_info=True)
     return None

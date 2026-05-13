@@ -25,40 +25,41 @@ from rag_service import RAGService
 # ---------------------------------------------------------------------------
 
 
-def _detect_indicator_override(df) -> Optional[Tuple[str, str]]:
+def _detect_indicator_override(df, excluded: Optional[set] = None) -> Optional[Tuple[str, str]]:
     """
-    Returns (strategy_name, reason) if a strong on-screen pattern is detected
-    in the underlying-bar dataframe; else None. First match wins.
-
-    Each check needs the relevant indicator columns to be present and non-NaN.
-    `calculate_all_indicators()` populates all of these so passing a df from
-    `_get_underlying_bars()` is sufficient.
+    Builds the full list of indicator-pattern matches in priority order, then
+    returns the first one whose strategy is not in `excluded`. This way, if
+    NR7_Compression has been cooled down for the day but BB compression also
+    fires, BB_Squeeze_Breakout gets picked instead — same Layer 3, different
+    pattern. First non-excluded match wins.
     """
     if df is None or len(df) < 8:
         return None
 
+    excluded = excluded or set()
     last = df.iloc[-1]
+    candidates: list = []
 
     # 1. Bollinger-band compression: bandwidth materially below its own MA.
     if "bb_bandwidth" in df.columns and "bb_bandwidth_ma" in df.columns:
         bw, bw_ma = last.get("bb_bandwidth"), last.get("bb_bandwidth_ma")
         if pd.notna(bw) and pd.notna(bw_ma) and bw_ma > 0 and bw < 0.7 * bw_ma:
-            return (
+            candidates.append((
                 "BB_Squeeze_Breakout",
                 f"BB-bandwidth compression (bw={bw:.3f} < 0.7 x MA={bw_ma:.3f})",
-            )
+            ))
 
     # 2. NR7: the narrowest of the last 8 bars is within the last 3 (fresh).
     try:
         ranges_8 = (df["high"] - df["low"]).iloc[-8:]
         if not ranges_8.isna().any():
             min_idx_in_8 = int(ranges_8.values.argmin())
-            if min_idx_in_8 >= 5:  # narrowest bar is among the last 3 of the 8-window
-                return (
+            if min_idx_in_8 >= 5:
+                candidates.append((
                     "NR7_Compression",
                     f"Fresh NR7 compression (narrowest bar in last 3, "
                     f"range={float(ranges_8.min()):.2f})",
-                )
+                ))
     except Exception:
         pass
 
@@ -67,30 +68,35 @@ def _detect_indicator_override(df) -> Optional[Tuple[str, str]]:
     if pd.notna(rsi):
         rsi_f = float(rsi)
         if rsi_f > 78 or rsi_f < 22:
-            return (
+            candidates.append((
                 "Reversal_Detector",
                 f"RSI extreme ({rsi_f:.1f}) — outside (22, 78)",
-            )
+            ))
 
     # 4. Volume spike vs 20-bar MA (smart-money footprint).
     vol = last.get("volume")
     vol_ma = last.get("volume_ma")
     if pd.notna(vol) and pd.notna(vol_ma) and vol_ma > 0 and float(vol) > 2.0 * float(vol_ma):
-        return (
+        candidates.append((
             "Volume_Spread_Analysis",
             f"Volume spike (vol={float(vol):.0f} > 2x MA={float(vol_ma):.0f})",
-        )
+        ))
 
     # 5. Supertrend flipped on the last completed bar.
     if "supertrend_direction" in df.columns and len(df) >= 2:
         last_st = df.iloc[-1].get("supertrend_direction")
         prev_st = df.iloc[-2].get("supertrend_direction")
-        if pd.notna(last_st) and pd.notna(prev_st) and last_st != 0 and prev_st != 0 and last_st != prev_st:
-            return (
+        if (pd.notna(last_st) and pd.notna(prev_st)
+                and last_st != 0 and prev_st != 0 and last_st != prev_st):
+            candidates.append((
                 "Supertrend_MACD",
                 f"Supertrend flipped ({int(prev_st)} -> {int(last_st)})",
-            )
+            ))
 
+    # First non-excluded match wins.
+    for strat, reason in candidates:
+        if strat not in excluded:
+            return (strat, reason)
     return None
 
 
@@ -133,47 +139,59 @@ def pick_strategy_deterministic(
     open_gap_pct: Optional[float] = None,
     underlying_bars=None,
     config: Optional[dict] = None,
-) -> Tuple[str, str]:
+    exclude_strategies: Optional[set] = None,
+) -> Optional[Tuple[str, str]]:
     """
-    Returns (strategy_name, reason). 5-layer priority cascade — first match wins.
+    Returns (strategy_name, reason) — first non-excluded match across the 5 layers.
+    Returns None if every layer's candidate is in `exclude_strategies` (orchestrator
+    should halt with "exhausted" message). `exclude_strategies` is typically the
+    "cooled" set: strategies that were picked earlier today but produced zero
+    non-HOLD signals during their evaluation window.
     """
     cfg = (config or {}).get("strategy_selector", {}) or {}
     gap_threshold = float(cfg.get("gap_override_pct", 0.8))
+    excluded = set(exclude_strategies or [])
+
+    def _take(name: str, reason: str) -> Optional[Tuple[str, str]]:
+        return (name, reason) if name not in excluded else None
 
     # ----- Layer 1: hard pins -----
     if "EVENT_FED_MEETING" in market_conditions:
-        return ("Opening_Range_Breakout", "Hard pin: FOMC meeting day")
+        pick = _take("Opening_Range_Breakout", "Hard pin: FOMC meeting day")
+        if pick: return pick
     if "EVENT_RBI_POLICY" in market_conditions:
-        return ("Opening_Range_Breakout", "Hard pin: RBI policy day")
+        pick = _take("Opening_Range_Breakout", "Hard pin: RBI policy day")
+        if pick: return pick
     if is_expiry_day:
-        return (
-            "RSI_Divergence",
-            "Hard pin: weekly expiry day (mean-reversion bias on gamma whipsaw)",
-        )
+        pick = _take("RSI_Divergence",
+                     "Hard pin: weekly expiry day (mean-reversion bias on gamma whipsaw)")
+        if pick: return pick
 
     # ----- Layer 2: open-gap override -----
     if open_gap_pct is not None and abs(open_gap_pct) >= gap_threshold:
-        return (
-            "Breakout_Prev_Day_HL",
-            f"Open-gap override: {open_gap_pct:+.2f}% (|gap| >= {gap_threshold}%)",
-        )
+        pick = _take("Breakout_Prev_Day_HL",
+                     f"Open-gap override: {open_gap_pct:+.2f}% (|gap| >= {gap_threshold}%)")
+        if pick: return pick
 
-    # ----- Layer 3: indicator overrides -----
-    ind_pick = _detect_indicator_override(underlying_bars)
+    # ----- Layer 3: indicator overrides (filter happens INSIDE the detector) -----
+    ind_pick = _detect_indicator_override(underlying_bars, excluded=excluded)
     if ind_pick:
-        strat, why = ind_pick
-        return (strat, f"Indicator override: {why}")
+        return (ind_pick[0], f"Indicator override: {ind_pick[1]}")
 
     # ----- Layer 4: regime table -----
     regime_pick = _regime_table_pick(market_conditions, sentiment)
     if regime_pick:
-        return (
-            regime_pick,
-            f"Regime table: VIX/IV/Sentiment match -> {sorted(market_conditions)} + {sentiment}",
-        )
+        pick = _take(regime_pick,
+                     f"Regime table: VIX/IV/Sentiment match -> "
+                     f"{sorted(market_conditions)} + {sentiment}")
+        if pick: return pick
 
     # ----- Layer 5: last resort -----
-    return ("Gemini_Default", "Last-resort default (no other layer matched)")
+    pick = _take("Gemini_Default", "Last-resort default (no other layer matched)")
+    if pick: return pick
+
+    # All layers exhausted by cooldown.
+    return None
 
 
 class LangGraphAgent:
@@ -186,16 +204,27 @@ class LangGraphAgent:
         self.model_name = "gemini-2.0-flash"
 
     def _deterministic_pick(self, market_conditions, sentiment, is_expiry_day,
-                             open_gap_pct, underlying_bars) -> str:
-        """Wrap pick_strategy_deterministic with consistent logging."""
-        strat, reason = pick_strategy_deterministic(
+                             open_gap_pct, underlying_bars,
+                             exclude_strategies: Optional[set] = None) -> Optional[str]:
+        """Wrap pick_strategy_deterministic with consistent logging. Returns
+        None if every cascade layer is excluded — caller should treat that as
+        'strategies exhausted, halt for the day'."""
+        result = pick_strategy_deterministic(
             market_conditions=market_conditions,
             sentiment=sentiment,
             is_expiry_day=is_expiry_day,
             open_gap_pct=open_gap_pct,
             underlying_bars=underlying_bars,
             config=self.config,
+            exclude_strategies=exclude_strategies,
         )
+        if result is None:
+            logging.error(
+                f"[Selector] All cascade layers excluded by cooldown "
+                f"(cooled={sorted(exclude_strategies or [])}). No strategy available."
+            )
+            return None
+        strat, reason = result
         logging.info(f"[Selector] Deterministic pick: {strat} — {reason}")
         return strat
 
@@ -206,6 +235,7 @@ class LangGraphAgent:
         is_expiry_day: bool = False,
         open_gap_pct: Optional[float] = None,
         underlying_bars=None,
+        exclude_strategies: Optional[set] = None,
         user_prompt: str = None,
         rag_context: str = None,
     ):
@@ -223,7 +253,7 @@ class LangGraphAgent:
         if not use_llm or not self.api_key:
             return self._deterministic_pick(
                 market_conditions, sentiment, is_expiry_day,
-                open_gap_pct, underlying_bars,
+                open_gap_pct, underlying_bars, exclude_strategies,
             )
 
         logging.info(f"[Gemini Agent] Market Conditions: {market_conditions}. Recommending strategy...")
@@ -292,7 +322,7 @@ class LangGraphAgent:
                 )
                 return self._deterministic_pick(
                     market_conditions, sentiment, is_expiry_day,
-                    open_gap_pct, underlying_bars,
+                    open_gap_pct, underlying_bars, exclude_strategies,
                 )
 
             logging.info(f"[Gemini Agent] AI Recommended Strategy: {recommended_strategy}")
@@ -304,5 +334,5 @@ class LangGraphAgent:
             )
             return self._deterministic_pick(
                 market_conditions, sentiment, is_expiry_day,
-                open_gap_pct, underlying_bars,
+                open_gap_pct, underlying_bars, exclude_strategies,
             )
