@@ -135,11 +135,13 @@ class TradingBotOrchestrator:
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
         # once market is open; consumed by the strategy selector's Layer-2 override).
         self.open_gap_pct = None
-        # Strategy cooldown bookkeeping. A strategy gets added to `_cooled_strategies`
-        # when it was active for a full reassessment window without producing a
-        # single non-HOLD signal — re-picking it on the next setup is wasteful.
-        # The selector will skip cooled strategies until the bot restarts (tomorrow).
-        self._cooled_strategies: set = set()
+        # Strategy cooldown bookkeeping. When a strategy produces 0 non-HOLD
+        # signals during a reassessment window, it's "cooled" for
+        # `strategy_cooldown_minutes` (default 60) — the selector skips it
+        # until the cooldown expires. Time-based (not "rest of day") so
+        # strategies can rotate back in as market conditions evolve.
+        # Maps: strategy_name -> datetime when the cooldown expires.
+        self._strategy_cooldown_until: dict = {}
         self._signals_seen_for_active_strategy: int = 0
         # Cache for the underlying intraday bar data (refreshed only when a new bar closes).
         self._bars_cache = None
@@ -157,6 +159,13 @@ class TradingBotOrchestrator:
         # Daily-report idempotency flag — set the first time the report is sent
         # (whether by normal market-close or by an early shutdown).
         self._report_sent = False
+        # ONE-SHOT force-trade diagnostic flag. Read once at startup from
+        # config.trading_flags.force_one_trade_today and auto-disarmed after
+        # the first trade lands. Bypasses sentiment / VIX / IVR / IV-RV gates
+        # for that one trade — liquidity, daily-loss, max-trades stay enforced.
+        self._force_mode_armed = bool(
+            (config.get('trading_flags') or {}).get('force_one_trade_today', False)
+        )
 
     def authenticate(self, request_token_override=None):
         """
@@ -205,6 +214,40 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.warning(f"Could not snapshot starting capital: {e}")
             self.starting_capital = 0.0
+
+    # ----- Strategy cooldown bookkeeping ----------------------------------
+
+    def _currently_cooled(self) -> set:
+        """
+        Returns the set of strategy names whose cooldown is still active. Side
+        effect: expired entries are removed from `_strategy_cooldown_until` and
+        an info line is logged so the operator sees strategies re-entering the
+        eligible pool.
+        """
+        now = datetime.datetime.now()
+        expired = [
+            name for name, until in self._strategy_cooldown_until.items()
+            if until <= now
+        ]
+        for name in expired:
+            del self._strategy_cooldown_until[name]
+            logging.info(f"Cooldown expired: '{name}' is eligible again.")
+        return set(self._strategy_cooldown_until.keys())
+
+    def _cool_strategy(self, name: str) -> None:
+        """Adds `name` to the cooldown set with an expiry time."""
+        if not name:
+            return
+        cooldown_minutes = int(
+            self.config.get("trading_flags", {}).get("strategy_cooldown_minutes", 60)
+        )
+        expiry = datetime.datetime.now() + datetime.timedelta(minutes=cooldown_minutes)
+        self._strategy_cooldown_until[name] = expiry
+        logging.warning(
+            f"Cooling down '{name}' until {expiry.strftime('%H:%M:%S')} "
+            f"({cooldown_minutes}-minute cooldown). Currently cooled: "
+            f"{sorted(self._strategy_cooldown_until.keys())}"
+        )
 
     async def _refresh_starting_capital(self) -> None:
         """
@@ -700,16 +743,35 @@ class TradingBotOrchestrator:
                 is_expiry_day=is_expiry_day_now,
                 open_gap_pct=self.open_gap_pct,
                 underlying_bars=bars_for_selector,
-                exclude_strategies=self._cooled_strategies,
+                exclude_strategies=self._currently_cooled(),
                 user_prompt=user_prompt,
                 rag_context=rag_context,
             )
-            if not best_strategy_name:
-                # All cascade layers exhausted by cooldown — no strategy to run.
-                self.no_trade_reason = (
-                    f"All strategies exhausted (cooled today: "
-                    f"{sorted(self._cooled_strategies)}). No strategy left to try."
+            # Safety valve: every cascade layer is excluded by active cooldowns.
+            # Clear the entire cooldown set (gives every strategy a fresh shot)
+            # and retry the cascade once. If anything still doesn't fire next
+            # window, the cooldowns rebuild naturally.
+            if not best_strategy_name and self._strategy_cooldown_until:
+                cleared = sorted(self._strategy_cooldown_until.keys())
+                logging.warning(
+                    f"All strategies currently cooled ({cleared}). Clearing "
+                    f"cooldowns and retrying the cascade with a clean slate."
                 )
+                self._strategy_cooldown_until.clear()
+                best_strategy_name = await self.langgraph_agent.get_recommended_strategy(
+                    market_conditions=todays_conditions,
+                    sentiment=self.day_sentiment,
+                    is_expiry_day=is_expiry_day_now,
+                    open_gap_pct=self.open_gap_pct,
+                    underlying_bars=bars_for_selector,
+                    exclude_strategies=set(),
+                    user_prompt=user_prompt,
+                    rag_context=rag_context,
+                )
+            if not best_strategy_name:
+                # Even with cleared cooldowns the cascade returned nothing —
+                # shouldn't happen given Layer 5's Gemini_Default, but be safe.
+                self.no_trade_reason = "Selector returned no strategy."
                 logging.error(self.no_trade_reason)
                 return False
             # Reset the per-strategy signal counter when the strategy changes.
@@ -1190,16 +1252,16 @@ class TradingBotOrchestrator:
                     if self.awaiting_signal_since and (datetime.datetime.now() - self.awaiting_signal_since).total_seconds() > reassessment_period * 60:
                         # Cool down the current strategy if it produced zero
                         # non-HOLD signals during this window — re-picking the
-                        # same strategy is wasteful and selector will skip it.
+                        # same strategy is wasteful. Time-based cooldown so it
+                        # can come back later as market conditions evolve.
                         if (self.active_strategy_name
                                 and self._signals_seen_for_active_strategy == 0
-                                and self.active_strategy_name not in self._cooled_strategies):
-                            self._cooled_strategies.add(self.active_strategy_name)
-                            logging.warning(
-                                f"Cooling down '{self.active_strategy_name}' for the day: "
-                                f"produced 0 non-HOLD signals in {reassessment_period} min. "
-                                f"Cooled set: {sorted(self._cooled_strategies)}"
+                                and self.active_strategy_name not in self._strategy_cooldown_until):
+                            logging.info(
+                                f"'{self.active_strategy_name}' produced 0 non-HOLD "
+                                f"signals in {reassessment_period} min."
                             )
+                            self._cool_strategy(self.active_strategy_name)
                         logging.warning(f"No trade signal for over {reassessment_period} minutes. Re-assessing strategy...")
                         if not await self.setup():
                             self.bot_state = "STOPPED"; continue
@@ -1222,15 +1284,26 @@ class TradingBotOrchestrator:
                         # on strategies that produce zero non-HOLD signals.
                         self._signals_seen_for_active_strategy += 1
                         is_primary_signal = (signal == 'BUY' and self.day_sentiment in ['Bullish', 'Very Bullish']) or (signal == 'SELL' and self.day_sentiment in ['Bearish', 'Very Bearish'])
-                        if getattr(self.active_strategy, 'is_reversal_trade', False) or is_primary_signal:
-                            # VIX gate is intentionally checked at the moment of intent so it doesn't
-                            # block the loop in a quiet phase.
-                            if await self._is_vix_too_high():
+
+                        # FORCE-MODE: skip sentiment-direction match and VIX gate.
+                        # Liquidity / daily-loss / max-trades / IP whitelist
+                        # remain enforced inside the order-placement path.
+                        force_mode_now = self._force_mode_armed
+                        if force_mode_now:
+                            logging.warning(
+                                f"FORCE-TRADE MODE armed: taking '{signal}' regardless "
+                                f"of sentiment ({self.day_sentiment}) and VIX gate. "
+                                f"Will auto-disarm after this trade fires."
+                            )
+
+                        if force_mode_now or getattr(self.active_strategy, 'is_reversal_trade', False) or is_primary_signal:
+                            # VIX gate — bypassed in force mode.
+                            if not force_mode_now and await self._is_vix_too_high():
                                 logging.warning("Skipping entry due to VIX gate.")
                             else:
-                                trade_details = (await self.order_agent.place_trade(signal)
+                                trade_details = (await self.order_agent.place_trade(signal, force_mode=force_mode_now)
                                                  if not is_paper
-                                                 else await self.order_agent.get_paper_trade_details(signal))
+                                                 else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now))
                                 if trade_details:
                                     trade_details['Strategy'] = self.active_strategy_name
                                     self.position_agent.start_trade(trade_details)
@@ -1239,6 +1312,14 @@ class TradingBotOrchestrator:
                                     self.trades_today_count += 1
                                     self.bot_state = "IN_POSITION"
                                     self.awaiting_signal_since = None
+                                    # Auto-disarm force mode after the first trade.
+                                    if self._force_mode_armed:
+                                        self._force_mode_armed = False
+                                        logging.warning(
+                                            "FORCE-TRADE MODE disarmed: first diagnostic "
+                                            "trade fired. Normal gating resumes for any "
+                                            "subsequent entries this session."
+                                        )
                         else:
                             logging.warning(f"COUNTER-SIGNAL DETECTED: '{signal}' vs sentiment '{self.day_sentiment}'.")
 

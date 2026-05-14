@@ -290,9 +290,10 @@ class OrderExecutionAgent:
 
     # ---------- entry ----------
 
-    async def place_trade(self, direction):
-        """Places a LIMIT entry, waits for fill, returns trade dict (no SL-M attached here)."""
-        symbol, qty, lot_size = await self._get_trade_details(direction)
+    async def place_trade(self, direction, force_mode: bool = False):
+        """Places a LIMIT entry, waits for fill, returns trade dict (no SL-M attached here).
+        `force_mode=True` propagates to chain analysis so IVR / IV-RV gates are bypassed."""
+        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
         if not symbol or not qty:
             return None
 
@@ -384,8 +385,8 @@ class OrderExecutionAgent:
         access_token = self.config["zerodha"]["access_token"]
         return await asyncio.to_thread(_execute_order_sync, api_key, access_token, sl_params)
 
-    async def get_paper_trade_details(self, direction):
-        symbol, qty, lot_size = await self._get_trade_details(direction)
+    async def get_paper_trade_details(self, direction, force_mode: bool = False):
+        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
         if not symbol or not qty:
             return None
         ltp = safe_ltp(self.kite, f"NFO:{symbol}")
@@ -445,15 +446,17 @@ class OrderExecutionAgent:
         return df["tradingsymbol"].tolist()
 
     async def _run_chain_analysis(self, spot: float, atm_strike: float,
-                                   option_type: str, expiry_date):
+                                   option_type: str, expiry_date,
+                                   force_mode: bool = False):
         """
         Builds a chain snapshot, runs IV-Rank and IV/RV gates, then picks a strike
         by delta band (with offset fallback) and a liquidity check.
 
-        Returns (symbol, lot_size, ref_price) on success, or None to abort the trade
-        and let the caller log the reason. None vs falling back to legacy is a
-        deliberate signal: if the chain pipeline is enabled, a gate refusal means
-        skip the trade — not 'try anyway with the legacy path'.
+        Returns (symbol, lot_size, ref_price) on success, or None to abort.
+
+        `force_mode=True` bypasses the IVR and IV/RV gates with a warning log.
+        Liquidity remains enforced — bypassing it would mean trading strikes
+        with 0 OI and 50% spreads, which is bad regardless of force mode.
         """
         flt = self.config.get("option_filters", {}) or {}
         rate = float(flt.get("risk_free_rate", 0.07))
@@ -503,12 +506,19 @@ class OrderExecutionAgent:
                                         atm_iv, lookback, min_samples)
             if ivr is not None:
                 if ivr > ivr_max:
-                    logging.warning(
-                        f"IVR gate: today's ATM IV {atm_iv:.3f} = {ivr:.1f}IVR "
-                        f"(>{ivr_max:.0f}, samples={samples}). Skipping entry."
-                    )
-                    return None
-                logging.info(f"IVR check: {ivr:.1f} <= {ivr_max:.0f} (samples={samples}). OK.")
+                    if force_mode:
+                        logging.warning(
+                            f"FORCE-MODE: IVR gate BYPASSED. IVR={ivr:.1f} > max "
+                            f"{ivr_max:.0f}. Would normally skip; proceeding under force."
+                        )
+                    else:
+                        logging.warning(
+                            f"IVR gate: today's ATM IV {atm_iv:.3f} = {ivr:.1f}IVR "
+                            f"(>{ivr_max:.0f}, samples={samples}). Skipping entry."
+                        )
+                        return None
+                else:
+                    logging.info(f"IVR check: {ivr:.1f} <= {ivr_max:.0f} (samples={samples}). OK.")
             else:
                 logging.info(f"IVR gate bypassed: insufficient history ({samples} samples).")
 
@@ -522,12 +532,19 @@ class OrderExecutionAgent:
                     if rv and rv > 0:
                         ratio = atm_iv / rv
                         if ratio > iv_rv_max:
-                            logging.warning(
-                                f"IV/RV gate: IV {atm_iv:.3f} / RV {rv:.3f} = {ratio:.2f} "
-                                f"> max {iv_rv_max:.2f}. Skipping (options too expensive)."
-                            )
-                            return None
-                        logging.info(f"IV/RV check: {ratio:.2f} <= {iv_rv_max:.2f}. OK.")
+                            if force_mode:
+                                logging.warning(
+                                    f"FORCE-MODE: IV/RV gate BYPASSED. ratio={ratio:.2f} > "
+                                    f"max {iv_rv_max:.2f}. Proceeding under force."
+                                )
+                            else:
+                                logging.warning(
+                                    f"IV/RV gate: IV {atm_iv:.3f} / RV {rv:.3f} = {ratio:.2f} "
+                                    f"> max {iv_rv_max:.2f}. Skipping (options too expensive)."
+                                )
+                                return None
+                        else:
+                            logging.info(f"IV/RV check: {ratio:.2f} <= {iv_rv_max:.2f}. OK.")
 
         # ---------- Strike selection: delta-targeted with offset fallback ----------
         chosen = None
@@ -596,7 +613,7 @@ class OrderExecutionAgent:
 
         return chosen["tradingsymbol"], lot_size, ref_price
 
-    async def _get_trade_details(self, direction):
+    async def _get_trade_details(self, direction, force_mode: bool = False):
         try:
             # Fetch underlying LTP and margins concurrently — independent calls.
             underlying_key = str(self.underlying_token)
@@ -636,6 +653,7 @@ class OrderExecutionAgent:
                     atm_strike=float(atm_strike),
                     option_type=option_type,
                     expiry_date=expiry_date,
+                    force_mode=force_mode,
                 )
                 if result is None:
                     # An enabled chain pipeline that refuses == skip the trade.

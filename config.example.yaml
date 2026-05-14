@@ -88,6 +88,17 @@ trading_flags:
   run_startup_backtest: false
   stop_loss_percent: 25.0
   strategy_reassessment_period_minutes: 15
+  # If a strategy produces 0 non-HOLD signals during its window, it's put in
+  # cooldown for this many minutes. Time-based so it can rotate back later
+  # as market conditions evolve.
+  strategy_cooldown_minutes: 60
+  # When true, every HOLD also logs the specific reason (which condition
+  # wasn't met). Useful for diagnosing days where nothing fires.
+  log_hold_reasons: false
+  # ONE-SHOT diagnostic. When true, the bot bypasses sentiment/VIX/IVR/IV-RV
+  # gates and takes the first non-HOLD signal; auto-disarms after that trade.
+  # Daily-loss limit + liquidity + max-trades + IP whitelist still apply.
+  force_one_trade_today: false
   underlying_instrument: NIFTY 50
   use_rag: true
   win_rate_threshold: 55.0
@@ -173,7 +184,9 @@ option_filters:
   # IV vs realized vol: skip when implied vastly exceeds realized. Indian
   # options structurally trade ~1.3-1.5x of realized (overnight gap premium +
   # put skew), so 1.3 rejects most days. 1.5 is the realistic cutoff.
-  iv_rv_max_ratio: 1.5       # set 0 to disable
+  # Indian options trade ~1.3-1.7x of realised vol naturally; 2.5 lets normal
+  # conditions through and only blocks genuinely expensive IV regimes.
+  iv_rv_max_ratio: 2.5       # set 0 to disable
   rv_lookback_days: 20
   # Strike selection: target a delta band (works around any IV regime). Falls
   # back to strike_offset_steps if the chain has no Greeks.

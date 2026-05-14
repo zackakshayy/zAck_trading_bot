@@ -29,6 +29,16 @@ class BaseStrategy:
         """Returns a human-readable status message."""
         return "Awaiting signal: Generic strategy waiting for conditions."
 
+    def _log_hold(self, reason: str):
+        """
+        Emit a HOLD-reason log when the operator has opted in via
+        `trading_flags.log_hold_reasons: true`. Lets you read the logs
+        and see exactly which strategy condition isn't being met instead
+        of guessing why nothing is firing.
+        """
+        if (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
+            logging.info(f"[{self.name}] HOLD: {reason}")
+
 class Gemini_Default_Strategy(BaseStrategy):
     """The original Gemini strategy based on CPR, EMA, and RSI."""
     def __init__(self, kite, config):
@@ -37,7 +47,9 @@ class Gemini_Default_Strategy(BaseStrategy):
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 1: return 'HOLD'
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
         if 'ema_50' not in day_df.columns:
             day_df['ema_50'] = calculate_ema(day_df['close'], 50)
         if 'rsi' not in day_df.columns:
@@ -45,14 +57,14 @@ class Gemini_Default_Strategy(BaseStrategy):
 
         cpr_pivots = kwargs.get('cpr_pivots', {})
         current_candle = day_df.iloc[index]
-        
+
         primary_signal_met = False
         confirmation_signals_met = 0
 
         cpr_breakout_signal = check_cpr_breakout(current_candle, cpr_pivots, day_df.iloc[index-1])
         if cpr_breakout_signal == sentiment:
             primary_signal_met = True
-        
+
         if primary_signal_met:
             if sentiment == 'Bullish':
                 if current_candle['close'] > current_candle['ema_50']: confirmation_signals_met += 1
@@ -60,13 +72,28 @@ class Gemini_Default_Strategy(BaseStrategy):
             elif sentiment == 'Bearish':
                 if current_candle['close'] < current_candle['ema_50']: confirmation_signals_met += 1
                 if current_candle['rsi'] < 45: confirmation_signals_met += 1
-        
+
         logging.debug(f"[{self.name}] Check on {current_candle.name}: Primary Met={primary_signal_met}, Confirmations Met={confirmation_signals_met}")
 
         if primary_signal_met and confirmation_signals_met >= 1:
             logging.info(f"[{self.name}] Signal confirmed: Primary condition and {confirmation_signals_met} confirmation(s) met.")
             return 'BUY' if sentiment == 'Bullish' else 'SELL'
-        
+
+        if not primary_signal_met:
+            self._log_hold(
+                f"CPR breakout direction ({cpr_breakout_signal!r}) does not match "
+                f"sentiment ({sentiment!r}). "
+                f"close={current_candle.get('close', 0):.2f}, "
+                f"tc={cpr_pivots.get('tc', 'N/A')}, bc={cpr_pivots.get('bc', 'N/A')}"
+            )
+        else:
+            self._log_hold(
+                f"CPR breakout matched ({sentiment}) but 0 confirmations met "
+                f"(need >=1 from EMA50/RSI). "
+                f"close={current_candle.get('close', 0):.2f} vs "
+                f"ema_50={current_candle.get('ema_50', float('nan')):.2f}, "
+                f"rsi={current_candle.get('rsi', float('nan')):.1f}"
+            )
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -98,9 +125,11 @@ class Supertrend_MACD_Strategy(BaseStrategy):
                 day_df[['macd', 'macd_signal']] = macd[['MACD_12_26_9', 'MACDs_12_26_9']]
 
         current = day_df.iloc[index]
-         # --- MODIFIED LOGIC: Check for both BUY and SELL signals ---
-        is_bullish_signal = current.get('supertrend_direction') == 1 and current.get('macd') > current.get('macd_signal')
-        is_bearish_signal = current.get('supertrend_direction') == -1 and current.get('macd') < current.get('macd_signal')
+        st_dir = current.get('supertrend_direction')
+        macd = current.get('macd')
+        macd_sig = current.get('macd_signal')
+        is_bullish_signal = st_dir == 1 and (macd or 0) > (macd_sig or 0)
+        is_bearish_signal = st_dir == -1 and (macd or 0) < (macd_sig or 0)
 
         if is_bullish_signal:
             logging.info(f"[{self.name}] BUY Signal condition met.")
@@ -108,7 +137,11 @@ class Supertrend_MACD_Strategy(BaseStrategy):
         if is_bearish_signal:
             logging.info(f"[{self.name}] SELL Signal condition met.")
             return 'SELL'
-            
+
+        self._log_hold(
+            f"supertrend_dir={st_dir}, macd={macd}, macd_signal={macd_sig} "
+            f"(need ST=+1 AND macd>signal for BUY, or ST=-1 AND macd<signal for SELL)"
+        )
         return 'HOLD'
     
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -204,11 +237,30 @@ class Momentum_VWAP_RSI_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "Momentum_VWAP_RSI"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 1: return 'HOLD'
-        
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
+
         current = day_df.iloc[index]
-        if sentiment in ['Bullish', 'Very Bullish'] and current['close'] > current['vwap'] and current['rsi'] > 55: return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and current['close'] < current['vwap'] and current['rsi'] < 45: return 'SELL'
+        close = current.get('close', float('nan'))
+        vwap = current.get('vwap', float('nan'))
+        rsi = current.get('rsi', float('nan'))
+
+        if sentiment in ['Bullish', 'Very Bullish'] and close > vwap and rsi > 55:
+            return 'BUY'
+        if sentiment in ['Bearish', 'Very Bearish'] and close < vwap and rsi < 45:
+            return 'SELL'
+
+        if sentiment in ['Bullish', 'Very Bullish']:
+            self._log_hold(
+                f"need close>vwap AND rsi>55. got close={close:.2f}, vwap={vwap:.2f} "
+                f"({'above' if close > vwap else 'below'}), rsi={rsi:.1f}"
+            )
+        else:
+            self._log_hold(
+                f"need close<vwap AND rsi<45. got close={close:.2f}, vwap={vwap:.2f} "
+                f"({'above' if close > vwap else 'below'}), rsi={rsi:.1f}"
+            )
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -222,14 +274,38 @@ class Breakout_Prev_Day_HL_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "Breakout_Prev_Day_HL"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 1: return 'HOLD'
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
 
         cpr = kwargs.get('cpr_pivots', {})
         pdh, pdl = cpr.get('prev_high'), cpr.get('prev_low')
-        if not pdh or not pdl: return 'HOLD'
+        if not pdh or not pdl:
+            self._log_hold("prev_day high/low pivots missing")
+            return 'HOLD'
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
-        if sentiment in ['Bullish', 'Very Bullish'] and last['close'] < pdh and current['close'] > pdh and current['volume'] > (current['volume_ma'] * 1.2): return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and last['close'] > pdl and current['close'] < pdl and current['volume'] > (current['volume_ma'] * 1.2): return 'SELL'
+        close = current.get('close', float('nan'))
+        vol = current.get('volume', 0)
+        vol_ma = current.get('volume_ma', 0)
+        vol_ok = vol > (vol_ma * 1.2) if vol_ma else False
+
+        if sentiment in ['Bullish', 'Very Bullish'] and last['close'] < pdh and close > pdh and vol_ok:
+            return 'BUY'
+        if sentiment in ['Bearish', 'Very Bearish'] and last['close'] > pdl and close < pdl and vol_ok:
+            return 'SELL'
+
+        if sentiment in ['Bullish', 'Very Bullish']:
+            self._log_hold(
+                f"need break above PDH({pdh:.2f}) with vol>1.2*MA. "
+                f"close={close:.2f}, prev_close={last['close']:.2f}, "
+                f"vol={vol:.0f}, vol_ma={vol_ma:.0f}, vol_ok={vol_ok}"
+            )
+        else:
+            self._log_hold(
+                f"need break below PDL({pdl:.2f}) with vol>1.2*MA. "
+                f"close={close:.2f}, prev_close={last['close']:.2f}, "
+                f"vol={vol:.0f}, vol_ma={vol_ma:.0f}, vol_ok={vol_ok}"
+            )
         return 'HOLD'
     
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -290,12 +366,34 @@ class Bollinger_Band_Squeeze_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "BB_Squeeze_Breakout"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 1: return 'HOLD'
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
 
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
-        if current['bb_bandwidth'] < current['bb_bandwidth_ma']:
-            if sentiment in ['Bullish', 'Very Bullish'] and last['close'] < last['bb_upper'] and current['close'] > current['bb_upper']: return 'BUY'
-            if sentiment in ['Bearish', 'Very Bearish'] and last['close'] > last['bb_lower'] and current['close'] < current['bb_lower']: return 'SELL'
+        bw, bw_ma = current.get('bb_bandwidth'), current.get('bb_bandwidth_ma')
+        in_squeeze = bw is not None and bw_ma is not None and bw < bw_ma
+
+        if in_squeeze:
+            close = current.get('close', float('nan'))
+            upper = current.get('bb_upper', float('nan'))
+            lower = current.get('bb_lower', float('nan'))
+            last_close = last.get('close', float('nan'))
+            last_upper = last.get('bb_upper', float('nan'))
+            last_lower = last.get('bb_lower', float('nan'))
+            if sentiment in ['Bullish', 'Very Bullish'] and last_close < last_upper and close > upper:
+                return 'BUY'
+            if sentiment in ['Bearish', 'Very Bearish'] and last_close > last_lower and close < lower:
+                return 'SELL'
+            self._log_hold(
+                f"in squeeze (bw={bw:.3f}<bw_ma={bw_ma:.3f}) but no breakout. "
+                f"close={close:.2f}, upper={upper:.2f}, lower={lower:.2f}"
+            )
+        else:
+            self._log_hold(
+                f"not in squeeze: bb_bandwidth={bw} >= bb_bandwidth_ma={bw_ma} "
+                f"(need bandwidth below its MA)"
+            )
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -497,36 +595,58 @@ class VWAP_Reversion_Strategy(BaseStrategy):
         if index is None:
             index = len(day_df) - 1
         if index < 2:
+            self._log_hold("insufficient bars (index < 2)")
             return 'HOLD'
         if 'vwap' not in day_df.columns or 'rsi' not in day_df.columns:
+            self._log_hold("vwap or rsi column missing from bars")
             return 'HOLD'
 
         current = day_df.iloc[index]
         prev = day_df.iloc[index - 1]
 
         if pd.isna(current.get('vwap')) or pd.isna(prev.get('vwap')):
+            self._log_hold("vwap is NaN on current or prev bar")
             return 'HOLD'
         if pd.isna(current.get('rsi')):
+            self._log_hold("rsi is NaN on current bar")
             return 'HOLD'
+
+        cur_close, cur_vwap, cur_rsi = current['close'], current['vwap'], current['rsi']
+        prev_close, prev_vwap = prev['close'], prev['vwap']
 
         # Bullish reclaim: prior bar at/under VWAP, current bar closes above it.
         if sentiment in ['Bullish', 'Very Bullish']:
-            reclaimed = (prev['close'] <= prev['vwap']) and (current['close'] > current['vwap'])
-            momentum_ok = current['rsi'] > 45
+            reclaimed = (prev_close <= prev_vwap) and (cur_close > cur_vwap)
+            momentum_ok = cur_rsi > 45
             if reclaimed and momentum_ok:
-                logging.info(f"[{self.name}] BUY: VWAP reclaim (prev close <= VWAP, "
-                             f"current close > VWAP) with RSI {current['rsi']:.1f} > 45.")
+                logging.info(f"[{self.name}] BUY: VWAP reclaim with RSI {cur_rsi:.1f} > 45.")
                 return 'BUY'
+            self._log_hold(
+                f"need VWAP-reclaim (prev close<=VWAP AND curr close>VWAP) AND RSI>45. "
+                f"prev_close={prev_close:.2f} vs prev_vwap={prev_vwap:.2f} "
+                f"({'<=' if prev_close <= prev_vwap else '>'}), "
+                f"curr_close={cur_close:.2f} vs curr_vwap={cur_vwap:.2f} "
+                f"({'>' if cur_close > cur_vwap else '<='}), "
+                f"rsi={cur_rsi:.1f} (momentum_ok={momentum_ok})"
+            )
+            return 'HOLD'
 
         # Bearish loss: prior bar at/above VWAP, current bar closes below it.
         if sentiment in ['Bearish', 'Very Bearish']:
-            lost = (prev['close'] >= prev['vwap']) and (current['close'] < current['vwap'])
-            momentum_ok = current['rsi'] < 55
+            lost = (prev_close >= prev_vwap) and (cur_close < cur_vwap)
+            momentum_ok = cur_rsi < 55
             if lost and momentum_ok:
-                logging.info(f"[{self.name}] SELL: VWAP loss (prev close >= VWAP, "
-                             f"current close < VWAP) with RSI {current['rsi']:.1f} < 55.")
+                logging.info(f"[{self.name}] SELL: VWAP loss with RSI {cur_rsi:.1f} < 55.")
                 return 'SELL'
+            self._log_hold(
+                f"need VWAP-loss (prev close>=VWAP AND curr close<VWAP) AND RSI<55. "
+                f"prev_close={prev_close:.2f} vs prev_vwap={prev_vwap:.2f}, "
+                f"curr_close={cur_close:.2f} vs curr_vwap={cur_vwap:.2f}, "
+                f"rsi={cur_rsi:.1f} (momentum_ok={momentum_ok})"
+            )
+            return 'HOLD'
 
+        self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -559,45 +679,71 @@ class NR7_Compression_Breakout_Strategy(BaseStrategy):
         if index is None:
             index = len(day_df) - 1
         if index < 8:
+            self._log_hold("insufficient bars (need >= 8)")
             return 'HOLD'
         if 'volume_ma' not in day_df.columns:
+            self._log_hold("volume_ma column missing")
             return 'HOLD'
 
-        # 7 completed bars BEFORE the current one
         window = day_df.iloc[index - 7:index]
         if window.empty or len(window) < 7:
+            self._log_hold("window too short for NR7 lookup")
             return 'HOLD'
         ranges = window['high'] - window['low']
         if ranges.isna().any():
+            self._log_hold("range column has NaN in lookback window")
             return 'HOLD'
         nr7_idx_in_window = int(ranges.values.argmin())
-        bars_since_nr7 = len(window) - 1 - nr7_idx_in_window  # 0 = most recent of the 7
+        bars_since_nr7 = len(window) - 1 - nr7_idx_in_window
         if bars_since_nr7 > 3:
-            return 'HOLD'  # compression too stale
+            self._log_hold(
+                f"NR7 too stale: narrowest bar was {bars_since_nr7} bars ago "
+                f"(need <= 3 to count as 'fresh' compression)"
+            )
+            return 'HOLD'
 
         nr7_bar = window.iloc[nr7_idx_in_window]
         current = day_df.iloc[index]
-        if pd.isna(current.get('volume_ma')) or current.get('volume_ma', 0) <= 0:
+        cur_close = current.get('close', float('nan'))
+        cur_vol = current.get('volume', 0)
+        cur_vol_ma = current.get('volume_ma', 0)
+        if pd.isna(cur_vol_ma) or cur_vol_ma <= 0:
+            self._log_hold("volume_ma is NaN/zero")
             return 'HOLD'
-        volume_confirm = current.get('volume', 0) > (current['volume_ma'] * 1.2)
+        volume_confirm = cur_vol > (cur_vol_ma * 1.2)
         if not volume_confirm:
+            self._log_hold(
+                f"NR7 fresh ({bars_since_nr7} bars ago) but volume not confirming: "
+                f"vol={cur_vol:.0f} <= 1.2*MA={1.2 * cur_vol_ma:.0f}"
+            )
             return 'HOLD'
 
-        if sentiment in ['Bullish', 'Very Bullish'] and current['close'] > nr7_bar['high']:
+        nr7_high, nr7_low = nr7_bar['high'], nr7_bar['low']
+        if sentiment in ['Bullish', 'Very Bullish'] and cur_close > nr7_high:
             logging.info(
-                f"[{self.name}] BUY: close {current['close']:.2f} > NR7 high "
-                f"{nr7_bar['high']:.2f} on volume {current['volume']:.0f} "
-                f"vs MA {current['volume_ma']:.0f}."
+                f"[{self.name}] BUY: close {cur_close:.2f} > NR7 high "
+                f"{nr7_high:.2f} on volume {cur_vol:.0f} vs MA {cur_vol_ma:.0f}."
             )
             return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and current['close'] < nr7_bar['low']:
+        if sentiment in ['Bearish', 'Very Bearish'] and cur_close < nr7_low:
             logging.info(
-                f"[{self.name}] SELL: close {current['close']:.2f} < NR7 low "
-                f"{nr7_bar['low']:.2f} on volume {current['volume']:.0f} "
-                f"vs MA {current['volume_ma']:.0f}."
+                f"[{self.name}] SELL: close {cur_close:.2f} < NR7 low "
+                f"{nr7_low:.2f} on volume {cur_vol:.0f} vs MA {cur_vol_ma:.0f}."
             )
             return 'SELL'
 
+        if sentiment in ['Bullish', 'Very Bullish']:
+            self._log_hold(
+                f"NR7 fresh + volume OK, but close {cur_close:.2f} <= NR7 high "
+                f"{nr7_high:.2f} (need breakout above the NR7 bar's high)"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
+            self._log_hold(
+                f"NR7 fresh + volume OK, but close {cur_close:.2f} >= NR7 low "
+                f"{nr7_low:.2f} (need breakdown below the NR7 bar's low)"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional check")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
