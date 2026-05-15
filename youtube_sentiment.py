@@ -282,7 +282,14 @@ class YouTubeSentimentAgent:
     # ---------- transcript fetch ----------
 
     def _fetch_transcript(self, video_id: str) -> Optional[list]:
-        """Returns list of {text, start, duration} or None on failure."""
+        """
+        Returns list of {text, start, duration} or None on failure.
+
+        Compatible with BOTH the legacy `youtube-transcript-api` API
+        (v0.6.x — classmethod `get_transcript`) and the newer v1.x API
+        (instance method `.fetch()` returning a `FetchedTranscript`).
+        First inspects the installed class to pick the right path.
+        """
         try:
             from youtube_transcript_api import YouTubeTranscriptApi
         except ImportError:
@@ -291,12 +298,32 @@ class YouTubeSentimentAgent:
                 "Run: pip install youtube-transcript-api"
             )
             return None
+
+        languages = ["en", "en-IN", "hi"]
+
         try:
-            return YouTubeTranscriptApi.get_transcript(
-                video_id, languages=["en", "en-IN", "hi"]
-            )
+            # Legacy API (v0.6.x) — classmethod still present.
+            if hasattr(YouTubeTranscriptApi, "get_transcript"):
+                return YouTubeTranscriptApi.get_transcript(
+                    video_id, languages=languages
+                )
+            # New API (v1.x) — instance method returning a FetchedTranscript.
+            ytt_api = YouTubeTranscriptApi()
+            fetched = ytt_api.fetch(video_id, languages=languages)
+            # Prefer the official conversion helper if it's exposed.
+            if hasattr(fetched, "to_raw_data"):
+                return fetched.to_raw_data()
+            # Otherwise iterate snippet attributes ourselves.
+            return [
+                {"text": getattr(s, "text", ""),
+                 "start": float(getattr(s, "start", 0.0) or 0.0),
+                 "duration": float(getattr(s, "duration", 0.0) or 0.0)}
+                for s in fetched
+            ]
         except Exception as e:
-            logging.info(f"YouTubeSentiment: transcript fetch failed for {video_id}: {e}")
+            logging.info(
+                f"YouTubeSentiment: transcript fetch failed for {video_id}: {e}"
+            )
             return None
 
     # ---------- SponsorBlock segments ----------
