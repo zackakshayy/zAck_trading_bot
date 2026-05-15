@@ -1,5 +1,34 @@
+import logging
 import pandas_ta_classic as ta
 import pandas as pd
+
+
+# Indicator columns that must be valid on the latest bar for strategies to
+# trade. After all rolling/EMA computations are done, these columns are
+# forward-filled so a transient NaN in the middle of the series (e.g., a Kite
+# bar with bad data) doesn't corrupt the latest-bar value the bot acts on.
+# OHLCV are deliberately NOT in this list — never overwrite price/volume.
+_INDICATOR_COLS_TO_FFILL = (
+    "rsi", "ema_9", "ema_15", "ema_20", "ema_21", "ema_50",
+    "supertrend_direction", "macd", "macd_signal",
+    "atr", "atr_ma", "spread", "volume_ma",
+    "vwap",
+    "bb_upper", "bb_lower", "bb_mid", "bb_bandwidth", "bb_bandwidth_ma",
+    "psar_long", "psar_short",
+)
+
+
+def _safe_rolling_mean(series: pd.Series, window: int, min_periods: int = 5) -> pd.Series:
+    """
+    Rolling mean that survives sparse data. `min_periods` is the minimum
+    number of non-NaN values required to produce a result — without this,
+    pandas needs the FULL window populated, so the first (window-1) bars
+    of any session return NaN, breaking strategies that touch this MA.
+
+    With min_periods=5 the MA stabilises from bar 5 onwards, slightly noisier
+    for the first 15 bars but never NaN on the latest bar of a real dataset.
+    """
+    return series.rolling(window=window, min_periods=min(min_periods, window)).mean()
 
 
 def _compute_vwap_daily(df: pd.DataFrame) -> pd.Series:
@@ -74,9 +103,9 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
 
     # Volatility & VSA Strategy Indicators
     df['atr'] = ta.atr(df['high'], df['low'], df['close'], length=14)
-    df['atr_ma'] = df['atr'].rolling(window=20).mean()
+    df['atr_ma'] = _safe_rolling_mean(df['atr'], window=20)
     df['spread'] = df['high'] - df['low']
-    df['volume_ma'] = df['volume'].rolling(window=20).mean()
+    df['volume_ma'] = _safe_rolling_mean(df['volume'], window=20)
 
     # Daily-anchored VWAP — computed manually to avoid pandas_ta's NaN-on-TZ
     # quirk. See _compute_vwap_daily docstring for the math.
@@ -89,7 +118,7 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
         df['bb_lower'] = bbands['BBL_20_2.0']
         df['bb_mid'] = bbands['BBM_20_2.0']
         df['bb_bandwidth'] = bbands['BBB_20_2.0']
-        df['bb_bandwidth_ma'] = df['bb_bandwidth'].rolling(window=20).mean()
+        df['bb_bandwidth_ma'] = _safe_rolling_mean(df['bb_bandwidth'], window=20)
 
     # PSAR for indicator-based exits (long_psar = trailing stop for long positions).
     psar = ta.psar(df['high'], df['low'], df['close'], af=0.02, max_af=0.2)
@@ -100,5 +129,25 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
             df['psar_long'] = psar[psar_long_col]
         if psar_short_col:
             df['psar_short'] = psar[psar_short_col]
+
+    # Forward-fill indicator columns so a single bad bar in the middle of the
+    # rolling window doesn't corrupt the latest-bar value strategies act on.
+    # OHLCV is deliberately NOT touched — never overwrite price/volume.
+    cols_to_fill = [c for c in _INDICATOR_COLS_TO_FFILL if c in df.columns]
+    if cols_to_fill:
+        df[cols_to_fill] = df[cols_to_fill].ffill()
+
+    # Diagnostic: warn (once per call) if the latest bar still has any NaN in
+    # the critical indicator set after the forward-fill. If this fires, the
+    # dataset is too small or genuinely malformed — strategies will skip.
+    if not df.empty:
+        last = df.iloc[-1]
+        missing = [c for c in cols_to_fill if pd.isna(last.get(c))]
+        if missing:
+            logging.warning(
+                f"calculate_all_indicators: latest bar still has NaN for "
+                f"{missing} after ffill (df has {len(df)} bars). Strategies "
+                f"depending on these columns will skip."
+            )
 
     return df
