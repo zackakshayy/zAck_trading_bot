@@ -1,6 +1,50 @@
 import pandas_ta_classic as ta
 import pandas as pd
 
+
+def _compute_vwap_daily(df: pd.DataFrame) -> pd.Series:
+    """
+    Daily-anchored VWAP, computed manually without pandas_ta's `ta.vwap()` —
+    which silently emits NaN when the DatetimeIndex is timezone-aware and was
+    causing every VWAP-based strategy to return HOLD on every bar.
+
+    VWAP for bar i within a day:
+        VWAP_i = sum( typical_price_k * volume_k ) / sum( volume_k )   for k=0..i
+
+    where typical_price = (high + low + close) / 3, and the sums reset at each
+    calendar-date boundary.
+
+    Returns a Series aligned with df.index. The first bar of each day equals
+    its own typical price (well-defined; no NaN). If a row has volume=0, the
+    cumulative denominator carries forward — no division by zero.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype="float64", index=df.index if df is not None else None)
+
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    tp_x_vol = typical_price * df["volume"]
+
+    # Derive a daily-grouping key from the index (or 'date' column).
+    if isinstance(df.index, pd.DatetimeIndex):
+        idx = df.index
+        # Strip timezone so date extraction is consistent across pandas versions.
+        if getattr(idx, "tz", None) is not None:
+            idx = idx.tz_localize(None)
+        day_key = idx.normalize()  # truncates to midnight of the same day
+    else:
+        day_key = pd.to_datetime(df.get("date", df.index)).dt.normalize()
+
+    # Cumulative-within-day numerator / denominator.
+    cum_tpv = tp_x_vol.groupby(day_key).cumsum()
+    cum_vol = df["volume"].groupby(day_key).cumsum()
+
+    # Avoid div-by-zero on a hypothetical zero-volume bar; replace with NaN.
+    cum_vol_safe = cum_vol.where(cum_vol > 0)
+    vwap = cum_tpv / cum_vol_safe
+    vwap.index = df.index  # ensure alignment (groupby may reset the index name)
+    return vwap
+
+
 def calculate_all_indicators(df: pd.DataFrame, config: dict):
     """
     Calculates and attaches all required technical indicators to the dataframe.
@@ -34,9 +78,9 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
     df['spread'] = df['high'] - df['low']
     df['volume_ma'] = df['volume'].rolling(window=20).mean()
 
-    # Momentum VWAP & ORB Strategy Indicators
-    # This calculation will now work correctly
-    df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
+    # Daily-anchored VWAP — computed manually to avoid pandas_ta's NaN-on-TZ
+    # quirk. See _compute_vwap_daily docstring for the math.
+    df['vwap'] = _compute_vwap_daily(df)
 
     # Bollinger Band Squeeze Strategy Indicators
     bbands = ta.bbands(df['close'], length=20, std=2)
