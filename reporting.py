@@ -50,6 +50,57 @@ def log_trade(trade_details):
         logging.error(f"Failed to log trade to Excel: {e}", exc_info=True)
 
 
+def _send_email(config, subject, html_body) -> bool:
+    """
+    Generic email sender shared by the daily report and the loss-analysis
+    mailer. Returns True on success. Honours email_settings.send_daily_report
+    as the master on/off switch for ALL bot email.
+    """
+    email_conf = config.get('email_settings', {}) or {}
+    if not email_conf.get('send_daily_report', False):
+        logging.info("Email reporting is disabled in config; skipping email.")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = email_conf['sender_email']
+        msg['To'] = email_conf['receiver_email']
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_body, 'html'))
+        with smtplib.SMTP(email_conf['smtp_server'], email_conf['smtp_port']) as server:
+            server.starttls()
+            server.login(email_conf['sender_email'], email_conf['sender_password'])
+            server.send_message(msg)
+        logging.info(f"Email sent: {subject!r}")
+        return True
+    except Exception as e:
+        logging.error(f"Failed to send email {subject!r}: {e}", exc_info=True)
+        return False
+
+
+def send_loss_analysis_email(config, report_text, trade):
+    """
+    Sends a dedicated 'Trade Loss Analysis' email immediately after a losing
+    trade is booked. `report_text` is the plain-text post-mortem from
+    loss_analyzer.build_loss_report; `trade` is the completed-trade dict.
+    """
+    try:
+        from loss_analyzer import report_to_html
+        html = report_to_html(report_text)
+    except Exception:
+        # Fallback: minimal <pre> wrap if the helper isn't importable.
+        safe = (report_text or "").replace("<", "&lt;").replace(">", "&gt;")
+        html = f"<html><body><pre>{safe}</pre></body></html>"
+
+    sym = trade.get('Symbol', '?')
+    pnl = trade.get('ProfitLoss', 0)
+    try:
+        pnl_str = f"{float(pnl):,.2f}"
+    except Exception:
+        pnl_str = str(pnl)
+    subject = f"Trade Loss Analysis: {sym} (P&L {pnl_str})"
+    _send_email(config, subject, html)
+
+
 def send_daily_report(config, date_str, no_trades_reason=None):
     """Reads the trade log and sends a daily report with segregated live and paper trade stats."""
     email_conf = config.get('email_settings', {})

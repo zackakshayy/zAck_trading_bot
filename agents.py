@@ -235,6 +235,14 @@ class OrderExecutionAgent:
 
         self.underlying_token = self._lookup_underlying_token(self.flags["underlying_instrument"])
 
+        # Signal-data token — separate from underlying_token. Indices (NIFTY 50,
+        # BANKNIFTY, etc.) don't trade, so kite.historical_data on the index
+        # token returns volume=0 on every bar, which breaks every volume-using
+        # strategy. We resolve the nearest-expiry FUTURES token instead and use
+        # THAT for signal-bar fetches. Falls back to the index if no futures
+        # are listed for this underlying.
+        self.signal_data_token = self._lookup_nearest_futures_token() or self.underlying_token
+
         # Lazy session-scoped cache for daily bars (used only by realized-vol gate).
         self._daily_bars_cache = None
         self._daily_bars_cached_at_date = None
@@ -247,6 +255,44 @@ class OrderExecutionAgent:
         if match.empty:
             raise ConnectionError(f"Underlying {name!r} not found on NSE.")
         return int(match.iloc[0]["instrument_token"])
+
+    def _lookup_nearest_futures_token(self) -> Optional[int]:
+        """
+        Returns the instrument_token of the nearest-expiry futures contract
+        for this underlying — used as the signal-data source because indices
+        (NIFTY 50, BANKNIFTY) have zero trading volume on `kite.historical_data`.
+
+        Returns None if no futures are listed (caller falls back to the
+        underlying/index token).
+        """
+        if self.nfo_instruments is None or self.nfo_instruments.empty:
+            return None
+        today = datetime.date.today()
+        try:
+            mask = (
+                (self.nfo_instruments["instrument_type"] == "FUT")
+                & (self.nfo_instruments["expiry_date"] >= today)
+            )
+            futures = self.nfo_instruments[mask]
+            if futures.empty:
+                logging.warning(
+                    f"No futures listed for {self._root} — falling back to "
+                    f"index token for signal data (volume will be zero)."
+                )
+                return None
+            futures = futures.sort_values("expiry_date")
+            nearest = futures.iloc[0]
+            token = int(nearest["instrument_token"])
+            logging.info(
+                f"Signal-data source: {self._root} futures "
+                f"(symbol={nearest.get('tradingsymbol', '?')}, "
+                f"expiry={nearest['expiry_date']}, token={token}). "
+                f"Index has zero volume; futures provide real volume bars."
+            )
+            return token
+        except Exception as e:
+            logging.warning(f"Futures-token lookup failed: {e}. Falling back to index.")
+            return None
 
     def _strike_step(self) -> int:
         return int(self.strike_steps.get(self._root, 50))
@@ -1151,6 +1197,12 @@ class PositionManagementAgent:
             "ProfitLoss": pnl,
             "Status": "CLOSED",
             "Strategy": trade.get("Strategy", "N/A"),
+            # Extra context for the loss post-mortem (loss_analyzer.build_loss_report).
+            # Carried on the dict; reporting.log_trade ignores unknown keys.
+            "entry_time": trade.get("entry_time"),
+            "high_water_mark": trade.get("high_water_mark"),
+            "initial_stop_loss": trade.get("initial_stop_loss"),
+            "lot_size": trade.get("lot_size"),
         }
 
         if pnl < 0 and self.flags.get("enable_gemini_loss_analysis") and gemini_api_key:

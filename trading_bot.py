@@ -16,7 +16,11 @@ from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
 from strategy_factory import get_strategy
 from backtester import run_backtest
-from reporting import send_daily_report, initialize_trade_log, log_trade, send_monthly_report
+from reporting import (
+    send_daily_report, initialize_trade_log, log_trade, send_monthly_report,
+    send_loss_analysis_email,
+)
+from loss_analyzer import build_loss_report
 from indicators import calculate_cpr, is_trend_overextended, check_momentum_divergence
 from indicator_calculator import calculate_all_indicators
 from market_context import MarketConditionIdentifier
@@ -132,6 +136,8 @@ class TradingBotOrchestrator:
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
+        # Today's market-condition tags — stashed by setup() for the loss analyzer.
+        self.todays_conditions = set()
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
         # once market is open; consumed by the strategy selector's Layer-2 override).
         self.open_gap_pct = None
@@ -629,6 +635,8 @@ class TradingBotOrchestrator:
             todays_conditions = self.market_condition_identifier.get_conditions_for_date(today)
             if 'UNKNOWN' in todays_conditions:
                 self.no_trade_reason = "Could not determine market conditions."; return False
+            # Stash for the loss-analyzer (needs the regime context at exit time).
+            self.todays_conditions = todays_conditions
 
             # 1b. Trigger the YouTube sentiment fetch BEFORE we look at sentiment.
             # Cached for the day after the first call, so reassessment runs are
@@ -902,6 +910,36 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.error(f"Failed to send shutdown report: {e}", exc_info=True)
 
+    def _handle_losing_trade(self, completed_trade: dict, underlying_df):
+        """
+        Builds a detailed deterministic post-mortem for a losing trade, prints
+        it to the terminal, and emails it. Never raises into the trading loop —
+        a reporting failure must not interrupt the bot.
+        """
+        try:
+            report = build_loss_report(
+                trade=completed_trade,
+                underlying_df=underlying_df,
+                market_conditions=self.todays_conditions,
+                sentiment=self.day_sentiment,
+            )
+        except Exception as e:
+            logging.error(f"Loss-analysis report build failed: {e}", exc_info=True)
+            return
+
+        # Terminal: print the full report so it's visible in the live log.
+        print("\n" + report + "\n")
+        logging.info(
+            f"Loss post-mortem generated for {completed_trade.get('Symbol', '?')} "
+            f"(P&L {completed_trade.get('ProfitLoss', 0):,.2f})."
+        )
+
+        # Email: best-effort, gated by email_settings.send_daily_report.
+        try:
+            send_loss_analysis_email(self.config, report, completed_trade)
+        except Exception as e:
+            logging.error(f"Loss-analysis email failed: {e}", exc_info=True)
+
     async def _resolve_sentiment(self):
         """
         Compute today's sentiment via a hybrid flow:
@@ -1114,9 +1152,16 @@ class TradingBotOrchestrator:
                 and self._bars_cached_at_bar == bar_idx):
             return self._bars_cache
 
+        # Use the futures token (resolved at agent init) — indices return
+        # volume=0 on historical bars, which silently breaks every
+        # volume-using strategy. signal_data_token falls back to the
+        # underlying/index token if no futures contract was found.
+        signal_token = getattr(
+            self.order_agent, "signal_data_token", self.order_agent.underlying_token
+        )
         hist = await asyncio.to_thread(
             self.kite.historical_data,
-            self.order_agent.underlying_token,
+            signal_token,
             datetime.datetime.now() - datetime.timedelta(days=5),
             datetime.datetime.now(),
             timeframe,
@@ -1334,6 +1379,10 @@ class TradingBotOrchestrator:
                     if isinstance(status, dict):
                         log_trade(status)
                         self._record_realized_pnl(status.get('ProfitLoss', 0))
+                        # On a losing trade, build a detailed post-mortem,
+                        # print it to the terminal, and email it.
+                        if float(status.get('ProfitLoss', 0) or 0) < 0:
+                            self._handle_losing_trade(status, underlying_df_hist)
                         self.bot_state = "AWAITING_SIGNAL"
                         self.awaiting_signal_since = datetime.datetime.now()
 
