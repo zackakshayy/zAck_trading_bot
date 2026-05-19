@@ -95,6 +95,13 @@ trading_flags:
   # When true, every HOLD also logs the specific reason (which condition
   # wasn't met). Useful for diagnosing days where nothing fires.
   log_hold_reasons: false
+  # ATR momentum gate. Skip entry when the avg ATR over the last N completed
+  # bars is below this threshold — market is grinding too slowly for options
+  # buying to be viable (theta > expected move). Set to 0 to disable.
+  # NIFTY 5-min guidance: ~15 pts = slow chop (skip), 20-25 = moderate (borderline),
+  # >25 = tradeable momentum (take it). Start at 15 and tune from logs.
+  min_atr_per_bar: 0
+  min_atr_lookback_bars: 3
   # ONE-SHOT diagnostic. When true, the bot bypasses sentiment/VIX/IVR/IV-RV
   # gates and takes the first non-HOLD signal; auto-disarms after that trade.
   # Daily-loss limit + liquidity + max-trades + IP whitelist still apply.

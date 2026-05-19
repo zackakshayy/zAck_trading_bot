@@ -15,8 +15,9 @@ class BaseStrategy:
         self.kite = kite
         self.config = config
         self.name = "Base"
-        self.is_reversal_trade = False # Default behavior requires sentiment confirmation
-
+        self.is_reversal_trade = False
+        # Tracks the last HOLD reason for the terminal status line and log dedup.
+        self._last_hold_reason: str = ""
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         """
@@ -31,12 +32,14 @@ class BaseStrategy:
 
     def _log_hold(self, reason: str):
         """
-        Emit a HOLD-reason log when the operator has opted in via
-        `trading_flags.log_hold_reasons: true`. Lets you read the logs
-        and see exactly which strategy condition isn't being met instead
-        of guessing why nothing is firing.
+        Always updates _last_hold_reason (feeds the terminal status line).
+        Only emits a log line when the reason changes — suppresses the repeated
+        identical lines that appear every 5 s while market conditions are stable.
+        Logging requires trading_flags.log_hold_reasons: true.
         """
-        if (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
+        changed = reason != self._last_hold_reason
+        self._last_hold_reason = reason
+        if changed and (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
             logging.info(f"[{self.name}] HOLD: {reason}")
 
 class Gemini_Default_Strategy(BaseStrategy):
@@ -158,16 +161,20 @@ class VolatilityClusterStrategy(BaseStrategy):
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 20: return 'HOLD'
+        if index < 20:
+            self._log_hold(f"insufficient bars (index={index} < 20)")
+            return 'HOLD'
 
         if 'atr' not in day_df.columns:
             day_df['atr'] = ta.atr(day_df['high'], day_df['low'], day_df['close'], length=14)
         if 'atr_ma' not in day_df.columns:
             day_df['atr_ma'] = day_df['atr'].rolling(window=20).mean()
-            
+
         last_completed_candle = day_df.iloc[index - 1]
 
-        if pd.isna(last_completed_candle['atr']) or pd.isna(last_completed_candle['atr_ma']): return 'HOLD'
+        if pd.isna(last_completed_candle['atr']) or pd.isna(last_completed_candle['atr_ma']):
+            self._log_hold("ATR or ATR-MA is NaN on last completed candle")
+            return 'HOLD'
 
         is_high_volatility = last_completed_candle['atr'] > last_completed_candle['atr_ma']
         avg_candle_size = day_df['atr'].iloc[index-1]
@@ -179,12 +186,26 @@ class VolatilityClusterStrategy(BaseStrategy):
             if is_high_volatility and is_large_move and is_reversal_candle:
                 logging.info(f"[{self.name}] Reversal BUY signal: High volatility detected after a large down move.")
                 return 'BUY'
+            self._log_hold(
+                f"need high_vol AND large_down_candle. "
+                f"high_vol={is_high_volatility} (atr={last_completed_candle['atr']:.2f} vs atr_ma={last_completed_candle['atr_ma']:.2f}), "
+                f"large_move={is_large_move} (candle={last_candle_size:.2f} vs 1.5x_atr={avg_candle_size*1.5:.2f}), "
+                f"reversal_candle={is_reversal_candle}"
+            )
         elif sentiment in ['Bearish', 'Very Bearish']:
             is_reversal_candle = last_completed_candle['close'] > last_completed_candle['open']
             if is_high_volatility and is_large_move and is_reversal_candle:
                 logging.info(f"[{self.name}] Reversal SELL signal: High volatility detected after a large up move.")
                 return 'SELL'
-            
+            self._log_hold(
+                f"need high_vol AND large_up_candle. "
+                f"high_vol={is_high_volatility} (atr={last_completed_candle['atr']:.2f} vs atr_ma={last_completed_candle['atr_ma']:.2f}), "
+                f"large_move={is_large_move} (candle={last_candle_size:.2f} vs 1.5x_atr={avg_candle_size*1.5:.2f}), "
+                f"reversal_candle={is_reversal_candle}"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
+
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -201,30 +222,50 @@ class VSA_Strategy(BaseStrategy):
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 20: return 'HOLD'
-        
+        if index < 20:
+            self._log_hold(f"insufficient bars (index={index} < 20)")
+            return 'HOLD'
+
         if 'volume_ma' not in day_df.columns:
             day_df['volume_ma'] = day_df['volume'].rolling(window=20).mean()
         if 'spread' not in day_df.columns:
             day_df['spread'] = day_df['high'] - day_df['low']
-        
+
         last_candle = day_df.iloc[index - 1]
-        
+        spread_ma = day_df['spread'].rolling(window=20).mean().iloc[index - 1]
+
         is_high_volume = last_candle.get('volume', 0) > (last_candle.get('volume_ma', 0) * 1.3)
-        is_wide_spread = last_candle.get('spread', 0) > day_df['spread'].rolling(window=20).mean().iloc[index - 1]
-        
+        is_wide_spread = last_candle.get('spread', 0) > spread_ma
+
         if sentiment in ['Bullish', 'Very Bullish']:
             is_down_bar = last_candle['close'] < last_candle['open']
             is_high_close = last_candle['close'] > (last_candle['low'] + last_candle['spread'] * 0.5)
             if is_down_bar and is_high_volume and is_wide_spread and is_high_close:
-                logging.info(f"[{self.name}] Signal confirmed: Sign of Strength detected."); return 'BUY'
-        
-        if sentiment in ['Bearish', 'Very Bearish']:
+                logging.info(f"[{self.name}] Signal confirmed: Sign of Strength detected.")
+                return 'BUY'
+            self._log_hold(
+                f"need down_bar AND high_vol AND wide_spread AND high_close. "
+                f"down_bar={is_down_bar}, high_vol={is_high_volume} "
+                f"(vol={last_candle.get('volume',0):.0f} vs 1.3x_ma={last_candle.get('volume_ma',0)*1.3:.0f}), "
+                f"wide_spread={is_wide_spread} (spread={last_candle.get('spread',0):.2f} vs ma={spread_ma:.2f}), "
+                f"high_close={is_high_close}"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
             is_up_bar = last_candle['close'] > last_candle['open']
             is_low_close = last_candle['close'] < (last_candle['low'] + last_candle['spread'] * 0.5)
             if is_up_bar and is_high_volume and is_wide_spread and is_low_close:
-                logging.info(f"[{self.name}] Signal confirmed: Sign of Weakness detected."); return 'SELL'
-            
+                logging.info(f"[{self.name}] Signal confirmed: Sign of Weakness detected.")
+                return 'SELL'
+            self._log_hold(
+                f"need up_bar AND high_vol AND wide_spread AND low_close. "
+                f"up_bar={is_up_bar}, high_vol={is_high_volume} "
+                f"(vol={last_candle.get('volume',0):.0f} vs 1.3x_ma={last_candle.get('volume_ma',0)*1.3:.0f}), "
+                f"wide_spread={is_wide_spread} (spread={last_candle.get('spread',0):.2f} vs ma={spread_ma:.2f}), "
+                f"low_close={is_low_close}"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
+
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -337,21 +378,42 @@ class Opening_Range_Breakout_Strategy(BaseStrategy):
                 self.orb_period_set = True
                 logging.info(f"[{self.name}] ORB Set: High={self.orb_high:.2f}, Low={self.orb_low:.2f}, Range={(self.orb_high - self.orb_low):.2f}")
         
-        if not self.orb_period_set: return 'HOLD'
-        
-        if (self.orb_high - self.orb_low) < 10:
-            logging.debug(f"[{self.name}] ORB range is too narrow ({self.orb_high - self.orb_low:.2f} points). No trades will be taken.")
+        if not self.orb_period_set:
+            self._log_hold(f"ORB not established yet — waiting for first {orb_minutes} min candles")
+            return 'HOLD'
+
+        orb_range = self.orb_high - self.orb_low
+        if orb_range < 10:
+            self._log_hold(f"ORB range too narrow ({orb_range:.2f} pts < 10 pts min) — no trade")
             return 'HOLD'
 
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
         if 'volume_ma' not in day_df.columns: day_df['volume_ma'] = day_df['volume'].rolling(window=20).mean()
-        
-        if sentiment in ['Bullish', 'Very Bullish'] and last['close'] < self.orb_high and current['close'] > self.orb_high and current['volume'] > (current.get('volume_ma', 0) * 1.5):
-            logging.info(f"[{self.name}] BUY Signal on ORB High breakout.")
-            return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and last['close'] > self.orb_low and current['close'] < self.orb_low and current['volume'] > (current.get('volume_ma', 0) * 1.5):
-            logging.info(f"[{self.name}] SELL Signal on ORB Low breakdown.")
-            return 'SELL'
+
+        vol = current.get('volume', 0)
+        vol_ma = current.get('volume_ma', 0)
+        vol_ok = vol > (vol_ma * 1.5)
+
+        if sentiment in ['Bullish', 'Very Bullish']:
+            if last['close'] < self.orb_high and current['close'] > self.orb_high and vol_ok:
+                logging.info(f"[{self.name}] BUY Signal on ORB High breakout.")
+                return 'BUY'
+            self._log_hold(
+                f"need break above ORB high ({self.orb_high:.2f}) with vol>1.5x_MA. "
+                f"prev_close={last['close']:.2f}, curr_close={current['close']:.2f}, "
+                f"vol={vol:.0f} vs 1.5x_ma={vol_ma*1.5:.0f} (vol_ok={vol_ok})"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
+            if last['close'] > self.orb_low and current['close'] < self.orb_low and vol_ok:
+                logging.info(f"[{self.name}] SELL Signal on ORB Low breakdown.")
+                return 'SELL'
+            self._log_hold(
+                f"need break below ORB low ({self.orb_low:.2f}) with vol>1.5x_MA. "
+                f"prev_close={last['close']:.2f}, curr_close={current['close']:.2f}, "
+                f"vol={vol:.0f} vs 1.5x_ma={vol_ma*1.5:.0f} (vol_ok={vol_ok})"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -409,11 +471,31 @@ class MA_Crossover_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "MA_Crossover"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        if index < 1: return 'HOLD'
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
 
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
-        if sentiment in ['Bullish', 'Very Bullish'] and last['ema_9'] <= last['ema_21'] and current['ema_9'] > current['ema_21']: return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and last['ema_9'] >= last['ema_21'] and current['ema_9'] < current['ema_21']: return 'SELL'
+        if sentiment in ['Bullish', 'Very Bullish']:
+            crossed_up = last['ema_9'] <= last['ema_21'] and current['ema_9'] > current['ema_21']
+            if crossed_up:
+                return 'BUY'
+            self._log_hold(
+                f"no bullish EMA-9/21 crossover. "
+                f"prev: ema9={last['ema_9']:.2f} vs ema21={last['ema_21']:.2f}, "
+                f"curr: ema9={current['ema_9']:.2f} vs ema21={current['ema_21']:.2f}"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
+            crossed_down = last['ema_9'] >= last['ema_21'] and current['ema_9'] < current['ema_21']
+            if crossed_down:
+                return 'SELL'
+            self._log_hold(
+                f"no bearish EMA-9/21 crossover. "
+                f"prev: ema9={last['ema_9']:.2f} vs ema21={last['ema_21']:.2f}, "
+                f"curr: ema9={current['ema_9']:.2f} vs ema21={current['ema_21']:.2f}"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -426,10 +508,22 @@ class RSI_Divergence_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "RSI_Divergence"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
-        
+
         divergence = check_rsi_divergence(day_df.iloc[:index + 1], day_df['rsi'].iloc[:index + 1])
-        if sentiment in ['Bullish', 'Very Bullish'] and divergence == 'Bullish': return 'BUY'
-        if sentiment in ['Bearish', 'Very Bearish'] and divergence == 'Bearish': return 'SELL'
+        if sentiment in ['Bullish', 'Very Bullish']:
+            if divergence == 'Bullish':
+                return 'BUY'
+            self._log_hold(
+                f"need Bullish RSI divergence. got divergence={divergence!r}"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
+            if divergence == 'Bearish':
+                return 'SELL'
+            self._log_hold(
+                f"need Bearish RSI divergence. got divergence={divergence!r}"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
@@ -454,7 +548,8 @@ class EMACrossRSIStrategy(BaseStrategy):
         # New configurable lookback period. Default to 5 candles if not set.
         lookback_period = self.config['trading_flags'].get('ema_cross_lookback', 5)
 
-        if index < lookback_period + 1: # Ensure we have enough data for the lookback
+        if index < lookback_period + 1:
+            self._log_hold(f"insufficient bars (index={index} < lookback+1={lookback_period+1})")
             return 'HOLD'
 
         # Ensure indicators are present
@@ -483,6 +578,12 @@ class EMACrossRSIStrategy(BaseStrategy):
             if recent_golden_cross:
                 logging.info(f"[{self.name}] BUY Signal: 9/15 EMA in bullish state post-crossover with RSI > 50.")
                 return 'BUY'
+            self._log_hold(
+                f"bullish state confirmed but no golden cross in last {lookback_period} bars. "
+                f"ema9={current_candle['ema_9']:.2f} > ema15={current_candle['ema_15']:.2f}, "
+                f"rsi={current_candle['rsi']:.1f}"
+            )
+            return 'HOLD'
 
         # --- MODIFIED BEARISH (SELL) SIGNAL LOGIC ---
         # 1. Check current state: 9-EMA is below 15-EMA now.
@@ -503,6 +604,28 @@ class EMACrossRSIStrategy(BaseStrategy):
             if recent_death_cross:
                 logging.info(f"[{self.name}] SELL Signal: 9/15 EMA in bearish state post-crossover with RSI < 50.")
                 return 'SELL'
+            self._log_hold(
+                f"bearish state confirmed but no death-cross in last {lookback_period} bars. "
+                f"ema9={current_candle['ema_9']:.2f} < ema15={current_candle['ema_15']:.2f}, "
+                f"rsi={current_candle['rsi']:.1f}"
+            )
+            return 'HOLD'
+        elif sentiment in ['Bullish', 'Very Bullish']:
+            self._log_hold(
+                f"bullish conditions not met: trending_up={is_trending_up} "
+                f"(ema9={current_candle['ema_9']:.2f} vs ema15={current_candle['ema_15']:.2f}), "
+                f"confirmed_up={is_confirmed_up} (rsi={current_candle['rsi']:.1f}, "
+                f"close={'above' if current_candle['close'] > current_candle['ema_9'] else 'below'} ema9)"
+            )
+        elif sentiment in ['Bearish', 'Very Bearish']:
+            self._log_hold(
+                f"bearish conditions not met: trending_down={is_trending_down} "
+                f"(ema9={current_candle['ema_9']:.2f} vs ema15={current_candle['ema_15']:.2f}), "
+                f"confirmed_down={is_confirmed_down} (rsi={current_candle['rsi']:.1f}, "
+                f"close={'below' if current_candle['close'] < current_candle['ema_9'] else 'above'} ema9)"
+            )
+        else:
+            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
 
         return 'HOLD'
 
@@ -544,10 +667,10 @@ class Reversal_Detector_Strategy(BaseStrategy):
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         trend_status = is_trend_overextended(day_df)
         if trend_status == "None":
+            self._log_hold("no overextended trend detected (need RSI>70+1.5% move up, or RSI<30+1.5% move down)")
             return 'HOLD'
 
         rsi_divergence = check_momentum_divergence(day_df['close'], day_df['rsi'])
-        
         current_candle = day_df.iloc[-1]
 
         # Look for a Bearish Reversal signal
@@ -555,13 +678,24 @@ class Reversal_Detector_Strategy(BaseStrategy):
             if current_candle['close'] < current_candle['ema_9']:
                 logging.info(f"[{self.name}] Bearish Reversal Signal: Overextended uptrend with RSI divergence confirmed by close below 9-EMA.")
                 return 'SELL'
-
-        # Look for a Bullish Reversal signal
-        if trend_status == "Downtrend" and rsi_divergence == "Bullish":
+            self._log_hold(
+                f"uptrend+bearish_divergence confirmed but price not below ema9. "
+                f"close={current_candle['close']:.2f} vs ema9={current_candle['ema_9']:.2f}"
+            )
+        elif trend_status == "Downtrend" and rsi_divergence == "Bullish":
             if current_candle['close'] > current_candle['ema_9']:
                 logging.info(f"[{self.name}] Bullish Reversal Signal: Overextended downtrend with RSI divergence confirmed by close above 9-EMA.")
                 return 'BUY'
-        
+            self._log_hold(
+                f"downtrend+bullish_divergence confirmed but price not above ema9. "
+                f"close={current_candle['close']:.2f} vs ema9={current_candle['ema_9']:.2f}"
+            )
+        else:
+            self._log_hold(
+                f"trend/divergence mismatch. trend={trend_status}, divergence={rsi_divergence} "
+                f"(need uptrend+bearish_div or downtrend+bullish_div)"
+            )
+
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):

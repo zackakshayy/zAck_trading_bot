@@ -414,6 +414,35 @@ class TradingBotOrchestrator:
             return True
         return False
 
+    def _is_momentum_too_low(self, df) -> bool:
+        """Return True when recent bars are too slow for options buying to be viable.
+
+        Checks the rolling average ATR over the last `min_atr_lookback_bars` completed
+        bars against `min_atr_per_bar`. A threshold of 0 (the default) disables the gate.
+        """
+        flags = self.config.get('trading_flags') or {}
+        threshold = float(flags.get('min_atr_per_bar', 0) or 0)
+        if threshold <= 0:
+            return False
+        try:
+            lookback = int(flags.get('min_atr_lookback_bars', 3) or 3)
+            if df is None or len(df) < lookback + 1:
+                return False
+            # Use completed bars only (exclude the forming bar at iloc[-1]).
+            atr_vals = df['atr'].iloc[-(lookback + 1):-1]
+            if atr_vals.isna().all():
+                return False
+            avg_atr = float(atr_vals.mean())
+            if avg_atr < threshold:
+                logging.warning(
+                    f"ATR momentum gate: avg ATR over last {lookback} bars = {avg_atr:.2f} "
+                    f"< min {threshold:.2f}. Market too slow for options buying — skipping entry."
+                )
+                return True
+        except Exception as e:
+            logging.debug(f"ATR momentum gate check failed (non-fatal): {e}")
+        return False
+
     async def _is_vix_too_high(self) -> bool:
         max_vix = float(self.config['trading_flags'].get('max_vix_level', 0) or 0)
         if max_vix <= 0:
@@ -857,6 +886,33 @@ class TradingBotOrchestrator:
         except Exception:
             return False
 
+    def _print_status_line(self) -> None:
+        """Overwrite the current terminal line with a live waiting-timer.
+
+        Shows: timestamp | strategy | elapsed wait | current HOLD reason.
+        Only active while AWAITING_SIGNAL in an interactive TTY so log files
+        and headless runs are unaffected.
+        """
+        if not self._is_interactive_tty() or self.bot_state != "AWAITING_SIGNAL":
+            return
+        now = datetime.datetime.now()
+        elapsed = "00:00"
+        if self.awaiting_signal_since:
+            secs = max(0, int((now - self.awaiting_signal_since).total_seconds()))
+            elapsed = f"{secs // 60:02d}:{secs % 60:02d}"
+        strategy = self.active_strategy_name or "—"
+        hold_reason = ""
+        if self.active_strategy and self.active_strategy._last_hold_reason:
+            hold_reason = self.active_strategy._last_hold_reason
+        line = f"[{now.strftime('%H:%M:%S')}]  {strategy}  |  waiting {elapsed}  |  {hold_reason}"
+        try:
+            import shutil
+            width = shutil.get_terminal_size(fallback=(120, 24)).columns - 1
+        except Exception:
+            width = 119
+        # Pad to full width so previous longer lines are fully overwritten.
+        print(f"\r{line[:width].ljust(width)}", end="", flush=True)
+
     async def _input_with_timeout(self, prompt: str, timeout: float = 20.0):
         """
         Reads a line from stdin with a timeout. Returns the stripped input
@@ -1177,7 +1233,9 @@ class TradingBotOrchestrator:
         """
         Sleep until the next 5s tick (bounded by max_seconds). Cheap to call,
         responsive to broker SL-M fills, and avoids drifting against the bar clock.
+        Refreshes the terminal status line on each tick while awaiting a signal.
         """
+        self._print_status_line()
         sleep_for = max(1.0, min(max_seconds, 5.0))
         await asyncio.sleep(sleep_for)
 
@@ -1342,8 +1400,11 @@ class TradingBotOrchestrator:
                             )
 
                         if force_mode_now or getattr(self.active_strategy, 'is_reversal_trade', False) or is_primary_signal:
+                            # ATR momentum gate — bypassed in force mode.
+                            if not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
+                                pass  # already logged inside helper
                             # VIX gate — bypassed in force mode.
-                            if not force_mode_now and await self._is_vix_too_high():
+                            elif not force_mode_now and await self._is_vix_too_high():
                                 logging.warning("Skipping entry due to VIX gate.")
                             else:
                                 trade_details = (await self.order_agent.place_trade(signal, force_mode=force_mode_now)
@@ -1355,6 +1416,9 @@ class TradingBotOrchestrator:
                                     if not is_paper:
                                         await self.position_agent.attach_broker_stop_loss(self.order_agent)
                                     self.trades_today_count += 1
+                                    # Clear the \r status line before trade logs print.
+                                    if self._is_interactive_tty():
+                                        print(flush=True)
                                     self.bot_state = "IN_POSITION"
                                     self.awaiting_signal_since = None
                                     # Auto-disarm force mode after the first trade.

@@ -107,6 +107,18 @@ def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
       Bear = {Bearish, Very Bearish}
       Neutral handled upstream (no trade today).
     Returns the strategy name, or None if conditions don't match any cell.
+
+    Regime rationale:
+      VIX_HIGH        — Big directional moves expected. Buy the breakout of
+                        prev-day levels (Breakout_Prev_Day_HL fires reliably on
+                        high-vol days). Volatility_Cluster_Reversal requires a
+                        specific reversal candle that rarely forms under stress.
+      VIX_MEDIUM      — Normal trending session. VWAP-anchored plays (VWAP_Reversion
+                        fires multiple times/day) or EMA/Supertrend for trending IV.
+      VIX_LOW+IV_LOW  — Slow, grinding, VWAP-anchored session. VWAP_Reversion is
+                        the right tool; BB_Squeeze/NR7 are still reachable via the
+                        Layer-3 indicator override when they actually form.
+      VIX_LOW+IV_HIGH — Smart-money footprint or mean-reversion bias.
     """
     is_bull = sentiment in ("Bullish", "Very Bullish")
     is_bear = sentiment in ("Bearish", "Very Bearish")
@@ -114,8 +126,9 @@ def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
         return None
 
     if "VIX_HIGH" in market_conditions:
-        # All VIX_HIGH cells route to the same strategy — high vol = vol-cluster reversal.
-        return "Volatility_Cluster_Reversal"
+        # High VIX → big directional day. Breakout of prev-day levels is
+        # far more reliable than waiting for a reversal candle pattern.
+        return "Breakout_Prev_Day_HL"
 
     iv_high = "IV_HIGH" in market_conditions
 
@@ -126,7 +139,10 @@ def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
 
     if "VIX_LOW" in market_conditions:
         if not iv_high:
-            return "BB_Squeeze_Breakout" if is_bull else "NR7_Compression"
+            # Quiet session — VWAP reversion suits a slow grind much better
+            # than waiting for a BB squeeze that may never break out.
+            # BB_Squeeze and NR7 are still reachable via Layer-3 indicator override.
+            return "VWAP_Reversion"
         return "Volume_Spread_Analysis" if is_bull else "RSI_Divergence"
 
     return None
