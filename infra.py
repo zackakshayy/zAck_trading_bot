@@ -209,6 +209,29 @@ def save_daily_pnl(date_str: str, pnl: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Weekly P&L persistence
+# ---------------------------------------------------------------------------
+
+WEEKLY_PNL_FILE = state_path("weekly_pnl.json")
+
+
+def load_weekly_pnl(week_str: str) -> float:
+    """Reads realized P&L for `week_str` (e.g. '2025-W03'); returns 0.0 if missing."""
+    data = read_json(WEEKLY_PNL_FILE, default={})
+    if not isinstance(data, dict):
+        return 0.0
+    return float(data.get(week_str, 0.0))
+
+
+def save_weekly_pnl(week_str: str, pnl: float) -> None:
+    data = read_json(WEEKLY_PNL_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    data[week_str] = float(pnl)
+    atomic_write_json(WEEKLY_PNL_FILE, data)
+
+
+# ---------------------------------------------------------------------------
 # ATM IV history (per underlying, dated) + IV-Rank computation
 # ---------------------------------------------------------------------------
 

@@ -65,6 +65,16 @@ risk_management:
   high_vix_risk_reduction_factor: 0.5
   high_vix_threshold: 22.0
   max_daily_loss_percent: 2.5
+  # Consecutive-loss circuit breaker: halt the session after N losing trades
+  # in a row without a winning trade in between. A winning trade resets the
+  # streak to 0. The breaker is session-scoped (resets on bot restart).
+  enable_consecutive_loss_limit: true
+  max_consecutive_losses: 3
+  # Weekly P&L cap: halt new entries for the remainder of the ISO week once
+  # cumulative realized losses since Monday reach this % of starting capital.
+  # Disabled by default — opt in by setting enable_weekly_loss_limit: true.
+  enable_weekly_loss_limit: false
+  max_weekly_loss_percent: 5.0
 strategy_signals:
   use_cpr_breakout: true
   use_ema_20_crossover: true

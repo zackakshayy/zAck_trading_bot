@@ -29,8 +29,10 @@ from pcr_feed import PCRFeed
 from infra import (
     is_nse_holiday,
     load_daily_pnl,
+    load_weekly_pnl,
     safe_ltp,
     save_daily_pnl,
+    save_weekly_pnl,
 )
 import multiprocessing
 import warnings
@@ -126,14 +128,26 @@ class TradingBotOrchestrator:
         self.bot_state = "STARTING"
         self.last_processed_timestamp = None
         self.awaiting_signal_since = None
-        # Realized P&L tracking for daily-loss circuit breaker — persisted per date.
+        # Realized P&L tracking for daily-loss and weekly-loss circuit breakers.
+        # Both are persisted to disk so a same-day restart doesn't reset the caps.
         self._today_str = datetime.date.today().isoformat()
+        self._today_week_str = datetime.date.today().strftime("%G-W%V")
         self.realized_pnl_today = load_daily_pnl(self._today_str)
+        self.realized_pnl_week  = load_weekly_pnl(self._today_week_str)
         if self.realized_pnl_today != 0.0:
             logging.info(
                 f"Resuming with persisted realized P&L for {self._today_str}: "
                 f"{self.realized_pnl_today:,.2f}"
             )
+        if self.realized_pnl_week != 0.0:
+            logging.info(
+                f"Resuming with persisted weekly P&L for {self._today_week_str}: "
+                f"{self.realized_pnl_week:,.2f}"
+            )
+        # Consecutive-loss counter — resets each bot restart (session-scoped).
+        # The circuit breaker fires once N losses occur in an unbroken streak
+        # within this session; winning trades reset the streak to 0.
+        self.consecutive_losses: int = 0
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
@@ -420,6 +434,51 @@ class TradingBotOrchestrator:
             logging.error(
                 f"DAILY LOSS LIMIT BREACHED: realized={self.realized_pnl_today:,.2f} "
                 f"limit={-max_loss_amt:,.2f}. Halting new entries."
+            )
+            return True
+        return False
+
+    def _is_consecutive_loss_breached(self) -> bool:
+        """
+        True once the intra-session consecutive-loss streak reaches the
+        configured limit. Resets to False after a winning trade.
+
+        Reads from config.risk_management:
+          enable_consecutive_loss_limit: true   (default true)
+          max_consecutive_losses: 3             (default 3)
+        """
+        rm = self.config.get('risk_management', {})
+        if not rm.get('enable_consecutive_loss_limit', True):
+            return False
+        max_streak = int(rm.get('max_consecutive_losses', 3))
+        if self.consecutive_losses >= max_streak:
+            logging.error(
+                f"CONSECUTIVE LOSS LIMIT: {self.consecutive_losses} losses in a row "
+                f"(limit={max_streak}). Halting new entries for the session."
+            )
+            return True
+        return False
+
+    async def _is_weekly_loss_breached(self) -> bool:
+        """
+        True when the cumulative realized P&L since Monday of the current
+        ISO week hits the configured weekly-loss cap.
+
+        Reads from config.risk_management:
+          enable_weekly_loss_limit: true         (default false — opt-in)
+          max_weekly_loss_percent: 5.0           (% of starting capital)
+        """
+        rm = self.config.get('risk_management', {})
+        if not rm.get('enable_weekly_loss_limit', False):
+            return False
+        if not self.starting_capital or self.starting_capital <= 0:
+            return False
+        max_loss_pct = float(rm.get('max_weekly_loss_percent', 5.0))
+        max_loss_amt = self.starting_capital * (max_loss_pct / 100.0)
+        if self.realized_pnl_week <= -abs(max_loss_amt):
+            logging.error(
+                f"WEEKLY LOSS LIMIT BREACHED: realized={self.realized_pnl_week:,.2f} "
+                f"limit={-max_loss_amt:,.2f}. Halting new entries for the week."
             )
             return True
         return False
@@ -1372,11 +1431,30 @@ class TradingBotOrchestrator:
         return True
 
     def _record_realized_pnl(self, delta_pnl: float) -> None:
-        self.realized_pnl_today += float(delta_pnl or 0)
+        amount = float(delta_pnl or 0)
+        self.realized_pnl_today += amount
+        self.realized_pnl_week  += amount
+
+        # Update the consecutive-loss streak.
+        if amount < 0:
+            self.consecutive_losses += 1
+            logging.warning(
+                f"[Risk] Consecutive losses: {self.consecutive_losses} "
+                f"(trade P&L={amount:,.2f})"
+            )
+        elif amount > 0:
+            if self.consecutive_losses > 0:
+                logging.info(
+                    f"[Risk] Consecutive-loss streak broken after "
+                    f"{self.consecutive_losses} loss(es) — resetting to 0."
+                )
+            self.consecutive_losses = 0
+
         try:
             save_daily_pnl(self._today_str, self.realized_pnl_today)
+            save_weekly_pnl(self._today_week_str, self.realized_pnl_week)
         except Exception as e:
-            logging.warning(f"Could not persist daily P&L: {e}")
+            logging.warning(f"Could not persist P&L: {e}")
 
     async def run(self):
         """The main event loop for the trading bot."""
@@ -1466,6 +1544,10 @@ class TradingBotOrchestrator:
                     await self._refresh_starting_capital()
                     # Hard gates that must pass before considering any new entry.
                     if await self._is_daily_loss_breached():
+                        self.bot_state = "STOPPED"; continue
+                    if self._is_consecutive_loss_breached():
+                        self.bot_state = "STOPPED"; continue
+                    if await self._is_weekly_loss_breached():
                         self.bot_state = "STOPPED"; continue
                     max_trades = int(self.config['trading_flags']['max_trades_per_day'])
                     if getattr(self, "is_expiry_day", False):
