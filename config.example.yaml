@@ -70,6 +70,22 @@ strategy_signals:
   use_ema_20_crossover: true
   use_ema_50_crossover: true
   use_rsi_divergence: true
+# Put-Call Ratio feed. Fetches NIFTY option chain OI from Kite (NFO instruments
+# + quote API). Used as a pre-trade gate: a PCR_BEARISH reading blocks BUY
+# entries, PCR_BULLISH blocks SELL entries. Set enable: false to disable.
+pcr_feed:
+  enable: true
+  strikes_each_side: 5          # ATM ± 5 strikes (11 total) for OI aggregation
+  bullish_threshold: 1.2        # PCR >= this → PCR_BULLISH (confirms BUY bias)
+  bearish_threshold: 0.8        # PCR <= this → PCR_BEARISH (confirms SELL bias)
+  cache_seconds: 300            # refresh at most once per 5-min bar
+# 15-minute confirmation gate. Before placing any trade, the bot fetches the
+# 15-min bar series and checks that the higher-timeframe trend agrees:
+#   BUY  requires: 15-min RSI > 50 AND close > 15-min EMA20
+#   SELL requires: 15-min RSI < 50 AND close < 15-min EMA20
+# Gate is bypassed when the 15-min data is unavailable or indicators are NaN,
+# so a transient outage never silently blocks all trades.
+# Set enable_15m_confirmation: false in trading_flags to disable.
 trading_flags:
   backtest_years: 2
   chart_timeframe: 5minute
@@ -106,6 +122,8 @@ trading_flags:
   # gates and takes the first non-HOLD signal; auto-disarms after that trade.
   # Daily-loss limit + liquidity + max-trades + IP whitelist still apply.
   force_one_trade_today: false
+  # 15-minute confirmation gate (see pcr_feed block comment above for details).
+  enable_15m_confirmation: true
   underlying_instrument: NIFTY 50
   use_rag: true
   win_rate_threshold: 55.0

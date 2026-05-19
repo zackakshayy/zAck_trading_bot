@@ -25,6 +25,7 @@ from indicators import calculate_cpr, is_trend_overextended, check_momentum_dive
 from indicator_calculator import calculate_all_indicators
 from market_context import MarketConditionIdentifier
 from rag_service import RAGService
+from pcr_feed import PCRFeed
 from infra import (
     is_nse_holiday,
     load_daily_pnl,
@@ -152,6 +153,14 @@ class TradingBotOrchestrator:
         # Cache for the underlying intraday bar data (refreshed only when a new bar closes).
         self._bars_cache = None
         self._bars_cached_at_bar = None
+        # Separate cache for 15-minute bars used by the confirmation gate.
+        self._bars_15m_cache = None
+        self._bars_15m_cached_at_bar = None
+        # PCR feed — initialised after authentication.
+        self.pcr_feed: PCRFeed | None = None
+        # Last PCR result dict (tag, pcr, put_oi, call_oi …). Default to empty so
+        # gate is bypassed until the first successful fetch.
+        self._pcr_data: dict = {}
         # Track whether the bot should fail-stop on the next iteration (e.g. token expiry).
         self._abort = False
         # Sentiment + NL-prompt cache. Captured ONCE on first setup; reused on
@@ -202,6 +211,7 @@ class TradingBotOrchestrator:
             self.market_condition_identifier = MarketConditionIdentifier(self.kite, self.config)
             self.order_agent = OrderExecutionAgent(self.kite, self.config)
             self.position_agent = PositionManagementAgent(self.kite, self.config, self.rag_service)
+            self.pcr_feed = PCRFeed(self.kite, self.config)
             logging.info("Agents initialized successfully.")
             
             return True
@@ -1239,6 +1249,128 @@ class TradingBotOrchestrator:
         sleep_for = max(1.0, min(max_seconds, 5.0))
         await asyncio.sleep(sleep_for)
 
+    # ------------------------------------------------------------------
+    # 15-minute bar confirmation helpers
+    # ------------------------------------------------------------------
+
+    async def _get_15min_bars(self, force_refresh: bool = False) -> pd.DataFrame:
+        """
+        Returns 15-minute intraday bars with all indicators pre-computed.
+        Uses a separate cache from the 5-min bars — refreshed only when a new
+        15-min bar closes (every 15 minutes) to avoid extra API calls.
+        """
+        timeframe = "15minute"
+        bar_idx = self._current_bar_index(timeframe)
+        if (
+            not force_refresh
+            and self._bars_15m_cache is not None
+            and self._bars_15m_cached_at_bar == bar_idx
+        ):
+            return self._bars_15m_cache
+
+        signal_token = getattr(
+            self.order_agent, "signal_data_token", self.order_agent.underlying_token
+        )
+        try:
+            hist = await asyncio.to_thread(
+                self.kite.historical_data,
+                signal_token,
+                datetime.datetime.now() - datetime.timedelta(days=5),
+                datetime.datetime.now(),
+                timeframe,
+            )
+            df = pd.DataFrame(hist)
+            if not df.empty:
+                df = calculate_all_indicators(df, self.config)
+        except Exception as exc:
+            logging.warning(f"[15m bars] Fetch failed (non-fatal): {exc}")
+            df = pd.DataFrame()
+        self._bars_15m_cache      = df
+        self._bars_15m_cached_at_bar = bar_idx
+        return df
+
+    @staticmethod
+    def _check_15min_confirmation(signal: str, df_15m: pd.DataFrame) -> tuple:
+        """
+        Returns (confirmed: bool, reason: str).
+
+        BUY  confirmed when 15-min RSI > 50  AND  close > 15-min EMA20.
+        SELL confirmed when 15-min RSI < 50  AND  close < 15-min EMA20.
+
+        The gate is bypassed (confirmed=True) when:
+          - df_15m is empty or missing required columns
+          - any indicator is NaN on the latest bar
+        so a data outage never silently blocks all trades.
+        """
+        import math
+        if df_15m is None or df_15m.empty:
+            return True, "15m: no data — gate bypassed"
+        if "rsi" not in df_15m.columns or "ema_20" not in df_15m.columns:
+            return True, "15m: indicators missing — gate bypassed"
+        last  = df_15m.iloc[-1]
+        rsi   = float(last.get("rsi",   float("nan")))
+        ema20 = float(last.get("ema_20", float("nan")))
+        close = float(last.get("close",  float("nan")))
+        if any(math.isnan(v) for v in (rsi, ema20, close)):
+            return True, "15m: NaN indicators — gate bypassed"
+
+        if signal == "BUY":
+            rsi_ok = rsi   > 50
+            ema_ok = close > ema20
+            if rsi_ok and ema_ok:
+                return True, (
+                    f"15m BUY confirmed: RSI={rsi:.1f}>50, "
+                    f"close={close:.2f}>EMA20={ema20:.2f}"
+                )
+            reasons = []
+            if not rsi_ok:
+                reasons.append(f"RSI={rsi:.1f}≤50")
+            if not ema_ok:
+                reasons.append(f"close={close:.2f}≤EMA20={ema20:.2f}")
+            return False, f"15m BUY not confirmed: {', '.join(reasons)}"
+
+        if signal == "SELL":
+            rsi_ok = rsi   < 50
+            ema_ok = close < ema20
+            if rsi_ok and ema_ok:
+                return True, (
+                    f"15m SELL confirmed: RSI={rsi:.1f}<50, "
+                    f"close={close:.2f}<EMA20={ema20:.2f}"
+                )
+            reasons = []
+            if not rsi_ok:
+                reasons.append(f"RSI={rsi:.1f}≥50")
+            if not ema_ok:
+                reasons.append(f"close={close:.2f}≥EMA20={ema20:.2f}")
+            return False, f"15m SELL not confirmed: {', '.join(reasons)}"
+
+        return True, "HOLD — no confirmation needed"
+
+    # ------------------------------------------------------------------
+    # PCR gate helper
+    # ------------------------------------------------------------------
+
+    def _is_pcr_aligned(self, signal: str) -> bool:
+        """
+        Returns True if the most-recent PCR reading is compatible with the
+        trade direction, or if PCR data is unavailable / neutral (gate bypassed).
+
+        Alignment rules (contrarian interpretation):
+          PCR_BULLISH + BUY  → aligned   (put build-up confirms long bias)
+          PCR_BULLISH + SELL → misaligned
+          PCR_BEARISH + SELL → aligned   (call build-up confirms short bias)
+          PCR_BEARISH + BUY  → misaligned
+          PCR_NEUTRAL / no data → always aligned (bypass)
+        """
+        tag = (self._pcr_data or {}).get("tag", "")
+        if not tag or tag in ("PCR_NEUTRAL", "PCR_DISABLED", "PCR_ERROR", ""):
+            return True
+        if signal == "BUY"  and tag == "PCR_BEARISH":
+            return False
+        if signal == "SELL" and tag == "PCR_BULLISH":
+            return False
+        return True
+
     def _record_realized_pnl(self, delta_pnl: float) -> None:
         self.realized_pnl_today += float(delta_pnl or 0)
         try:
@@ -1375,9 +1507,18 @@ class TradingBotOrchestrator:
                         await self._aligned_sleep()
                         continue
 
+                    # Refresh PCR (cached for one bar; non-fatal on failure).
+                    if self.pcr_feed is not None:
+                        try:
+                            spot = float(day_df_for_signal["close"].iloc[-1])
+                            self._pcr_data = await self.pcr_feed.get_pcr(spot_price=spot)
+                        except Exception as _pcr_exc:
+                            logging.debug(f"PCR refresh skipped: {_pcr_exc}")
+
                     signal = self.active_strategy.generate_signals(
                         day_df_for_signal, self.day_sentiment,
                         cpr_pivots=self.position_agent.cpr_pivots,
+                        vix_conditions=self.todays_conditions,
                     )
 
                     if signal != 'HOLD':
@@ -1406,29 +1547,66 @@ class TradingBotOrchestrator:
                             # VIX gate — bypassed in force mode.
                             elif not force_mode_now and await self._is_vix_too_high():
                                 logging.warning("Skipping entry due to VIX gate.")
+                            # PCR gate — bypassed in force mode.
+                            elif not force_mode_now and not self._is_pcr_aligned(signal):
+                                pcr_tag = (self._pcr_data or {}).get("tag", "?")
+                                pcr_val = (self._pcr_data or {}).get("pcr")
+                                logging.warning(
+                                    f"PCR gate: {signal} blocked by {pcr_tag} "
+                                    f"(PCR={pcr_val:.3f if pcr_val else 'N/A'}). "
+                                    f"PCR contradicts trade direction — skipping entry."
+                                )
                             else:
-                                trade_details = (await self.order_agent.place_trade(signal, force_mode=force_mode_now)
-                                                 if not is_paper
-                                                 else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now))
-                                if trade_details:
-                                    trade_details['Strategy'] = self.active_strategy_name
-                                    self.position_agent.start_trade(trade_details)
-                                    if not is_paper:
-                                        await self.position_agent.attach_broker_stop_loss(self.order_agent)
-                                    self.trades_today_count += 1
-                                    # Clear the \r status line before trade logs print.
-                                    if self._is_interactive_tty():
-                                        print(flush=True)
-                                    self.bot_state = "IN_POSITION"
-                                    self.awaiting_signal_since = None
-                                    # Auto-disarm force mode after the first trade.
-                                    if self._force_mode_armed:
-                                        self._force_mode_armed = False
-                                        logging.warning(
-                                            "FORCE-TRADE MODE disarmed: first diagnostic "
-                                            "trade fired. Normal gating resumes for any "
-                                            "subsequent entries this session."
+                                # 15-min confirmation gate — bypassed in force mode.
+                                _15m_ok = True
+                                _15m_reason = ""
+                                if not force_mode_now and self.config.get(
+                                    "trading_flags", {}
+                                ).get("enable_15m_confirmation", True):
+                                    try:
+                                        df_15m = await self._get_15min_bars()
+                                        _15m_ok, _15m_reason = self._check_15min_confirmation(
+                                            signal, df_15m
                                         )
+                                    except Exception as _15m_exc:
+                                        logging.debug(
+                                            f"15m confirmation check failed (bypassed): "
+                                            f"{_15m_exc}"
+                                        )
+                                        _15m_ok, _15m_reason = True, "error — bypassed"
+
+                                if not _15m_ok:
+                                    logging.warning(
+                                        f"15-min confirmation gate: {signal} blocked. "
+                                        f"{_15m_reason}"
+                                    )
+                                else:
+                                    if _15m_reason:
+                                        logging.info(f"15-min gate: {_15m_reason}")
+                                    trade_details = (
+                                        await self.order_agent.place_trade(signal, force_mode=force_mode_now)
+                                        if not is_paper
+                                        else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
+                                    )
+                                    if trade_details:
+                                        trade_details['Strategy'] = self.active_strategy_name
+                                        self.position_agent.start_trade(trade_details)
+                                        if not is_paper:
+                                            await self.position_agent.attach_broker_stop_loss(self.order_agent)
+                                        self.trades_today_count += 1
+                                        # Clear the \r status line before trade logs print.
+                                        if self._is_interactive_tty():
+                                            print(flush=True)
+                                        self.bot_state = "IN_POSITION"
+                                        self.awaiting_signal_since = None
+                                        # Auto-disarm force mode after the first trade.
+                                        if self._force_mode_armed:
+                                            self._force_mode_armed = False
+                                            logging.warning(
+                                                "FORCE-TRADE MODE disarmed: first diagnostic "
+                                                "trade fired. Normal gating resumes for any "
+                                                "subsequent entries this session."
+                                            )
                         else:
                             logging.warning(f"COUNTER-SIGNAL DETECTED: '{signal}' vs sentiment '{self.day_sentiment}'.")
 
