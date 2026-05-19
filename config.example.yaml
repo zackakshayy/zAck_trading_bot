@@ -222,6 +222,17 @@ option_filters:
   risk_free_rate: 0.07
   # How many strikes each side of ATM to fetch for the snapshot.
   chain_strikes_each_side: 5
+# DTE-aware position sizing. Risk is scaled continuously based on how many
+# calendar days remain until the selected option's expiry.
+# Rationale: theta and gamma risks accelerate non-linearly in the final 2 DTE;
+# buying options that close reduces size without skipping the trade entirely.
+# Each factor multiplies risk_per_trade_percent (1.0 = no change).
+dte_sizing:
+  factor_0: 0.50       # 0 DTE — expiry day: theta crush + binary gamma risk
+  factor_1: 0.70       # 1 DTE — overnight gap risk compounds theta
+  factor_2: 0.85       # 2 DTE — moderate theta drag, two sessions to go
+  factor_3_4: 0.95     # 3-4 DTE — short window but workable
+  factor_5_plus: 1.00  # 5+ DTE — full size, normal theta regime
 zerodha:
   access_token: ${ZERODHA_ACCESS_TOKEN}
   api_key: ${ZERODHA_API_KEY}

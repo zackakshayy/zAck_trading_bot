@@ -313,6 +313,9 @@ class OrderExecutionAgent:
         """
         Returns the risk-reduction factor in effect on expiry day, or 1.0 otherwise.
         Reads from config.expiry_day_overrides (defaults: enabled, factor 0.5).
+
+        Kept for backward compatibility. New code should call dte_risk_factor()
+        which supersedes this with a continuous DTE-based scale.
         """
         cfg = (self.config.get("expiry_day_overrides") or {})
         if not cfg.get("enable", True):
@@ -320,6 +323,49 @@ class OrderExecutionAgent:
         if not self.is_weekly_expiry_today():
             return 1.0
         return float(cfg.get("risk_reduction_factor", 0.5))
+
+    def dte_risk_factor(self, expiry_date: datetime.date) -> float:
+        """
+        Continuous DTE-based risk scaling.
+
+        Rationale
+        ---------
+        Options lose value non-linearly as expiry approaches. Theta and gamma
+        risks accelerate dramatically in the final 2 DTE. Buying options with
+        0-1 DTE remaining is structurally disadvantaged unless the move starts
+        immediately — so we reduce position size rather than skip the trade.
+
+        Scale (overridable via config.dte_sizing):
+          0 DTE  →  0.50  (expiry-day — theta crush + binary gamma risk)
+          1 DTE  →  0.70  (next-day expiry — overnight gap risk)
+          2 DTE  →  0.85  (two sessions to expiry — moderate theta drag)
+          3-4 DTE→  0.95  (short but workable window)
+          5+ DTE →  1.00  (normal sizing)
+
+        Reads overrides from config.dte_sizing:
+          factor_0, factor_1, factor_2, factor_3_4, factor_5_plus
+        """
+        today = datetime.date.today()
+        dte = max(0, (expiry_date - today).days)
+        cfg = (self.config.get("dte_sizing") or {})
+
+        if dte == 0:
+            factor = float(cfg.get("factor_0", 0.50))
+        elif dte == 1:
+            factor = float(cfg.get("factor_1", 0.70))
+        elif dte == 2:
+            factor = float(cfg.get("factor_2", 0.85))
+        elif dte <= 4:
+            factor = float(cfg.get("factor_3_4", 0.95))
+        else:
+            factor = float(cfg.get("factor_5_plus", 1.00))
+
+        if factor < 1.0:
+            logging.info(
+                f"[DTE sizing] expiry={expiry_date} DTE={dte} "
+                f"→ risk factor={factor:.2f}"
+            )
+        return factor
 
     def _tick_size_for(self, symbol: str) -> float:
         """Use the broker-reported tick size if present; default to 0.05 for NFO."""
@@ -752,14 +798,21 @@ class OrderExecutionAgent:
                 logging.error(f"Could not determine available capital from margins: {equity}")
                 return None, 0, 0
 
-            risk_pct = float(self.flags["risk_per_trade_percent"])
-            expiry_factor = self.expiry_risk_factor()
-            if expiry_factor < 1.0:
+            # Base risk percentage: honour a runtime override injected into the
+            # shared config dict (key "_effective_risk_pct") so the orchestrator
+            # can dial risk up/down mid-session without touching flags.
+            risk_pct = float(
+                self.config.get("_effective_risk_pct")
+                or self.flags["risk_per_trade_percent"]
+            )
+            # Continuous DTE scaling supersedes the old binary expiry_risk_factor.
+            dte_factor = self.dte_risk_factor(expiry_date)
+            if dte_factor < 1.0:
                 logging.info(
-                    f"Expiry-day risk override: scaling risk_pct by {expiry_factor} "
-                    f"({risk_pct:.2f}% -> {risk_pct * expiry_factor:.2f}%)"
+                    f"DTE risk scaling: risk_pct {risk_pct:.2f}% "
+                    f"→ {risk_pct * dte_factor:.2f}% (DTE factor={dte_factor:.2f})"
                 )
-                risk_pct *= expiry_factor
+                risk_pct *= dte_factor
             risk_amount = capital * (risk_pct / 100.0)
 
             sl_pct = float(self.flags.get("stop_loss_percent", 25.0)) / 100.0

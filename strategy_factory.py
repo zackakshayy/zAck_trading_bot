@@ -1052,6 +1052,165 @@ class NR7_Compression_Breakout_Strategy(BaseStrategy):
                 f"{nr7_bar['low']:.2f} on volume > 1.2x MA.")
 
 
+class ExpiryMomentumScalpStrategy(BaseStrategy):
+    """
+    Weekly-expiry momentum scalp.
+
+    Rationale
+    ---------
+    Expiry Thursday is gamma day: once the dominant side (calls or puts) starts
+    printing ITM, market-makers frantically hedge → sharp, sustained directional
+    moves through the middle of the session. This strategy rides those moves.
+
+    Entry conditions (all required)
+    --------------------------------
+    1. Expiry day only — weekday == 3 (Thursday) OR is_expiry_day kwarg is True.
+    2. Time window: 09:45 – 12:30 (early entries before structure forms are
+       noise; after 12:30 gamma risk from the other side rises sharply).
+    3. EMA-9 crossed EMA-21 within the last 3 completed bars (fresh momentum,
+       not a stale cross from the open).
+    4. RSI confirming: > 55 for BUY, < 45 for SELL (avoids fading a move that
+       is already turning).
+    5. ATR expanding: current bar's ATR >= prior bar's ATR * 1.05 (momentum
+       rather than chop; 5 % threshold avoids noise flips).
+    6. Volume confirmation: current volume > volume_ma * 1.1 (institutional
+       participation vs. thin expiry-morning tape).
+
+    Deliberately NO VIX_HIGH gate — expiry day is structurally high-vol.
+    Deliberately NO sentiment override — the EMA/RSI/ATR combo already
+    encodes direction.
+    """
+
+    def __init__(self, kite, config):
+        super().__init__(kite, config)
+        self.name = "Expiry_Momentum_Scalp"
+        self.is_reversal_trade = False
+
+    def generate_signals(self, day_df, sentiment, index=None, **kwargs):
+        if index is None:
+            index = len(day_df) - 1
+
+        # Need at least 25 bars for a reliable EMA-21 + ATR + volume MA.
+        if len(day_df) < 25 or index < 24:
+            self._log_hold("need at least 25 bars of history")
+            return 'HOLD'
+
+        # ── Gate 1: expiry day only ──────────────────────────────────────────
+        is_expiry = kwargs.get("is_expiry_day", False) or self._bar_weekday(day_df, index) == 3
+        if not is_expiry:
+            self._log_hold("not expiry day (run only on weekly expiry / Thursday)")
+            return 'HOLD'
+
+        # ── Gate 2: trading window 09:45 – 12:30 ────────────────────────────
+        t = self._bar_time(day_df, index)
+        if not (datetime.time(9, 45) <= t < datetime.time(12, 30)):
+            self._log_hold(
+                f"outside expiry scalp window (09:45–12:30). "
+                f"current={t.strftime('%H:%M')}"
+            )
+            return 'HOLD'
+
+        # ── Compute EMAs if missing ──────────────────────────────────────────
+        if 'ema_9' not in day_df.columns:
+            day_df['ema_9'] = calculate_ema(day_df['close'], 9)
+        if 'ema_21' not in day_df.columns:
+            day_df['ema_21'] = calculate_ema(day_df['close'], 21)
+
+        # ── Gate 3: fresh EMA-9/21 cross within last 3 bars ─────────────────
+        # Look back up to 3 completed bars before 'index' for a cross.
+        cross_bull = False
+        cross_bear = False
+        lookback = min(3, index)
+        for k in range(1, lookback + 1):
+            prev_e9 = day_df['ema_9'].iloc[index - k]
+            prev_e21 = day_df['ema_21'].iloc[index - k]
+            cur_e9  = day_df['ema_9'].iloc[index - k + 1]
+            cur_e21 = day_df['ema_21'].iloc[index - k + 1]
+            if pd.isna(prev_e9) or pd.isna(prev_e21) or pd.isna(cur_e9) or pd.isna(cur_e21):
+                continue
+            if prev_e9 <= prev_e21 and cur_e9 > cur_e21:
+                cross_bull = True
+                break
+            if prev_e9 >= prev_e21 and cur_e9 < cur_e21:
+                cross_bear = True
+                break
+
+        if not cross_bull and not cross_bear:
+            self._log_hold("no fresh EMA-9/21 cross in the last 3 bars")
+            return 'HOLD'
+
+        # ── Gate 4: RSI confirmation ─────────────────────────────────────────
+        cur_rsi = day_df['rsi'].iloc[index] if 'rsi' in day_df.columns else float('nan')
+        if pd.isna(cur_rsi):
+            self._log_hold("RSI unavailable")
+            return 'HOLD'
+        if cross_bull and cur_rsi < 55:
+            self._log_hold(
+                f"bullish cross but RSI={cur_rsi:.1f} < 55 — momentum not confirmed"
+            )
+            return 'HOLD'
+        if cross_bear and cur_rsi > 45:
+            self._log_hold(
+                f"bearish cross but RSI={cur_rsi:.1f} > 45 — momentum not confirmed"
+            )
+            return 'HOLD'
+
+        # ── Gate 5: ATR expansion ────────────────────────────────────────────
+        if 'atr' in day_df.columns and index >= 1:
+            cur_atr  = day_df['atr'].iloc[index]
+            prev_atr = day_df['atr'].iloc[index - 1]
+            if pd.notna(cur_atr) and pd.notna(prev_atr) and prev_atr > 0:
+                if float(cur_atr) < float(prev_atr) * 1.05:
+                    self._log_hold(
+                        f"ATR not expanding: cur={float(cur_atr):.2f} "
+                        f"< prev={float(prev_atr):.2f} * 1.05"
+                    )
+                    return 'HOLD'
+
+        # ── Gate 6: volume confirmation ──────────────────────────────────────
+        if 'volume' in day_df.columns and 'volume_ma' in day_df.columns:
+            cur_vol    = day_df['volume'].iloc[index]
+            cur_vol_ma = day_df['volume_ma'].iloc[index]
+            if pd.notna(cur_vol) and pd.notna(cur_vol_ma) and cur_vol_ma > 0:
+                if float(cur_vol) < float(cur_vol_ma) * 1.1:
+                    self._log_hold(
+                        f"volume below threshold: {float(cur_vol):.0f} "
+                        f"< 1.1 × MA={float(cur_vol_ma):.0f}"
+                    )
+                    return 'HOLD'
+
+        # ── Signal ───────────────────────────────────────────────────────────
+        if cross_bull:
+            logging.info(
+                f"[{self.name}] BUY: EMA9 crossed above EMA21 (last 3 bars) "
+                f"RSI={cur_rsi:.1f} t={t.strftime('%H:%M')}"
+            )
+            return 'BUY'
+        logging.info(
+            f"[{self.name}] SELL: EMA9 crossed below EMA21 (last 3 bars) "
+            f"RSI={cur_rsi:.1f} t={t.strftime('%H:%M')}"
+        )
+        return 'SELL'
+
+    def get_status_message(self, day_df, sentiment, **kwargs):
+        if len(day_df) < 25:
+            return f"Awaiting signal for {self.name}: need at least 25 bars of history."
+        if 'ema_9' not in day_df.columns or 'ema_21' not in day_df.columns:
+            return f"Awaiting signal for {self.name}: EMAs not yet computed."
+        last = day_df.iloc[-1]
+        e9  = last.get('ema_9', float('nan'))
+        e21 = last.get('ema_21', float('nan'))
+        rsi = last.get('rsi', float('nan'))
+        if pd.isna(e9) or pd.isna(e21):
+            return f"Awaiting signal for {self.name}: EMA values NaN."
+        direction = "BUY (EMA9 > EMA21)" if e9 > e21 else "SELL (EMA9 < EMA21)"
+        return (
+            f"Expiry scalp watching for {direction}, "
+            f"EMA9={e9:.2f} EMA21={e21:.2f} RSI={rsi:.1f} "
+            f"— fresh cross + RSI/ATR/vol required."
+        )
+
+
 def get_strategy(name, kite, config):
     """Factory function to get a strategy instance by name."""
     strategies = {
@@ -1069,6 +1228,7 @@ def get_strategy(name, kite, config):
         "Reversal_Detector": Reversal_Detector_Strategy,
         "VWAP_Reversion": VWAP_Reversion_Strategy,
         "NR7_Compression": NR7_Compression_Breakout_Strategy,
+        "Expiry_Momentum_Scalp": ExpiryMomentumScalpStrategy,
     }
     strategy_class = strategies.get(name)
     if not strategy_class: raise ValueError(f"Strategy '{name}' not found.")

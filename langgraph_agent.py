@@ -179,8 +179,8 @@ def pick_strategy_deterministic(
         pick = _take("Opening_Range_Breakout", "Hard pin: RBI policy day")
         if pick: return pick
     if is_expiry_day:
-        pick = _take("RSI_Divergence",
-                     "Hard pin: weekly expiry day (mean-reversion bias on gamma whipsaw)")
+        pick = _take("Expiry_Momentum_Scalp",
+                     "Hard pin: weekly expiry day (EMA momentum scalp on gamma-driven move)")
         if pick: return pick
 
     # ----- Layer 2: open-gap override -----
@@ -307,6 +307,7 @@ class LangGraphAgent:
 12. **'Reversal_Detector'**: A specialized reversal strategy for overextended trends.
 13. **'VWAP_Reversion'**: HIGH-FREQUENCY intraday VWAP-reclaim play — fires multiple times per day in a trending session. Best on directional days with normal-to-low vol.
 14. **'NR7_Compression'**: Compression-then-expansion breakout — looks for the narrowest range bar of the last 7 and buys/sells the breakout on volume. Best on low-volatility, low-IV days.
+15. **'Expiry_Momentum_Scalp'**: Weekly-expiry gamma scalp — EMA-9/21 fresh cross + RSI + ATR expansion + volume. ONLY runs on weekly expiry day (Thursday), 09:45–12:30.
 """
         )
         prompt_sections.append("\nBased on all the above information, which single strategy name from the list has the highest probability of success today? Return only the name.")
@@ -329,7 +330,7 @@ class LangGraphAgent:
                 "Volume_Spread_Analysis", "EMA_Cross_RSI", "Momentum_VWAP_RSI",
                 "Breakout_Prev_Day_HL", "Opening_Range_Breakout", "BB_Squeeze_Breakout",
                 "MA_Crossover", "RSI_Divergence", "Reversal_Detector",
-                "VWAP_Reversion", "NR7_Compression",
+                "VWAP_Reversion", "NR7_Compression", "Expiry_Momentum_Scalp",
             ]
             if recommended_strategy not in valid_strategies:
                 logging.warning(
