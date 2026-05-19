@@ -1808,6 +1808,29 @@ class TradingBotOrchestrator:
 
                 elif self.bot_state == "IN_POSITION":
                     underlying_df_hist = await self._get_underlying_bars()
+
+                    # 6B — Re-attach SL-M if broker rejected it (at attach time
+                    # or mid-session). Re-attempt once per loop tick; the retry
+                    # loop inside attach_broker_stop_loss caps total attempts.
+                    active = self.position_agent.active_trade or {}
+                    _slm_absent = active.get("_slm_absent", False)
+                    if not is_paper and _slm_absent:
+                        logging.info(
+                            "[SLM-Reattach] _slm_absent=True — attempting SL-M re-attachment."
+                        )
+                        new_sl_id = await self.position_agent.attach_broker_stop_loss(
+                            self.order_agent
+                        )
+                        if new_sl_id:
+                            logging.info(
+                                f"[SLM-Reattach] SL-M successfully re-attached: "
+                                f"order_id={new_sl_id}"
+                            )
+                            # Clear the flag so we stop polling aggressively.
+                            if self.position_agent.active_trade:
+                                self.position_agent.active_trade["_slm_absent"] = False
+                                self.position_agent._save_state()
+
                     status = await self.position_agent.manage(
                         is_paper,
                         underlying_hist_df=underlying_df_hist,
@@ -1824,7 +1847,15 @@ class TradingBotOrchestrator:
                         self.bot_state = "AWAITING_SIGNAL"
                         self.awaiting_signal_since = datetime.datetime.now()
 
-                await self._aligned_sleep()
+                # 6B — When broker SL-M is absent, poll every ~2s so the
+                # software stop reacts quickly to a fast adverse move.
+                _active_now = self.position_agent.active_trade or {}
+                _poll_fast = (
+                    self.bot_state == "IN_POSITION"
+                    and not is_paper
+                    and _active_now.get("_slm_absent", False)
+                )
+                await self._aligned_sleep(max_seconds=2.0 if _poll_fast else 30.0)
             except exceptions.TokenException as e:
                 logging.error(f"Zerodha session expired or invalidated: {e}. Halting bot.")
                 try:

@@ -267,6 +267,26 @@ async def _place_entry_with_retry(
             _cancel_order_sync, api_key, access_token, variety, order_id
         )
 
+        # 6C — Partial-fill guard: after a cancel the exchange may have
+        # partially filled the order before cancellation was processed.
+        # If so, stop the retry loop immediately to avoid oversizing.
+        post_history = await asyncio.to_thread(
+            _order_history_sync, api_key, access_token, order_id
+        )
+        partial_qty = 0
+        partial_avg = 0.0
+        if post_history:
+            last_record = post_history[-1]
+            partial_qty = int(last_record.get("filled_quantity") or 0)
+            partial_avg = float(last_record.get("average_price") or 0.0)
+        if partial_qty > 0:
+            logging.warning(
+                f"[FillRetry] Partial fill detected after cancel: "
+                f"qty={partial_qty} avg={partial_avg:.2f}. "
+                f"Stopping retry to avoid oversizing."
+            )
+            return "PARTIAL", partial_avg, partial_qty, order_id
+
     # All LIMIT attempts failed — last resort: MARKET.
     logging.warning(
         f"[FillRetry] All {total_tries} LIMIT attempts exhausted for "
@@ -540,6 +560,37 @@ class OrderExecutionAgent:
 
         return short_symbol, float(short_ltp)
 
+    # ---------- duplicate-entry guard (6A) ----------
+
+    async def _has_open_position(self, symbol: str) -> bool:
+        """
+        Returns True if the broker reports a non-zero net quantity for `symbol`.
+        Called before every entry to prevent double positions caused by:
+          • bot restart while a position is open but reconcile_open_position
+            missed the file (e.g. state dir was wiped), OR
+          • a stale reconcile that failed silently.
+
+        Non-fatal on API failure: returns False and allows entry, so a transient
+        network glitch never silently blocks a valid trade.
+        """
+        try:
+            positions = await asyncio.to_thread(self.kite.positions)
+            net = positions.get("net", []) if isinstance(positions, dict) else []
+            for p in net:
+                if p.get("tradingsymbol") == symbol and int(p.get("quantity") or 0) != 0:
+                    logging.warning(
+                        f"[DupGuard] Open position already exists for {symbol} "
+                        f"(qty={p.get('quantity')}). Skipping new entry."
+                    )
+                    return True
+            return False
+        except Exception as e:
+            logging.warning(
+                f"[DupGuard] Could not check positions for {symbol}: {e}. "
+                f"Allowing entry (non-fatal)."
+            )
+            return False
+
     # ---------- entry ----------
 
     async def place_trade(self, direction, force_mode: bool = False):
@@ -558,6 +609,10 @@ class OrderExecutionAgent:
         """
         symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
         if not symbol or not qty:
+            return None
+
+        # 6A — Duplicate-entry guard: abort if broker already shows an open position.
+        if await self._has_open_position(symbol):
             return None
 
         ltp = safe_ltp(self.kite, f"NFO:{symbol}")
@@ -1236,14 +1291,66 @@ class PositionManagementAgent:
 
         sl_price = self.active_trade["initial_stop_loss"]
         tick = float(self.active_trade.get("tick_size", 0.05))
-        order_id = await order_agent.place_stop_loss(
-            self.active_trade["symbol"], self.active_trade["quantity"], sl_price, tick
-        )
-        self.active_trade["sl_order_id"] = order_id
-        if order_id:
-            logging.info(f"SL-M attached order_id={order_id} trigger={sl_price:.2f}")
+        symbol = self.active_trade["symbol"]
+        qty    = self.active_trade["quantity"]
+
+        # 6B — Retry loop: up to 3 attempts. On each REJECTED response we
+        # tighten the trigger by 0.5 % so the next attempt is further away
+        # from the current market price and less likely to be rejected as
+        # "trigger too close to LTP" by Kite.
+        _SLM_MAX_ATTEMPTS  = 3
+        _SLM_TIGHTEN_PCT   = 0.005        # tighten trigger by 0.5% per retry
+        _SLM_STATUS_WAIT_S = 1.0          # seconds to wait before status check
+
+        order_id   = None
+        used_trigger = sl_price
+
+        for attempt in range(_SLM_MAX_ATTEMPTS):
+            order_id = await order_agent.place_stop_loss(symbol, qty, used_trigger, tick)
+            if not order_id:
+                logging.warning(
+                    f"[SLM-Retry] attempt {attempt + 1}/{_SLM_MAX_ATTEMPTS}: "
+                    f"place_stop_loss returned None."
+                )
+                used_trigger = tick_round(used_trigger * (1.0 - _SLM_TIGHTEN_PCT), tick)
+                continue
+
+            # Give the exchange a moment to process before checking status.
+            await asyncio.sleep(_SLM_STATUS_WAIT_S)
+            sl_status = await _order_status(self.api_key, self.access_token, order_id)
+            if sl_status not in ("REJECTED",):
+                # TRIGGER PENDING or any non-rejected status → accepted.
+                logging.info(
+                    f"[SLM-Retry] SL-M accepted on attempt {attempt + 1}: "
+                    f"order_id={order_id} trigger={used_trigger:.2f} status={sl_status}"
+                )
+                break
+            # Rejected — tighten trigger and loop.
+            logging.warning(
+                f"[SLM-Retry] attempt {attempt + 1}/{_SLM_MAX_ATTEMPTS}: "
+                f"SL-M REJECTED (trigger={used_trigger:.2f}). "
+                f"Tightening by {_SLM_TIGHTEN_PCT * 100:.1f}% and retrying."
+            )
+            order_id = None
+            used_trigger = tick_round(used_trigger * (1.0 - _SLM_TIGHTEN_PCT), tick)
         else:
-            logging.error("Failed to attach broker SL-M; software SL is the only protection.")
+            # Loop exhausted without a successful placement.
+            order_id = None
+
+        self.active_trade["sl_order_id"] = order_id
+        # _slm_absent flag: the IN_POSITION loop watches this to re-attach and
+        # to tighten the software-SL poll interval.
+        self.active_trade["_slm_absent"] = (order_id is None)
+
+        if order_id:
+            logging.info(
+                f"SL-M attached order_id={order_id} trigger={used_trigger:.2f}"
+            )
+        else:
+            logging.error(
+                f"[SLM-Retry] All {_SLM_MAX_ATTEMPTS} SL-M attempts failed for "
+                f"{symbol}. Software SL is the only protection; polling faster."
+            )
         self._save_state()
         return order_id
 
@@ -1265,8 +1372,13 @@ class PositionManagementAgent:
                     sl_id, underlying_hist_df, sentiment_agent, gemini_api_key
                 )
             if status == "REJECTED":
-                logging.error(f"Broker SL-M for {symbol} REJECTED. Falling back to software SL.")
+                logging.error(
+                    f"Broker SL-M for {symbol} REJECTED mid-session. "
+                    f"Setting _slm_absent=True so the IN_POSITION loop can "
+                    f"re-attach and poll faster."
+                )
                 self.active_trade["sl_order_id"] = None
+                self.active_trade["_slm_absent"] = True
                 self._save_state()
 
         # 2. Pull current premium for trailing/software-SL/indicator checks.
