@@ -380,11 +380,86 @@ class OrderExecutionAgent:
         price = ltp * (1.0 + slip) if side == "BUY" else ltp * (1.0 - slip)
         return tick_round(price, tick_size)
 
+    # ---------- debit spread helpers ----------
+
+    def _spread_enabled(self) -> bool:
+        return bool((self.config.get("debit_spread") or {}).get("enable", False))
+
+    def _select_spread_short_leg(
+        self,
+        long_symbol: str,
+        direction: str,
+        expiry_date,
+    ) -> tuple:
+        """
+        Given the long-leg symbol, return (short_symbol, short_ltp) for a
+        debit-spread entry, or (None, None) if the leg is unavailable.
+
+        For a call debit spread (BUY CE): short leg is OTM — strike is HIGHER.
+        For a put debit spread (SELL PE):  short leg is OTM — strike is LOWER.
+
+        Reads config.debit_spread.spread_width_steps (default 2) to determine
+        how many strike steps OTM the short leg is.
+        """
+        cfg = (self.config.get("debit_spread") or {})
+        width_steps = int(cfg.get("spread_width_steps", 2))
+        step = self._strike_step()
+
+        # Look up the long leg to get its strike and option type.
+        row = self.nfo_instruments[self.nfo_instruments["tradingsymbol"] == long_symbol]
+        if row.empty:
+            logging.warning(f"[Spread] Long leg {long_symbol} not found in instruments.")
+            return None, None
+
+        long_strike    = float(row.iloc[0]["strike"])
+        option_type    = str(row.iloc[0]["instrument_type"])   # CE or PE
+
+        # BUY CE spread → short CE is further OTM (higher strike).
+        # SELL PE spread → short PE is further OTM (lower strike).
+        if option_type == "CE":
+            short_strike = long_strike + width_steps * step
+        else:
+            short_strike = long_strike - width_steps * step
+
+        short_leg = self.nfo_instruments[
+            (self.nfo_instruments["strike"]           == short_strike)
+            & (self.nfo_instruments["instrument_type"] == option_type)
+            & (self.nfo_instruments["expiry_date"]     == expiry_date)
+        ]
+        if short_leg.empty:
+            logging.warning(
+                f"[Spread] Short leg {option_type} strike={short_strike:.0f} "
+                f"expiry={expiry_date} not found — falling back to naked entry."
+            )
+            return None, None
+
+        short_symbol = short_leg.iloc[0]["tradingsymbol"]
+        short_ltp    = safe_ltp(self.kite, f"NFO:{short_symbol}")
+        if short_ltp is None or short_ltp <= 0:
+            logging.warning(
+                f"[Spread] LTP unavailable for short leg {short_symbol} "
+                f"— falling back to naked entry."
+            )
+            return None, None
+
+        return short_symbol, float(short_ltp)
+
     # ---------- entry ----------
 
     async def place_trade(self, direction, force_mode: bool = False):
-        """Places a LIMIT entry, waits for fill, returns trade dict (no SL-M attached here).
-        `force_mode=True` propagates to chain analysis so IVR / IV-RV gates are bypassed."""
+        """
+        Places a LIMIT entry and returns a trade dict.
+
+        If config.debit_spread.enable is True, attempts a 1x1 debit spread:
+          BUY direction → buy ATM/ITM CE (long leg) + sell OTM CE (short leg).
+          SELL direction → buy ATM/ITM PE + sell OTM PE.
+
+        entry_price in the returned dict is the NET DEBIT (long fill − short fill),
+        so all downstream P&L math (exit − entry) × qty remains unchanged.
+
+        Falls back to a naked long option if the short leg is unavailable.
+        `force_mode=True` propagates to chain analysis so IVR / IV-RV gates are bypassed.
+        """
         symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
         if not symbol or not qty:
             return None
@@ -394,50 +469,124 @@ class OrderExecutionAgent:
             logging.error(f"Could not fetch LTP for entry pricing on {symbol}.")
             return None
 
-        tick = self._tick_size_for(symbol)
-        limit_price = self._limit_price(ltp, "BUY", tick)
-        order_params = {
-            "variety": self.flags["order_variety"],
-            "exchange": self.kite.EXCHANGE_NFO,
-            "tradingsymbol": symbol,
+        tick       = self._tick_size_for(symbol)
+        api_key    = self.config["zerodha"]["api_key"]
+        access_tok = self.config["zerodha"]["access_token"]
+        timeout    = int(self.flags.get("order_fill_timeout_seconds", 30))
+
+        # ── Long leg (always placed) ──────────────────────────────────────────
+        long_limit  = self._limit_price(ltp, "BUY", tick)
+        long_params = {
+            "variety":          self.flags["order_variety"],
+            "exchange":         self.kite.EXCHANGE_NFO,
+            "tradingsymbol":    symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_BUY,
-            "quantity": qty,
-            "product": self.flags["product_type"],
-            "order_type": self.kite.ORDER_TYPE_LIMIT,
-            "price": limit_price,
+            "quantity":         qty,
+            "product":          self.flags["product_type"],
+            "order_type":       self.kite.ORDER_TYPE_LIMIT,
+            "price":            long_limit,
         }
-        logging.info(f"ASYNC: placing LIMIT entry {order_params}")
-
-        api_key = self.config["zerodha"]["api_key"]
-        access_token = self.config["zerodha"]["access_token"]
-
-        order_id = await asyncio.to_thread(_execute_order_sync, api_key, access_token, order_params)
-        if not order_id:
+        logging.info(f"ASYNC: placing LIMIT long-leg entry {long_params}")
+        long_id = await asyncio.to_thread(
+            _execute_order_sync, api_key, access_tok, long_params
+        )
+        if not long_id:
             return None
 
-        timeout = int(self.flags.get("order_fill_timeout_seconds", 30))
-        status, avg_price, filled_qty = await _wait_for_fill(
-            api_key, access_token, order_id, timeout
+        long_status, long_fill, long_filled_qty = await _wait_for_fill(
+            api_key, access_tok, long_id, timeout
         )
-        if status != "COMPLETE" or avg_price <= 0:
+        if long_status != "COMPLETE" or long_fill <= 0:
             logging.error(
-                f"Entry order did not fill cleanly. status={status} avg={avg_price} filled={filled_qty}"
+                f"Long-leg entry did not fill: status={long_status} fill={long_fill}. Aborting."
             )
             await asyncio.to_thread(
-                _cancel_order_sync, api_key, access_token, self.flags["order_variety"], order_id
+                _cancel_order_sync, api_key, access_tok, self.flags["order_variety"], long_id
             )
             return None
 
-        return {
-            "order_id": order_id,
-            "symbol": symbol,
-            "quantity": filled_qty or qty,
-            "lot_size": lot_size,
-            "tick_size": tick,
-            "entry_price": avg_price,
-            "type": direction,
-            "entry_time": datetime.datetime.now().isoformat(),
+        # ── Short leg (debit spread, optional) ───────────────────────────────
+        short_symbol = short_fill = short_id = None
+        if self._spread_enabled():
+            # Derive expiry from the long-leg instrument record.
+            long_row = self.nfo_instruments[
+                self.nfo_instruments["tradingsymbol"] == symbol
+            ]
+            expiry_date = long_row.iloc[0]["expiry_date"] if not long_row.empty else None
+            if expiry_date is not None:
+                short_symbol, short_ltp = self._select_spread_short_leg(
+                    symbol, direction, expiry_date
+                )
+                if short_symbol and short_ltp:
+                    short_tick  = self._tick_size_for(short_symbol)
+                    short_limit = self._limit_price(short_ltp, "SELL", short_tick)
+                    short_params = {
+                        "variety":          self.flags["order_variety"],
+                        "exchange":         self.kite.EXCHANGE_NFO,
+                        "tradingsymbol":    short_symbol,
+                        "transaction_type": self.kite.TRANSACTION_TYPE_SELL,
+                        "quantity":         qty,
+                        "product":          self.flags["product_type"],
+                        "order_type":       self.kite.ORDER_TYPE_LIMIT,
+                        "price":            short_limit,
+                    }
+                    logging.info(
+                        f"[Spread] Placing LIMIT short-leg {short_params}"
+                    )
+                    short_id = await asyncio.to_thread(
+                        _execute_order_sync, api_key, access_tok, short_params
+                    )
+                    if short_id:
+                        s_status, s_fill, _ = await _wait_for_fill(
+                            api_key, access_tok, short_id, timeout
+                        )
+                        if s_status == "COMPLETE" and s_fill > 0:
+                            short_fill = s_fill
+                            logging.info(
+                                f"[Spread] Short leg filled: {short_symbol} @ {short_fill:.2f}"
+                            )
+                        else:
+                            logging.warning(
+                                f"[Spread] Short leg did not fill cleanly "
+                                f"(status={s_status}); running as naked long."
+                            )
+                            await asyncio.to_thread(
+                                _cancel_order_sync, api_key, access_tok,
+                                self.flags["order_variety"], short_id,
+                            )
+                            short_symbol = short_fill = short_id = None
+
+        # entry_price = net debit for a spread, or just the long fill for naked.
+        entry_price = (
+            long_fill - short_fill
+            if (short_fill is not None and short_fill > 0)
+            else long_fill
+        )
+        is_spread = short_symbol is not None and short_fill is not None
+
+        trade_dict: dict = {
+            "order_id":    long_id,
+            "symbol":      symbol,
+            "quantity":    long_filled_qty or qty,
+            "lot_size":    lot_size,
+            "tick_size":   tick,
+            "entry_price": entry_price,
+            "type":        direction,
+            "entry_time":  datetime.datetime.now().isoformat(),
+            "is_spread":   is_spread,
         }
+        if is_spread:
+            trade_dict.update({
+                "spread_short_symbol":      short_symbol,
+                "spread_short_entry_price": short_fill,
+                "spread_short_order_id":    short_id,
+            })
+            logging.info(
+                f"[Spread] Debit spread entered — long={symbol} @ {long_fill:.2f}, "
+                f"short={short_symbol} @ {short_fill:.2f}, "
+                f"net_debit={entry_price:.2f}"
+            )
+        return trade_dict
 
     async def find_existing_sl_order(self, symbol: str) -> Optional[str]:
         """
@@ -485,17 +634,42 @@ class OrderExecutionAgent:
         if ltp is None:
             logging.error(f"Paper: failed to get LTP for {symbol}.")
             return None
-        logging.info(f"[Paper] {direction} {symbol} qty={qty} @ {ltp}")
-        return {
-            "order_id": f"PAPER_{int(datetime.datetime.now().timestamp())}",
-            "symbol": symbol,
-            "quantity": qty,
-            "lot_size": lot_size,
-            "tick_size": self._tick_size_for(symbol),
-            "entry_price": ltp,
-            "type": direction,
-            "entry_time": datetime.datetime.now().isoformat(),
+
+        # Debit spread paper trade.
+        short_symbol = short_ltp = None
+        if self._spread_enabled():
+            long_row = self.nfo_instruments[self.nfo_instruments["tradingsymbol"] == symbol]
+            expiry_date = long_row.iloc[0]["expiry_date"] if not long_row.empty else None
+            if expiry_date is not None:
+                short_symbol, short_ltp = self._select_spread_short_leg(
+                    symbol, direction, expiry_date
+                )
+
+        is_spread   = short_symbol is not None and short_ltp is not None
+        entry_price = (ltp - short_ltp) if is_spread else ltp
+        logging.info(
+            f"[Paper] {direction} {symbol} qty={qty} @ {ltp:.2f}"
+            + (f" | spread short={short_symbol} @ {short_ltp:.2f} net_debit={entry_price:.2f}"
+               if is_spread else "")
+        )
+        trade_dict = {
+            "order_id":    f"PAPER_{int(datetime.datetime.now().timestamp())}",
+            "symbol":      symbol,
+            "quantity":    qty,
+            "lot_size":    lot_size,
+            "tick_size":   self._tick_size_for(symbol),
+            "entry_price": entry_price,
+            "type":        direction,
+            "entry_time":  datetime.datetime.now().isoformat(),
+            "is_spread":   is_spread,
         }
+        if is_spread:
+            trade_dict.update({
+                "spread_short_symbol":      short_symbol,
+                "spread_short_entry_price": short_ltp,
+                "spread_short_order_id":    f"PAPER_SHORT_{int(datetime.datetime.now().timestamp())}",
+            })
+        return trade_dict
 
     # ---------- sizing ----------
 
@@ -911,7 +1085,12 @@ class PositionManagementAgent:
         )
         if match:
             self.active_trade = saved
-            logging.info(f"RECONCILE: resumed open position {symbol} qty={match.get('quantity')}")
+            # For spreads, log that we've resumed and note the short leg as well.
+            short_sym = saved.get("spread_short_symbol")
+            logging.info(
+                f"RECONCILE: resumed open position {symbol} qty={match.get('quantity')}"
+                + (f" [spread short={short_sym}]" if short_sym else "")
+            )
             return True
         logging.info(f"RECONCILE: persisted trade {symbol} not in open positions; clearing state.")
         self._clear_state()
@@ -936,9 +1115,27 @@ class PositionManagementAgent:
         self._save_state()
 
     async def attach_broker_stop_loss(self, order_agent: OrderExecutionAgent):
-        """Place a broker-side SL-M for the active trade. Idempotent: re-uses an existing SL-M."""
+        """
+        Place a broker-side SL-M for the active trade. Idempotent: re-uses an existing SL-M.
+
+        For debit spreads the short leg already hard-caps the maximum loss to the net
+        debit paid, so a separate SL-M on the long leg would race the spread logic and
+        leave an orphaned short position. We therefore skip the broker SL-M for spreads
+        and rely solely on the software trailing-stop and indicator exits.
+        """
         if not self.active_trade:
             return None
+
+        if self.active_trade.get("is_spread"):
+            logging.info(
+                "[Spread] Skipping broker SL-M — short leg already caps max loss to "
+                f"net_debit={self.active_trade['entry_price']:.2f}. "
+                "Software SL and indicator exits are active."
+            )
+            self.active_trade["sl_order_id"] = None
+            self._save_state()
+            return None
+
         sl_price = self.active_trade["initial_stop_loss"]
         tick = float(self.active_trade.get("tick_size", 0.05))
         order_id = await order_agent.place_stop_loss(
@@ -975,10 +1172,18 @@ class PositionManagementAgent:
                 self._save_state()
 
         # 2. Pull current premium for trailing/software-SL/indicator checks.
+        #    For a debit spread, current_price = long LTP − short LTP (net spread value).
         current_price = safe_ltp(self.kite, f"NFO:{symbol}")
         if current_price is None:
             logging.warning(f"Could not fetch LTP for {symbol}; staying ACTIVE.")
             return "ACTIVE"
+
+        if self.active_trade.get("is_spread"):
+            short_sym   = self.active_trade.get("spread_short_symbol")
+            short_price = safe_ltp(self.kite, f"NFO:{short_sym}") if short_sym else None
+            if short_price is not None:
+                current_price = max(0.0, float(current_price) - float(short_price))
+            # If short LTP is unavailable, fall back to long LTP only (conservative).
 
         # 3. Update trailing stop and (if live) modify the SL-M trigger upward.
         new_trail = self._update_premium_trailing_stop(current_price)
@@ -1161,72 +1366,119 @@ class PositionManagementAgent:
             exit_order_id=sl_order_id, exit_reason="SL_M_TRIGGERED",
         )
 
+    async def _close_one_leg(
+        self,
+        symbol: str,
+        qty: int,
+        transaction_type,   # kite.TRANSACTION_TYPE_SELL / BUY
+        current_ltp: float,
+        timeout: int,
+        side_label: str = "",
+    ) -> tuple:
+        """
+        Place a LIMIT order to close one option leg; fall back to MARKET on
+        non-fill.  Returns (fill_price, order_id).
+        """
+        tick  = self._tick_size_for(symbol)
+        slip  = float(self.flags.get("limit_order_slippage_percent", 0.5)) / 100.0
+
+        is_sell = transaction_type == self.kite.TRANSACTION_TYPE_SELL
+        limit_price = tick_round(
+            current_ltp * (1 - slip) if is_sell else current_ltp * (1 + slip), tick
+        )
+        params = {
+            "variety":          self.flags["order_variety"],
+            "exchange":         self.kite.EXCHANGE_NFO,
+            "tradingsymbol":    symbol,
+            "transaction_type": transaction_type,
+            "quantity":         qty,
+            "product":          self.flags["product_type"],
+            "order_type":       self.kite.ORDER_TYPE_LIMIT,
+            "price":            limit_price,
+        }
+        logging.info(f"ASYNC: placing LIMIT exit{side_label} {params}")
+        order_id = await asyncio.to_thread(
+            _execute_order_sync, self.api_key, self.access_token, params
+        )
+        if not order_id:
+            return current_ltp, None
+
+        status, avg, _ = await _wait_for_fill(self.api_key, self.access_token, order_id, timeout)
+        if status == "COMPLETE" and avg > 0:
+            return float(avg), order_id
+
+        logging.warning(
+            f"Exit LIMIT{side_label} did not fill (status={status}); falling back to MARKET."
+        )
+        await asyncio.to_thread(
+            _cancel_order_sync, self.api_key, self.access_token,
+            self.flags["order_variety"], order_id,
+        )
+        mkt_params = dict(params)
+        mkt_params.pop("price", None)
+        mkt_params["order_type"] = self.kite.ORDER_TYPE_MARKET
+        mkt_id = await asyncio.to_thread(
+            _execute_order_sync, self.api_key, self.access_token, mkt_params
+        )
+        if mkt_id:
+            s2, avg2, _ = await _wait_for_fill(self.api_key, self.access_token, mkt_id, timeout)
+            if s2 == "COMPLETE" and avg2 > 0:
+                return float(avg2), mkt_id
+        return current_ltp, order_id  # best-effort fallback
+
     async def exit_trade(self, is_paper_trade=False, underlying_df=None,
                          sentiment_agent=None, gemini_api_key=None):
         if not self.active_trade:
             return None
-        trade = self.active_trade
-        symbol = trade["symbol"]
-
-        current_ltp = safe_ltp(self.kite, f"NFO:{symbol}")
-        if current_ltp is None:
-            current_ltp = trade.get("entry_price", 0)
-        exit_price = current_ltp
-        exit_order_id = None
+        trade      = self.active_trade
+        symbol     = trade["symbol"]
+        is_spread  = trade.get("is_spread", False)
+        qty        = trade["quantity"]
+        timeout    = int(self.flags.get("order_fill_timeout_seconds", 30))
         exit_reason = "PAPER" if is_paper_trade else "INDICATOR_OR_SOFTWARE_SL"
 
+        long_ltp = safe_ltp(self.kite, f"NFO:{symbol}") or trade.get("entry_price", 0)
+        exit_price = long_ltp
+        exit_order_id = None
+
         if not is_paper_trade:
+            # Cancel any existing SL-M on the long leg first.
             sl_id = trade.get("sl_order_id")
             if sl_id:
                 await asyncio.to_thread(
                     _cancel_order_sync, self.api_key, self.access_token,
                     self.flags["order_variety"], sl_id,
                 )
-            tick = float(trade.get("tick_size", 0.05))
-            slip = float(self.flags.get("limit_order_slippage_percent", 0.5)) / 100.0
-            limit_price = tick_round(current_ltp * (1 - slip), tick)
-            exit_params = {
-                "variety": self.flags["order_variety"],
-                "exchange": self.kite.EXCHANGE_NFO,
-                "tradingsymbol": symbol,
-                "transaction_type": self.kite.TRANSACTION_TYPE_SELL,
-                "quantity": trade["quantity"],
-                "product": self.flags["product_type"],
-                "order_type": self.kite.ORDER_TYPE_LIMIT,
-                "price": limit_price,
-            }
-            logging.info(f"ASYNC: placing LIMIT exit {exit_params}")
-            exit_order_id = await asyncio.to_thread(
-                _execute_order_sync, self.api_key, self.access_token, exit_params
+
+            # ── Close long leg (SELL) ─────────────────────────────────────────
+            long_exit, exit_order_id = await self._close_one_leg(
+                symbol, qty, self.kite.TRANSACTION_TYPE_SELL, long_ltp, timeout,
+                side_label=" (long leg)",
             )
-            if exit_order_id:
-                timeout = int(self.flags.get("order_fill_timeout_seconds", 30))
-                status, avg, _ = await _wait_for_fill(
-                    self.api_key, self.access_token, exit_order_id, timeout
-                )
-                if status == "COMPLETE" and avg > 0:
-                    exit_price = avg
-                else:
-                    logging.error(
-                        f"Exit LIMIT did not fill (status={status}); cancelling and falling back to MARKET."
+            exit_price = long_exit
+
+            # ── Close short leg if this is a spread (BUY back the short) ─────
+            if is_spread:
+                short_sym = trade.get("spread_short_symbol")
+                if short_sym:
+                    short_ltp  = safe_ltp(self.kite, f"NFO:{short_sym}") or 0.0
+                    short_exit, _ = await self._close_one_leg(
+                        short_sym, qty, self.kite.TRANSACTION_TYPE_BUY,
+                        float(short_ltp), timeout, side_label=" (short leg)",
                     )
-                    await asyncio.to_thread(
-                        _cancel_order_sync, self.api_key, self.access_token,
-                        self.flags["order_variety"], exit_order_id,
+                    # exit_price = net credit received = long_exit − short_exit
+                    exit_price = long_exit - short_exit
+                    logging.info(
+                        f"[Spread] Exit: long={long_exit:.2f} short_buyback={short_exit:.2f} "
+                        f"net_credit={exit_price:.2f}"
                     )
-                    market_params = dict(exit_params)
-                    market_params.pop("price", None)
-                    market_params["order_type"] = self.kite.ORDER_TYPE_MARKET
-                    fallback_id = await asyncio.to_thread(
-                        _execute_order_sync, self.api_key, self.access_token, market_params
-                    )
-                    if fallback_id:
-                        status2, avg2, _ = await _wait_for_fill(
-                            self.api_key, self.access_token, fallback_id, timeout
-                        )
-                        exit_order_id = fallback_id
-                        if status2 == "COMPLETE" and avg2 > 0:
-                            exit_price = avg2
+
+        elif is_paper_trade and is_spread:
+            # Paper spread: net credit = long_ltp − short_ltp
+            short_sym   = trade.get("spread_short_symbol")
+            short_price = safe_ltp(self.kite, f"NFO:{short_sym}") if short_sym else None
+            if short_price:
+                exit_price = max(0.0, long_ltp - float(short_price))
 
         return await self._book_completed_trade(
             exit_price, underlying_df, sentiment_agent, gemini_api_key,

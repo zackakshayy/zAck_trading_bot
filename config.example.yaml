@@ -237,6 +237,21 @@ option_filters:
 # Rationale: theta and gamma risks accelerate non-linearly in the final 2 DTE;
 # buying options that close reduces size without skipping the trade entirely.
 # Each factor multiplies risk_per_trade_percent (1.0 = no change).
+# Debit-spread entry. When enabled, the bot buys the long leg (ATM/ITM option
+# selected by the chain analysis or legacy path) AND sells an OTM option
+# `spread_width_steps` strike steps away on the same expiry — converting the
+# naked long into a 1×1 debit spread. The spread hard-caps the maximum loss to
+# the net debit paid, eliminating unlimited theta / IV blowup risk.
+#
+# entry_price is stored as net debit (long fill − short fill), so all
+# downstream P&L math (exit − entry) × qty remains unchanged.
+#
+# Disabled by default (enable: false) — naked-long behaviour is preserved.
+# Enable only after confirming your Kite account has multi-leg NFO permissions.
+debit_spread:
+  enable: false
+  spread_width_steps: 2   # short leg is this many strike steps OTM from the long leg
+                           # NIFTY step=50 → 2 steps = 100 pts OTM
 dte_sizing:
   factor_0: 0.50       # 0 DTE — expiry day: theta crush + binary gamma risk
   factor_1: 0.70       # 1 DTE — overnight gap risk compounds theta
