@@ -42,6 +42,22 @@ class BaseStrategy:
         if changed and (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
             logging.info(f"[{self.name}] HOLD: {reason}")
 
+    @staticmethod
+    def _bar_time(df, index) -> datetime.time:
+        """Return the time component of the bar at *index*."""
+        return df.index[index].time()
+
+    @staticmethod
+    def _bar_weekday(df, index) -> int:
+        """Return the ISO weekday (Mon=0 … Sun=6) of the bar at *index*."""
+        return df.index[index].weekday()
+
+    def _is_vix_high(self, kwargs: dict) -> bool:
+        return 'VIX_HIGH' in (kwargs.get('vix_conditions') or set())
+
+    def _is_vix_low(self, kwargs: dict) -> bool:
+        return 'VIX_LOW' in (kwargs.get('vix_conditions') or set())
+
 class Gemini_Default_Strategy(BaseStrategy):
     """The original Gemini strategy based on CPR, EMA, and RSI."""
     def __init__(self, kite, config):
@@ -117,7 +133,11 @@ class Supertrend_MACD_Strategy(BaseStrategy):
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
         if index < 1: return 'HOLD'
-        
+
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: Supertrend/MACD signals are noisy in high-volatility regime")
+            return 'HOLD'
+
         if 'supertrend_direction' not in day_df.columns:
             supertrend = ta.supertrend(day_df['high'], day_df['low'], day_df['close'])
             if supertrend is not None and not supertrend.empty:
@@ -163,6 +183,20 @@ class VolatilityClusterStrategy(BaseStrategy):
         if index is None: index = len(day_df) - 1
         if index < 20:
             self._log_hold(f"insufficient bars (index={index} < 20)")
+            return 'HOLD'
+
+        # Reversal plays need gap-and-go energy — skip when VIX is already high
+        # (market is already in crisis mode; reversals are treacherous).
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: reversal trades unreliable in high-vol regime")
+            return 'HOLD'
+
+        # Confine to the 09:30–10:30 morning volatility window.
+        t = self._bar_time(day_df, index)
+        if not (datetime.time(9, 30) <= t < datetime.time(10, 30)):
+            self._log_hold(
+                f"outside bounce window (09:30–10:30). current={t.strftime('%H:%M')}"
+            )
             return 'HOLD'
 
         if 'atr' not in day_df.columns:
@@ -282,6 +316,10 @@ class Momentum_VWAP_RSI_Strategy(BaseStrategy):
             self._log_hold("insufficient bars (index < 1)")
             return 'HOLD'
 
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: VWAP levels lose meaning in high-volatility regime")
+            return 'HOLD'
+
         current = day_df.iloc[index]
         close = current.get('close', float('nan'))
         vwap = current.get('vwap', float('nan'))
@@ -365,8 +403,19 @@ class Opening_Range_Breakout_Strategy(BaseStrategy):
         self.orb_high = None; self.orb_low = None; self.orb_period_set = False
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
+
+        # ORB is weakest near expiry when gamma dominates intraday moves.
+        # Skip Thursday and Friday (weekdays 3 and 4).
+        wd = self._bar_weekday(day_df, index)
+        if wd in (3, 4):
+            self._log_hold(
+                f"ORB disabled on Thu/Fri (expiry-day gamma noise). "
+                f"weekday={wd} ({'Thu' if wd == 3 else 'Fri'})"
+            )
+            return 'HOLD'
+
         orb_minutes = self.config['trading_flags'].get('orb_minutes', 30)
-        
+
         current_time = day_df.index[index].time()
         market_open_time = datetime.time(9, 15)
         orb_end_time = (datetime.datetime.combine(datetime.date.today(), market_open_time) + datetime.timedelta(minutes=orb_minutes)).time()
@@ -432,6 +481,11 @@ class Bollinger_Band_Squeeze_Strategy(BaseStrategy):
             self._log_hold("insufficient bars (index < 1)")
             return 'HOLD'
 
+        # High VIX already shows expanded ranges — the squeeze premise is invalid.
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: BB squeeze is unreliable when market is already volatile")
+            return 'HOLD'
+
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
         bw, bw_ma = current.get('bb_bandwidth'), current.get('bb_bandwidth_ma')
         in_squeeze = bw is not None and bw_ma is not None and bw < bw_ma
@@ -475,62 +529,113 @@ class MA_Crossover_Strategy(BaseStrategy):
             self._log_hold("insufficient bars (index < 1)")
             return 'HOLD'
 
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: short-MA crosses whipsaw in high-volatility regime")
+            return 'HOLD'
+
+        if 'ema_50' not in day_df.columns:
+            day_df['ema_50'] = calculate_ema(day_df['close'], 50)
+
         current, last = day_df.iloc[index], day_df.iloc[index - 1]
+        close = current.get('close', float('nan'))
+        ema_50 = current.get('ema_50', float('nan'))
+
         if sentiment in ['Bullish', 'Very Bullish']:
-            crossed_up = last['ema_9'] <= last['ema_21'] and current['ema_9'] > current['ema_21']
-            if crossed_up:
+            if close < ema_50:
+                self._log_hold(
+                    f"EMA50 alignment failed for BUY: close={close:.2f} < ema_50={ema_50:.2f}"
+                )
+                return 'HOLD'
+            if last['ema_9'] <= last['ema_21'] and current['ema_9'] > current['ema_21']:
                 return 'BUY'
             self._log_hold(
                 f"no bullish EMA-9/21 crossover. "
                 f"prev: ema9={last['ema_9']:.2f} vs ema21={last['ema_21']:.2f}, "
                 f"curr: ema9={current['ema_9']:.2f} vs ema21={current['ema_21']:.2f}"
             )
-        elif sentiment in ['Bearish', 'Very Bearish']:
-            crossed_down = last['ema_9'] >= last['ema_21'] and current['ema_9'] < current['ema_21']
-            if crossed_down:
+            return 'HOLD'
+
+        if sentiment in ['Bearish', 'Very Bearish']:
+            if close > ema_50:
+                self._log_hold(
+                    f"EMA50 alignment failed for SELL: close={close:.2f} > ema_50={ema_50:.2f}"
+                )
+                return 'HOLD'
+            if last['ema_9'] >= last['ema_21'] and current['ema_9'] < current['ema_21']:
                 return 'SELL'
             self._log_hold(
                 f"no bearish EMA-9/21 crossover. "
                 f"prev: ema9={last['ema_9']:.2f} vs ema21={last['ema_21']:.2f}, "
                 f"curr: ema9={current['ema_9']:.2f} vs ema21={current['ema_21']:.2f}"
             )
-        else:
-            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
+            return 'HOLD'
+
+        self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
         if sentiment in ['Bullish', 'Very Bullish']:
-            return f"Awaiting BUY signal: Waiting for the 9-period EMA to cross above the 21-period EMA."
+            return f"Awaiting BUY signal: 9-EMA to cross above 21-EMA with close above 50-EMA."
         else:
-            return f"Awaiting SELL signal: Waiting for the 9-period EMA to cross below the 21-period EMA."
+            return f"Awaiting SELL signal: 9-EMA to cross below 21-EMA with close below 50-EMA."
 
 class RSI_Divergence_Strategy(BaseStrategy):
     def __init__(self, kite, config): super().__init__(kite, config); self.name = "RSI_Divergence"
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         if index is None: index = len(day_df) - 1
 
+        if index < 1:
+            self._log_hold("insufficient bars (index < 1)")
+            return 'HOLD'
+
+        # Divergences are only meaningful in the first ninety minutes of the
+        # session (price discovers direction; after that, divergences are noise).
+        t = self._bar_time(day_df, index)
+        if not (datetime.time(9, 30) <= t < datetime.time(11, 0)):
+            self._log_hold(
+                f"outside divergence window (09:30–11:00). current={t.strftime('%H:%M')}"
+            )
+            return 'HOLD'
+
+        cur_rsi = day_df['rsi'].iloc[index] if 'rsi' in day_df.columns else float('nan')
         divergence = check_rsi_divergence(day_df.iloc[:index + 1], day_df['rsi'].iloc[:index + 1])
-        if sentiment in ['Bullish', 'Very Bullish']:
-            if divergence == 'Bullish':
+
+        if sentiment in ['Bullish', 'Very Bullish'] and divergence == 'Bullish':
+            # Require RSI to be oversold (< 40) to confirm the divergence is
+            # meaningful rather than a mid-range wobble.
+            if cur_rsi < 40:
+                logging.info(f"[{self.name}] BUY: bullish divergence with RSI {cur_rsi:.1f} < 40.")
                 return 'BUY'
             self._log_hold(
-                f"need Bullish RSI divergence. got divergence={divergence!r}"
+                f"bullish divergence detected but RSI {cur_rsi:.1f} >= 40 "
+                f"(need RSI < 40 to confirm oversold divergence)"
             )
-        elif sentiment in ['Bearish', 'Very Bearish']:
-            if divergence == 'Bearish':
+            return 'HOLD'
+
+        if sentiment in ['Bearish', 'Very Bearish'] and divergence == 'Bearish':
+            # Require RSI to be overbought (> 60) to confirm meaningful divergence.
+            if cur_rsi > 60:
+                logging.info(f"[{self.name}] SELL: bearish divergence with RSI {cur_rsi:.1f} > 60.")
                 return 'SELL'
             self._log_hold(
-                f"need Bearish RSI divergence. got divergence={divergence!r}"
+                f"bearish divergence detected but RSI {cur_rsi:.1f} <= 60 "
+                f"(need RSI > 60 to confirm overbought divergence)"
             )
-        else:
-            self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
+            return 'HOLD'
+
+        self._log_hold(
+            f"divergence={divergence!r}, sentiment={sentiment!r}, rsi={cur_rsi:.1f}. "
+            f"Waiting for sentiment-matched divergence at RSI extreme."
+        )
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
         if sentiment in ['Bullish', 'Very Bullish']:
-            return f"Awaiting BUY signal: Waiting for price to make a new low while RSI makes a higher low (Bullish Divergence)."
+            return ("Awaiting BUY: bullish RSI divergence (new price low, higher RSI low) "
+                    "with RSI < 40 in the 09:30–11:00 window.")
         else:
-            return f"Awaiting SELL signal: Waiting for price to make a new high while RSI makes a lower high (Bearish Divergence)."
+            return ("Awaiting SELL: bearish RSI divergence (new price high, lower RSI high) "
+                    "with RSI > 60 in the 09:30–11:00 window.")
 
 class EMACrossRSIStrategy(BaseStrategy):
     def __init__(self, kite, config):
@@ -541,10 +646,12 @@ class EMACrossRSIStrategy(BaseStrategy):
         """
         Generates a signal if the EMAs are in a trending state and a crossover
         has occurred within a recent lookback period.
+        50-EMA used as a trend-alignment filter: only BUY above it, SELL below it.
+        VIX_HIGH suppressed — crosses are unreliable in high-vol regimes.
         """
         if index is None:
             index = len(day_df) - 1
-        
+
         # New configurable lookback period. Default to 5 candles if not set.
         lookback_period = self.config['trading_flags'].get('ema_cross_lookback', 5)
 
@@ -552,20 +659,33 @@ class EMACrossRSIStrategy(BaseStrategy):
             self._log_hold(f"insufficient bars (index={index} < lookback+1={lookback_period+1})")
             return 'HOLD'
 
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: EMA crosses produce false signals in high-vol regime")
+            return 'HOLD'
+
         # Ensure indicators are present
         if 'ema_9' not in day_df.columns: day_df['ema_9'] = calculate_ema(day_df['close'], 9)
         if 'ema_15' not in day_df.columns: day_df['ema_15'] = calculate_ema(day_df['close'], 15)
+        if 'ema_50' not in day_df.columns: day_df['ema_50'] = calculate_ema(day_df['close'], 50)
         if 'rsi' not in day_df.columns: day_df['rsi'] = calculate_rsi(day_df['close'], 14)
-        
+
         current_candle = day_df.iloc[index]
+        close   = current_candle.get('close', float('nan'))
+        ema_50  = current_candle.get('ema_50', float('nan'))
 
         # --- MODIFIED BULLISH (BUY) SIGNAL LOGIC ---
         # 1. Check current state: 9-EMA is above 15-EMA now.
         is_trending_up = current_candle['ema_9'] > current_candle['ema_15']
         # 2. Check confirmation conditions: RSI and price are favorable now.
         is_confirmed_up = current_candle['rsi'] > 50 and current_candle['close'] > current_candle['ema_9']
-        
+
         if is_trending_up and is_confirmed_up:
+            # 2b. 50-EMA alignment: only trade with the macro trend.
+            if close < ema_50:
+                self._log_hold(
+                    f"EMA50 alignment failed for BUY: close={close:.2f} < ema_50={ema_50:.2f}"
+                )
+                return 'HOLD'
             # 3. Verify a "Golden Cross" happened recently
             recent_golden_cross = False
             for i in range(index - lookback_period, index + 1):
@@ -592,6 +712,12 @@ class EMACrossRSIStrategy(BaseStrategy):
         is_confirmed_down = current_candle['rsi'] < 50 and current_candle['close'] < current_candle['ema_9']
 
         if is_trending_down and is_confirmed_down:
+            # 2b. 50-EMA alignment: only trade with the macro trend.
+            if close > ema_50:
+                self._log_hold(
+                    f"EMA50 alignment failed for SELL: close={close:.2f} > ema_50={ema_50:.2f}"
+                )
+                return 'HOLD'
             # 3. Verify a "Death Cross" happened recently
             recent_death_cross = False
             for i in range(index - lookback_period, index + 1):
@@ -600,7 +726,7 @@ class EMACrossRSIStrategy(BaseStrategy):
                 if prev_candle['ema_9'] > prev_candle['ema_15'] and signal_candle['ema_9'] < signal_candle['ema_15']:
                     recent_death_cross = True
                     break
-            
+
             if recent_death_cross:
                 logging.info(f"[{self.name}] SELL Signal: 9/15 EMA in bearish state post-crossover with RSI < 50.")
                 return 'SELL'
@@ -627,13 +753,18 @@ class EMACrossRSIStrategy(BaseStrategy):
         else:
             self._log_hold(f"sentiment {sentiment!r} is Neutral — no directional setup")
 
+        self._log_hold(
+            f"no qualifying cross in last {lookback_period} bars. "
+            f"trending_up={is_trending_up}, confirmed_up={is_confirmed_up}, "
+            f"trending_down={is_trending_down}, confirmed_down={is_confirmed_down}"
+        )
         return 'HOLD'
 
     def get_status_message(self, day_df, sentiment, **kwargs):
         if sentiment in ['Bullish', 'Very Bullish']:
-            return f"Awaiting BUY signal: Waiting for 9-EMA to cross above 15-EMA, with confirmation from RSI > 50."
+            return f"Awaiting BUY signal: 9/15 EMA golden cross (close above EMA50), RSI > 50."
         else:
-            return f"Awaiting SELL signal: Waiting for 9-EMA to cross below 15-EMA, with confirmation from RSI < 50."
+            return f"Awaiting SELL signal: 9/15 EMA death cross (close below EMA50), RSI < 50."
 
 
 class Reversal_Detector_Strategy(BaseStrategy):
@@ -665,6 +796,17 @@ class Reversal_Detector_Strategy(BaseStrategy):
         return "None"
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
+        if index is None: index = len(day_df) - 1
+
+        # Reversals require a mature intraday trend — too early and there is no
+        # established trend to reverse; too late and we lack time for the move.
+        t = self._bar_time(day_df, index)
+        if not (datetime.time(9, 30) <= t < datetime.time(11, 30)):
+            self._log_hold(
+                f"outside reversal window (09:30–11:30). current={t.strftime('%H:%M')}"
+            )
+            return 'HOLD'
+
         trend_status = is_trend_overextended(day_df)
         if trend_status == "None":
             self._log_hold("no overextended trend detected (need RSI>70+1.5% move up, or RSI<30+1.5% move down)")
@@ -731,6 +873,13 @@ class VWAP_Reversion_Strategy(BaseStrategy):
         if index < 2:
             self._log_hold("insufficient bars (index < 2)")
             return 'HOLD'
+
+        # In a high-VIX session price whips through VWAP many times; the
+        # "reclaim" pattern produces many false signals.
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: VWAP reclaim signals are noisy in high-vol regime")
+            return 'HOLD'
+
         if 'vwap' not in day_df.columns or 'rsi' not in day_df.columns:
             self._log_hold("vwap or rsi column missing from bars")
             return 'HOLD'
@@ -815,6 +964,13 @@ class NR7_Compression_Breakout_Strategy(BaseStrategy):
         if index < 8:
             self._log_hold("insufficient bars (need >= 8)")
             return 'HOLD'
+
+        # NR7 fires on compressed ranges — VIX_HIGH means ranges are already wide;
+        # the setup premise is invalid.
+        if self._is_vix_high(kwargs):
+            self._log_hold("VIX_HIGH: range compression is absent in high-vol regime")
+            return 'HOLD'
+
         if 'volume_ma' not in day_df.columns:
             self._log_hold("volume_ma column missing")
             return 'HOLD'
