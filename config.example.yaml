@@ -107,11 +107,22 @@ trading_flags:
   max_trades_per_day: 3
   max_vix_level: 25.0
   order_variety: regular
+  # Entry fill confirmation: if a LIMIT entry doesn't fill within
+  # order_fill_timeout_seconds / (max_fill_retries + 1) seconds, the order is
+  # cancelled and re-submitted at a wider price (slippage * fill_retry_slippage_mult).
+  # After max_fill_retries attempts, falls back to a MARKET order.
+  max_fill_retries: 2
+  fill_retry_slippage_mult: 2.0
   paper_trading: true
   product_type: MIS
   rag_min_trading_days: 1
   risk_per_trade_percent: 1.0
   run_startup_backtest: false
+  # Alignment note: backtest_years drives the date range only when
+  # run_startup_backtest is true. The bot will auto-align the window to
+  # max(rag.recency_window_days + 20, 60) calendar days so generated data
+  # actually falls inside the RAG recency window. Explicitly large values
+  # trigger a warning log.
   stop_loss_percent: 25.0
   strategy_reassessment_period_minutes: 15
   # If a strategy produces 0 non-HOLD signals during its window, it's put in

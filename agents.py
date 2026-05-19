@@ -195,6 +195,102 @@ async def _wait_for_fill(api_key: str, access_token: str, order_id: str,
     return last_status, 0.0, 0
 
 
+async def _place_entry_with_retry(
+    api_key: str,
+    access_token: str,
+    base_params: dict,
+    ltp_key: str,         # "NFO:NIFTY24000C" — passed back to safe_ltp on retry
+    kite,                 # live kite instance for LTP refresh
+    max_retries: int = 2,
+    base_slip_pct: float = 0.005,
+    slip_multiplier: float = 2.0,
+    timeout_per_attempt: int = 15,
+) -> tuple:
+    """
+    Places a LIMIT BUY entry with automatic price-widening on non-fill:
+
+      Attempt 1 : LIMIT at ltp * (1 + base_slip_pct)
+      Attempt 2 : refresh LTP, LIMIT at ltp * (1 + base_slip_pct * slip_multiplier)
+      …
+      Final     : MARKET order after all retries are exhausted.
+
+    Returns (status, avg_fill_price, filled_qty, order_id).
+    On all failures returns ("FAILED", 0.0, 0, None).
+
+    Rationale: widening before falling back to MARKET gives the exchange one
+    more chance to fill at a known price, reducing adverse selection vs a blind
+    MARKET order during thin tape (common on NIFTY options around signal time).
+    """
+    variety    = base_params.get("variety", "regular")
+    total_tries = max_retries + 1  # initial attempt + retries
+
+    for attempt in range(total_tries):
+        # Refresh LTP on every attempt so the widened price tracks reality.
+        current_ltp = safe_ltp(kite, ltp_key)
+        if current_ltp is None or current_ltp <= 0:
+            logging.warning(
+                f"[FillRetry] LTP unavailable for {ltp_key} on attempt {attempt + 1}."
+            )
+            break
+
+        slip = base_slip_pct * (slip_multiplier ** attempt)
+        params = dict(base_params)
+        params["price"] = tick_round(current_ltp * (1.0 + slip), 0.05)
+        params["order_type"] = "LIMIT"
+
+        logging.info(
+            f"[FillRetry] attempt {attempt + 1}/{total_tries}: "
+            f"LIMIT @ {params['price']:.2f}  (slip={slip * 100:.2f}%)"
+        )
+        order_id = await asyncio.to_thread(
+            _execute_order_sync, api_key, access_token, params
+        )
+        if not order_id:
+            continue
+
+        status, avg, qty = await _wait_for_fill(
+            api_key, access_token, order_id, timeout_per_attempt
+        )
+        if status == "COMPLETE" and avg > 0:
+            logging.info(
+                f"[FillRetry] Filled on attempt {attempt + 1}: "
+                f"avg={avg:.2f} qty={qty}"
+            )
+            return status, avg, qty, order_id
+
+        # Not filled — cancel before retrying.
+        logging.warning(
+            f"[FillRetry] attempt {attempt + 1} not filled "
+            f"(status={status}); cancelling."
+        )
+        await asyncio.to_thread(
+            _cancel_order_sync, api_key, access_token, variety, order_id
+        )
+
+    # All LIMIT attempts failed — last resort: MARKET.
+    logging.warning(
+        f"[FillRetry] All {total_tries} LIMIT attempts exhausted for "
+        f"{base_params.get('tradingsymbol')}; placing MARKET order."
+    )
+    mkt_ltp = safe_ltp(kite, ltp_key)
+    if mkt_ltp and mkt_ltp > 0:
+        mkt_params = dict(base_params)
+        mkt_params.pop("price", None)
+        mkt_params["order_type"] = "MARKET"
+        mkt_id = await asyncio.to_thread(
+            _execute_order_sync, api_key, access_token, mkt_params
+        )
+        if mkt_id:
+            s, avg, qty = await _wait_for_fill(
+                api_key, access_token, mkt_id, 30
+            )
+            if s == "COMPLETE" and avg > 0:
+                logging.info(f"[FillRetry] MARKET fallback filled: avg={avg:.2f}")
+                return s, avg, qty, mkt_id
+
+    return "FAILED", 0.0, 0, None
+
+
 async def _order_status(api_key, access_token, order_id) -> Optional[str]:
     history = await asyncio.to_thread(_order_history_sync, api_key, access_token, order_id)
     if not history:
@@ -472,36 +568,38 @@ class OrderExecutionAgent:
         tick       = self._tick_size_for(symbol)
         api_key    = self.config["zerodha"]["api_key"]
         access_tok = self.config["zerodha"]["access_token"]
-        timeout    = int(self.flags.get("order_fill_timeout_seconds", 30))
 
-        # ── Long leg (always placed) ──────────────────────────────────────────
-        long_limit  = self._limit_price(ltp, "BUY", tick)
-        long_params = {
+        # ── Long leg: place with automatic price-widening retries ─────────────
+        max_retries  = int(self.flags.get("max_fill_retries", 2))
+        slip_mult    = float(self.flags.get("fill_retry_slippage_mult", 2.0))
+        base_slip    = float(self.flags.get("limit_order_slippage_percent", 0.5)) / 100.0
+        # Divide the overall timeout evenly across attempts.
+        timeout_total = int(self.flags.get("order_fill_timeout_seconds", 30))
+        per_attempt   = max(5, timeout_total // (max_retries + 1))
+
+        base_long_params = {
             "variety":          self.flags["order_variety"],
             "exchange":         self.kite.EXCHANGE_NFO,
             "tradingsymbol":    symbol,
             "transaction_type": self.kite.TRANSACTION_TYPE_BUY,
             "quantity":         qty,
             "product":          self.flags["product_type"],
-            "order_type":       self.kite.ORDER_TYPE_LIMIT,
-            "price":            long_limit,
+            # price and order_type set by _place_entry_with_retry
         }
-        logging.info(f"ASYNC: placing LIMIT long-leg entry {long_params}")
-        long_id = await asyncio.to_thread(
-            _execute_order_sync, api_key, access_tok, long_params
-        )
-        if not long_id:
-            return None
-
-        long_status, long_fill, long_filled_qty = await _wait_for_fill(
-            api_key, access_tok, long_id, timeout
+        long_status, long_fill, long_filled_qty, long_id = await _place_entry_with_retry(
+            api_key, access_tok,
+            base_params=base_long_params,
+            ltp_key=f"NFO:{symbol}",
+            kite=self.kite,
+            max_retries=max_retries,
+            base_slip_pct=base_slip,
+            slip_multiplier=slip_mult,
+            timeout_per_attempt=per_attempt,
         )
         if long_status != "COMPLETE" or long_fill <= 0:
             logging.error(
-                f"Long-leg entry did not fill: status={long_status} fill={long_fill}. Aborting."
-            )
-            await asyncio.to_thread(
-                _cancel_order_sync, api_key, access_tok, self.flags["order_variety"], long_id
+                f"Long-leg entry failed after all retries: "
+                f"status={long_status} fill={long_fill}. Aborting."
             )
             return None
 

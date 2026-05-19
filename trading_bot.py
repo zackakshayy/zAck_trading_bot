@@ -18,7 +18,7 @@ from strategy_factory import get_strategy
 from backtester import run_backtest
 from reporting import (
     send_daily_report, initialize_trade_log, log_trade, send_monthly_report,
-    send_loss_analysis_email,
+    send_loss_analysis_email, send_token_expiry_alert,
 )
 from loss_analyzer import build_loss_report
 from indicators import calculate_cpr, is_trend_overextended, check_momentum_divergence
@@ -232,6 +232,108 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.error(f"Authentication failed: {e}", exc_info=True)
             return False
+
+    async def _validate_token(self) -> bool:
+        """
+        Confirms the current Zerodha access token is still valid by making a
+        cheap API call (profile). Returns True if valid.
+
+        On failure (TokenException / any exception) it:
+          1. Logs the error with the Kite login URL.
+          2. Sends an email alert via send_token_expiry_alert() so the operator
+             knows to refresh the token even if they're not watching the terminal.
+          3. Sets self._abort = True so the main loop exits cleanly.
+          4. Returns False.
+
+        Called once at the start of _run_inner(), before any setup work, so a
+        stale token surfaces immediately rather than mid-session.
+        """
+        try:
+            await asyncio.to_thread(self.kite.profile)
+            return True
+        except Exception as exc:
+            login_url = self.kite.login_url() if self.kite else "https://kite.zerodha.com"
+            logging.error(
+                f"Token validation failed: {exc}\n"
+                f"Refresh your token at: {login_url}"
+            )
+            if self._is_interactive_tty():
+                print("\n" + "!" * 78)
+                print("  Zerodha access token is INVALID or EXPIRED.")
+                print(f"  Error: {exc}")
+                print(f"  Refresh at: {login_url}")
+                print("!" * 78 + "\n")
+            try:
+                send_token_expiry_alert(self.config, str(exc), login_url)
+            except Exception as mail_exc:
+                logging.debug(f"Token-expiry alert email failed: {mail_exc}")
+            self._abort = True
+            return False
+
+    async def _run_startup_backtest(self) -> None:
+        """
+        Runs an optional warm-up backtest whose results are written to the trade
+        log so the RAG service has real signal history to retrieve from.
+
+        Gated by trading_flags.run_startup_backtest: true (default false).
+
+        Date-range alignment fix
+        ─────────────────────────
+        The legacy `backtest_years: 2` setting generates 500+ rows of historical
+        trades, but the RAG service only looks at the most recent
+        `config.rag.recency_window_days` (default 30) trading days. Running 2 years
+        of backtest to feed 30 days of RAG is wasteful and slow.
+
+        This method aligns the two: it derives the from_date as
+          today - max(recency_window_days + 20, backtest_years_days)
+        where the +20-day buffer ensures enough context for RAG's
+        min_trades_per_strategy check. If backtest_years is explicitly larger
+        than the aligned window, a warning is logged so the operator knows.
+        """
+        flags = self.config.get('trading_flags', {})
+        if not flags.get('run_startup_backtest', False):
+            return
+
+        rag_cfg    = self.config.get('rag', {}) or {}
+        recency_d  = int(rag_cfg.get('recency_window_days', 30))
+        bt_years   = float(flags.get('backtest_years', 2))
+        bt_days    = int(bt_years * 365)
+
+        # Aligned window: RAG recency + buffer.  Never shorter than 60 calendar days.
+        aligned_days = max(recency_d + 20, 60)
+
+        if bt_days > aligned_days * 2:
+            logging.warning(
+                f"[Backtest] backtest_years={bt_years} ({bt_days} days) is much larger "
+                f"than the RAG recency_window_days={recency_d}. "
+                f"Using aligned window of {aligned_days} days to avoid generating "
+                f"stale data that RAG will ignore."
+            )
+
+        from_date = datetime.date.today() - datetime.timedelta(days=aligned_days)
+        to_date   = datetime.date.today()
+
+        active_strat = getattr(self, 'active_strategy_name', None)
+        if not active_strat:
+            logging.warning("[Backtest] No active strategy set; skipping startup backtest.")
+            return
+
+        logging.info(
+            f"[Backtest] Running startup backtest for '{active_strat}' "
+            f"from {from_date} to {to_date} ({aligned_days} days)."
+        )
+        try:
+            await asyncio.to_thread(
+                run_backtest,
+                self.kite,
+                self.config,
+                active_strat,
+                from_date,
+                to_date,
+            )
+            logging.info("[Backtest] Startup backtest complete.")
+        except Exception as e:
+            logging.warning(f"[Backtest] Startup backtest failed (non-fatal): {e}")
 
     async def _capture_starting_capital(self):
         """Snapshot capital at session start for the daily-loss circuit breaker."""
@@ -1485,6 +1587,13 @@ class TradingBotOrchestrator:
 
     async def _run_inner(self):
         """The actual trading orchestration — wrapped by run() in a try/finally."""
+        # ── Token health-check before any setup work ──────────────────────────
+        # A stale / expired Zerodha token surfaces here (with an email alert)
+        # rather than failing mid-session after the user has already waited for
+        # sentiment capture and strategy selection.
+        if not await self._validate_token():
+            return  # _validate_token already sent the email and set _abort=True.
+
         # Reconcile any persisted open position from a previous session before setup.
         try:
             resumed = await self.position_agent.reconcile_open_position()
@@ -1495,6 +1604,11 @@ class TradingBotOrchestrator:
         if not await self.setup():
             logging.warning(f"Setup failed. Reason: {self.no_trade_reason or 'Unknown'}. Bot will exit.")
             return  # Finally block in run() will send the report.
+
+        # Warm-up backtest (optional): populate the RAG trade log with recent
+        # historical signals before today's session starts. Uses an aligned date
+        # window so the generated data falls within RAG's recency_window_days.
+        await self._run_startup_backtest()
 
         await self._capture_starting_capital()
 
@@ -1713,6 +1827,11 @@ class TradingBotOrchestrator:
                 await self._aligned_sleep()
             except exceptions.TokenException as e:
                 logging.error(f"Zerodha session expired or invalidated: {e}. Halting bot.")
+                try:
+                    login_url = self.kite.login_url() if self.kite else "https://kite.zerodha.com"
+                    send_token_expiry_alert(self.config, str(e), login_url)
+                except Exception as _alert_exc:
+                    logging.debug(f"Token-expiry alert email failed: {_alert_exc}")
                 self._abort = True
                 break
             except exceptions.PermissionException as e:

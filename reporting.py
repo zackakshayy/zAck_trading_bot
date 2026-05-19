@@ -101,6 +101,40 @@ def send_loss_analysis_email(config, report_text, trade):
     _send_email(config, subject, html)
 
 
+def send_token_expiry_alert(config, error_msg: str = "", login_url: str = "") -> bool:
+    """
+    Sends an urgent email when the Zerodha access token has expired mid-session
+    or is found stale at startup. Includes the Kite login URL so the operator
+    can refresh the token from their phone/laptop within minutes.
+
+    Safe to call even when email is disabled — returns False without error.
+    """
+    import datetime as _dt
+    now_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_err = (error_msg or "TokenException").replace("<", "&lt;").replace(">", "&gt;")
+    safe_url = (login_url or "https://kite.zerodha.com").replace("<", "&lt;").replace(">", "&gt;")
+
+    html = f"""
+<html><body style="font-family:Arial,sans-serif;color:#333">
+<h2 style="color:#c0392b">&#x26A0; zAck Bot — Zerodha Token Expired</h2>
+<p>The bot detected an expired / invalid access token at <strong>{now_str}</strong>
+and has halted to protect your account.</p>
+<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
+  <tr><td><b>Error</b></td><td><code>{safe_err}</code></td></tr>
+  <tr><td><b>Action required</b></td>
+      <td>Refresh your Kite access token and restart the bot.</td></tr>
+  <tr><td><b>Login URL</b></td>
+      <td><a href="{safe_url}">{safe_url}</a></td></tr>
+</table>
+<p style="color:#888;font-size:0.85em">Zerodha tokens are valid for one trading
+session (reset at ~06:00 IST). Run <code>python trading_bot.py</code> after
+generating a new token.</p>
+</body></html>
+"""
+    subject = f"[URGENT] zAck Bot halted — Zerodha token expired ({now_str})"
+    return _send_email(config, subject, html)
+
+
 def send_daily_report(config, date_str, no_trades_reason=None):
     """Reads the trade log and sends a daily report with segregated live and paper trade stats."""
     email_conf = config.get('email_settings', {})
