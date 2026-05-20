@@ -1359,6 +1359,19 @@ class TradingBotOrchestrator:
                 f"  Capital    : ₹{_cap:,.0f}  │  Entry from {_entry_s}  │  Cutoff 13:30",
             ], level="info")
 
+            # Fix: if setup completed but we're already past the entry cutoff,
+            # go straight to STOPPED — no point waiting in AWAITING_SIGNAL all day.
+            _now_time = datetime.datetime.now().time()
+            _cutoff_dt = self._parse_hhmm(self.config['trading_flags'].get('entry_cutoff_time', '13:30'))
+            if _cutoff_dt and _now_time > _cutoff_dt.time():
+                logging.warning(
+                    f"Setup completed after entry cutoff "
+                    f"({_now_time.strftime('%H:%M')} > {_cutoff_dt.strftime('%H:%M')}). "
+                    f"No trades possible today — bot will stop."
+                )
+                self.bot_state = "STOPPED"
+                return False
+
             return True
         except Exception as e:
             logging.error(f"Setup failed: {e}", exc_info=True)
@@ -2115,6 +2128,29 @@ class TradingBotOrchestrator:
                         self.bot_state = "STOPPED"; continue
                     if await self._is_daily_profit_target_hit():
                         self.bot_state = "STOPPED"; continue
+                    # Strategy reassessment timer — runs BEFORE the time gate so
+                    # that the strategy keeps rotating even after 13:30 (e.g. when
+                    # the bot started late). The `continue` inside the time gate
+                    # previously bypassed this block entirely, leaving the bot
+                    # frozen on the same strategy until kill.
+                    reassessment_period = self.config['trading_flags'].get('strategy_reassessment_period_minutes', 60)
+                    if self.awaiting_signal_since and (datetime.datetime.now() - self.awaiting_signal_since).total_seconds() > reassessment_period * 60:
+                        # Cool down the current strategy if it produced zero
+                        # non-HOLD signals during this window — re-picking the
+                        # same strategy is wasteful. Time-based cooldown so it
+                        # can come back later as market conditions evolve.
+                        if (self.active_strategy_name
+                                and self._signals_seen_for_active_strategy == 0
+                                and self.active_strategy_name not in self._strategy_cooldown_until):
+                            logging.info(
+                                f"'{self.active_strategy_name}' produced 0 non-HOLD "
+                                f"signals in {reassessment_period} min."
+                            )
+                            self._cool_strategy(self.active_strategy_name)
+                        logging.warning(f"No trade signal for over {reassessment_period} minutes. Re-assessing strategy...")
+                        if not await self.setup():
+                            self.bot_state = "STOPPED"; continue
+
                     # Time-of-day hard cutoff (13:30) — earlier than entry_cutoff_time
                     # for new entries; protects against theta eating afternoon gains.
                     if self._time_of_day_size_factor() == 0.0:
@@ -2138,25 +2174,6 @@ class TradingBotOrchestrator:
                         logging.debug(f"In no-trade window ({no_trade}); waiting.")
                         await asyncio.sleep(30)
                         continue
-
-                    # Strategy reassessment timer.
-                    reassessment_period = self.config['trading_flags'].get('strategy_reassessment_period_minutes', 60)
-                    if self.awaiting_signal_since and (datetime.datetime.now() - self.awaiting_signal_since).total_seconds() > reassessment_period * 60:
-                        # Cool down the current strategy if it produced zero
-                        # non-HOLD signals during this window — re-picking the
-                        # same strategy is wasteful. Time-based cooldown so it
-                        # can come back later as market conditions evolve.
-                        if (self.active_strategy_name
-                                and self._signals_seen_for_active_strategy == 0
-                                and self.active_strategy_name not in self._strategy_cooldown_until):
-                            logging.info(
-                                f"'{self.active_strategy_name}' produced 0 non-HOLD "
-                                f"signals in {reassessment_period} min."
-                            )
-                            self._cool_strategy(self.active_strategy_name)
-                        logging.warning(f"No trade signal for over {reassessment_period} minutes. Re-assessing strategy...")
-                        if not await self.setup():
-                            self.bot_state = "STOPPED"; continue
 
                     day_df_for_signal = await self._get_underlying_bars()
                     if day_df_for_signal is None or day_df_for_signal.empty:

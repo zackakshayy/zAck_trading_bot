@@ -133,15 +133,19 @@ def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
     iv_high = "IV_HIGH" in market_conditions
 
     if "VIX_MEDIUM" in market_conditions:
-        if not iv_high:  # IV_LOW or unspecified
-            return "VWAP_Reversion"
+        if not iv_high:
+            # IV_LOW + VIX_MEDIUM: trending session with normal vol.
+            # Bullish → ride the trend with EMA momentum.
+            # Bearish → VWAP reversion suits a slow fade better than a
+            #           full breakout strategy; EMA works here too but
+            #           mean-reversion entries tend to be crisper on down days.
+            return "EMA_Cross_RSI" if is_bull else "VWAP_Reversion"
         return "EMA_Cross_RSI" if is_bull else "Supertrend_MACD"
 
     if "VIX_LOW" in market_conditions:
         if not iv_high:
-            # Quiet session — VWAP reversion suits a slow grind much better
-            # than waiting for a BB squeeze that may never break out.
-            # BB_Squeeze and NR7 are still reachable via Layer-3 indicator override.
+            # Quiet, slow session — VWAP reversion suits a grind in either
+            # direction. BB_Squeeze and NR7 are still reachable via Layer-3.
             return "VWAP_Reversion"
         return "Volume_Spread_Analysis" if is_bull else "RSI_Divergence"
 
