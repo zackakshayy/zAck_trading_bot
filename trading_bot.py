@@ -747,6 +747,90 @@ class TradingBotOrchestrator:
             logging.debug(f"Trap detection failed (non-fatal): {e}")
         return False
 
+    # Strategies that work WITH a trend — unsuitable for range/mean-reversion days.
+    _TREND_FOLLOWING_STRATEGIES = frozenset({
+        'EMA_Cross_RSI', 'Supertrend_MACD', 'Breakout_Prev_Day_HL',
+        'Opening_Range_Breakout', 'BB_Squeeze_Breakout', 'NR7_Compression',
+        'Volume_Spread_Analysis', 'Gemini_Default', 'Expiry_Momentum_Scalp',
+    })
+    # Preferred order for range-day strategy selection (first available wins).
+    _RANGE_SCALP_STRATEGIES = ('VWAP_Reversion', 'Reversal_Detector', 'RSI_Divergence')
+
+    def _enter_range_scalp_mode(self, day_df) -> bool:
+        """
+        Switches the bot into range-scalp mode for the current bar cycle.
+
+        Actions:
+          • Injects _scalp_* override keys into trading_flags so agents use
+            tighter profit targets and a tighter trailing stop.
+          • If the currently active strategy is trend-following, rotates to the
+            first available range strategy (VWAP_Reversion preferred, then
+            Reversal_Detector, then RSI_Divergence).
+          • Applies a size haircut (range_scalp.size_factor, default 0.5) on top
+            of whatever progressive-loss / time-of-day multiplier is already set.
+
+        Returns True if scalp mode was engaged (a range strategy is available),
+        False if setup should be skipped this tick (no range strategy available).
+        """
+        scalp_cfg = self.config.get('range_scalp') or {}
+        if not scalp_cfg.get('enable', True):
+            return False
+
+        tf = self.config['trading_flags']
+
+        # Inject tight scalp-specific overrides.
+        tf['_scalp_mode']       = True
+        tf['_scalp_trail_pct']  = float(scalp_cfg.get('trail_pct', 10.0))
+        tf['_scalp_t1_gain_pct'] = float(scalp_cfg.get('t1_gain_pct', 15.0))
+        tf['_scalp_t2_gain_pct'] = float(scalp_cfg.get('t2_gain_pct', 25.0))
+
+        # Strategy rotation: only rotate if the active strategy is trend-following.
+        needs_rotation = (
+            not self.active_strategy
+            or self.active_strategy_name in self._TREND_FOLLOWING_STRATEGIES
+        )
+        if needs_rotation:
+            allowed = [s for s in self._RANGE_SCALP_STRATEGIES
+                       if s not in self._currently_cooled()]
+            if not allowed:
+                logging.warning(
+                    "[RangeScalp] All range strategies are cooled — skipping scalp tick."
+                )
+                tf.pop('_scalp_mode', None)
+                return False
+
+            new_name = allowed[0]
+            if new_name != self.active_strategy_name:
+                from strategy_factory import get_strategy
+                self.active_strategy = get_strategy(new_name, self.kite, self.config)
+                self.active_strategy_name = new_name
+                self._signals_seen_for_active_strategy = 0
+                logging.info(
+                    f"[RangeScalp] Rotated strategy → {new_name} "
+                    f"(range day: VWAP / RSI extremes only)."
+                )
+
+        # Size haircut: reduce on top of the existing multiplier.
+        size_factor = float(scalp_cfg.get('size_factor', 0.5))
+        current_mult = float(self._trade_size_multiplier)
+        tf['_effective_risk_pct_multiplier'] = current_mult * size_factor
+        logging.info(
+            f"[RangeScalp] Scalp mode active — strategy={self.active_strategy_name}  "
+            f"size={current_mult:.2f}×{size_factor:.2f}={current_mult*size_factor:.2f}  "
+            f"T1/T2 +{tf['_scalp_t1_gain_pct']:.0f}%/+{tf['_scalp_t2_gain_pct']:.0f}%  "
+            f"trail {tf['_scalp_trail_pct']:.0f}%"
+        )
+        return True
+
+    def _exit_range_scalp_mode(self):
+        """Clears all scalp-mode overrides so the next trending trade uses
+        the full config values."""
+        tf = self.config['trading_flags']
+        for k in ('_scalp_mode', '_scalp_trail_pct', '_scalp_t1_gain_pct', '_scalp_t2_gain_pct'):
+            tf.pop(k, None)
+        # Also clear the size override set by _enter_range_scalp_mode.
+        tf.pop('_effective_risk_pct_multiplier', None)
+
     def _time_of_day_size_factor(self) -> float:
         """
         Returns a position-size multiplier based on the current time of day.
@@ -1950,16 +2034,28 @@ class TradingBotOrchestrator:
                         vix_conditions=self.todays_conditions,
                     )
 
-                    # Day quality filter — only trade on TRENDING days.
-                    # RANGE and CHOPPY days bleed theta with no directional edge.
+                    # Day quality filter.
+                    #   TRENDING → normal flow, clear any leftover scalp flags.
+                    #   RANGE    → scalp mode (VWAP/RSI-extreme, half-size, tight targets).
+                    #   CHOPPY   → fully blocked; too many direction changes for any edge.
                     self._day_quality = self._classify_day_quality(day_df_for_signal)
-                    if self._day_quality in ('RANGE', 'CHOPPY'):
+                    if self._day_quality == 'CHOPPY':
+                        self._exit_range_scalp_mode()
                         logging.warning(
-                            f"[DayQuality] {self._day_quality} day detected — "
-                            f"skipping new entries. Options buying needs trending conditions."
+                            "[DayQuality] CHOPPY — too noisy for any entries (7+ "
+                            "direction changes). Waiting 60 s."
                         )
                         await asyncio.sleep(60)
                         continue
+                    elif self._day_quality == 'RANGE':
+                        scalp_ok = self._enter_range_scalp_mode(day_df_for_signal)
+                        if not scalp_ok:
+                            await asyncio.sleep(60)
+                            continue
+                        # Fall through — scalp strategy + tight params are now set.
+                    else:
+                        # TRENDING or UNKNOWN — ensure scalp overrides are cleared.
+                        self._exit_range_scalp_mode()
 
                     if signal != 'HOLD':
                         # The strategy fired *something* — bumps the per-strategy

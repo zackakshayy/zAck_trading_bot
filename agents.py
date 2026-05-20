@@ -1551,8 +1551,11 @@ class PositionManagementAgent:
         t1_gain = float(flags.get('_agg_t1_gain_pct', pe_cfg.get('t1_gain_pct', 30))) / 100.0
         t2_gain = float(flags.get('_agg_t2_gain_pct', pe_cfg.get('t2_gain_pct', 60))) / 100.0
 
-        # Base trail: aggressive mode uses a wider % to give winners more room.
-        base_pct = float(flags.get('_agg_trail_pct') or self.tsl_config.get('percentage', 15.0))
+        # Base trail priority: scalp mode (tightest) → aggressive mode (widest) → static config.
+        if flags.get('_scalp_mode'):
+            base_pct = float(flags.get('_scalp_trail_pct', 10.0))
+        else:
+            base_pct = float(flags.get('_agg_trail_pct') or self.tsl_config.get('percentage', 15.0))
 
         entry = float(self.active_trade.get('entry_price', 0) or 0)
         if entry <= 0:
@@ -1713,10 +1716,14 @@ class PositionManagementAgent:
         lot_size    = int(trade.get('lot_size', 1) or 1)
         remaining   = int(trade.get('quantity', 0))
 
-        # In AGGRESSIVE mode, let winners run further before booking partials.
-        # _agg_t1/t2_gain_pct are injected by setup() when mode = AGGRESSIVE.
-        t1_pct      = float(flags.get('_agg_t1_gain_pct', pe_cfg.get('t1_gain_pct', 30))) / 100.0
-        t2_pct      = float(flags.get('_agg_t2_gain_pct', pe_cfg.get('t2_gain_pct', 60))) / 100.0
+        # Target priority: scalp mode (tightest) → aggressive mode (widest) → static config.
+        if flags.get('_scalp_mode'):
+            t1_pct  = float(flags.get('_scalp_t1_gain_pct', 15)) / 100.0
+            t2_pct  = float(flags.get('_scalp_t2_gain_pct', 25)) / 100.0
+        else:
+            # In AGGRESSIVE mode, let winners run further before booking partials.
+            t1_pct  = float(flags.get('_agg_t1_gain_pct', pe_cfg.get('t1_gain_pct', 30))) / 100.0
+            t2_pct  = float(flags.get('_agg_t2_gain_pct', pe_cfg.get('t2_gain_pct', 60))) / 100.0
         t1_frac     = float(pe_cfg.get('t1_exit_pct', 40)) / 100.0
         t2_frac     = float(pe_cfg.get('t2_exit_pct', 40)) / 100.0
 

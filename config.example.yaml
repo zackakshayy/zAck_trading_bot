@@ -186,6 +186,17 @@ partial_exits:
   t2_exit_pct: 40          # sell 40% of original position at T2
   # Runner (remaining 20%) trail: tightened automatically by _dynamic_trail_pct
   # 0→T1: base trail %, T1→T2: 8%, T2+: 5%, after 13:30: forced to 5%
+# Range-day scalping. On RANGE days (ADX < 20, low open range) the bot rotates
+# to VWAP_Reversion / Reversal_Detector instead of sitting out completely.
+# Tighter targets + smaller size match the lower momentum environment.
+# CHOPPY days (7+ direction changes per hour) are still fully blocked.
+# Set enable: false to revert to "skip RANGE days entirely".
+range_scalp:
+  enable: true
+  size_factor: 0.5        # position size as a fraction of normal
+  trail_pct: 10.0         # trailing stop % (vs 15% on trending days)
+  t1_gain_pct: 15.0       # T1 profit target: +15% on entry premium
+  t2_gain_pct: 25.0       # T2 profit target: +25% on entry premium
 trailing_stop_loss:
   indicator_exit_type: PSAR
   ma_period: 9
