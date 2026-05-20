@@ -41,6 +41,11 @@ from infra import atomic_write_json, read_json, state_path
 
 # Map verdict labels to numeric polarity. Matches the bucket thresholds the
 # SentimentAgent uses to convert the final score back to a label.
+# Sentinel returned by _process_channel when YouTube confirms no recent
+# video exists for a channel. Distinct from None (Gemini/network error)
+# so fetch_today can stop retrying the channel for the rest of the day.
+_NO_VIDEO = object()
+
 DIRECTION_SCORE = {
     "Very Bullish": 0.7,
     "Bullish": 0.3,
@@ -81,11 +86,20 @@ class YouTubeSentimentAgent:
         self.gemini_model = cfg.get("gemini_model", "gemini-2.0-flash")
         self._verdicts: list = []
         self._ready = False
+        # Channels that definitively had no recent video (stop fetching them).
+        self._no_video_channels: set = set()
+        # Channels that errored last time (Gemini 429, network, etc.) — retry.
+        self._error_channels: set = set()
 
     # ---------- public read-only API used by SentimentAgent + orchestrator ----------
 
     def is_ready(self) -> bool:
-        return self._ready
+        """
+        True when YouTube sentiment has been resolved for today and no retries
+        are pending. Returns False when there were errors on the last fetch so
+        that setup() will call fetch_today() again to retry the failed channels.
+        """
+        return self._ready and len(self._error_channels) == 0
 
     def get_verdicts(self) -> list:
         return list(self._verdicts)
@@ -117,24 +131,74 @@ class YouTubeSentimentAgent:
             )
             return self._verdicts
 
-        verdicts = []
-        for idx, ch in enumerate(self.channels):
+        # On retry runs, only re-process channels that errored last time.
+        # Channels that explicitly had no recent video are skipped permanently.
+        is_retry = bool(self._error_channels)
+        channels_to_process = [
+            ch for ch in self.channels
+            if ch.get('handle', '') not in self._no_video_channels
+            and (not is_retry or ch.get('handle', '') in self._error_channels)
+        ]
+
+        if not channels_to_process:
+            # All channels either had no video or were already resolved.
+            self._error_channels.clear()
+            self._ready = True
+            logging.info(
+                f"YouTubeSentiment: nothing left to fetch "
+                f"(no-video channels: {sorted(self._no_video_channels)})."
+            )
+            return self._verdicts
+
+        # Clear error set — will be repopulated only for channels that fail again.
+        self._error_channels.clear()
+
+        verdicts = list(self._verdicts)  # keep already-fetched verdicts from prior calls
+        fetch_attempt = "retry" if is_retry else "first run"
+        logging.info(
+            f"YouTubeSentiment: {fetch_attempt} — processing "
+            f"{len(channels_to_process)} channel(s)."
+        )
+
+        for idx, ch in enumerate(channels_to_process):
+            handle = ch.get('handle', '?')
             # Small inter-channel delay so back-to-back Gemini calls don't
             # immediately hit the free-tier RPM cap (15 req/min on flash).
             if idx > 0:
                 await asyncio.sleep(5)
             try:
                 v = await self._process_channel(ch)
-                if v:
+                if v is _NO_VIDEO:
+                    # YouTube API confirmed: no recent upload from this channel.
+                    # Stop retrying — it won't have a new video for the rest of the day.
+                    self._no_video_channels.add(handle)
+                    logging.info(
+                        f"YouTubeSentiment: {handle} has no recent video — "
+                        f"will not retry this channel today."
+                    )
+                elif v is not None:
+                    # Successful verdict — replace any stale entry and keep it.
+                    verdicts = [x for x in verdicts if x.get('channel_handle') != handle]
                     verdicts.append(v)
+                else:
+                    # None = Gemini/transcript error (retriable).
+                    # Mark as errored so next setup() call retries this channel.
+                    self._error_channels.add(handle)
+                    logging.warning(
+                        f"YouTubeSentiment: {handle} returned no verdict "
+                        f"(Gemini/transcript issue) — will retry on next setup cycle."
+                    )
             except Exception as e:
+                # Unexpected exception — also retriable.
+                self._error_channels.add(handle)
                 logging.warning(
-                    f"YouTubeSentiment: channel {ch.get('handle','?')} failed: "
-                    f"{self._sanitize_error(e)}"
+                    f"YouTubeSentiment: channel {handle} failed: "
+                    f"{self._sanitize_error(e)} — will retry on next setup cycle."
                 )
 
         self._verdicts = verdicts
-        self._ready = True
+        # Only mark ready (no more retries) when no channels are still errored.
+        self._ready = len(self._error_channels) == 0
         try:
             atomic_write_json(
                 cache_path,
@@ -168,9 +232,10 @@ class YouTubeSentimentAgent:
         recent = await self._list_recent_videos(channel_id)
         if not recent:
             logging.info(
-                f"YouTubeSentiment: no videos from {handle} in last {self.max_age_hours}h."
+                f"YouTubeSentiment: no videos from {handle} in last "
+                f"{self.max_age_hours}h — marking channel as no-video for today."
             )
-            return None
+            return _NO_VIDEO  # ← definitive: YouTube confirmed no recent upload
 
         video = recent[0]  # most-recent qualifying upload
         video_id = video.get("videoId")

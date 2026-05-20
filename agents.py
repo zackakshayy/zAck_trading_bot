@@ -1058,7 +1058,19 @@ class OrderExecutionAgent:
             if not valid_expiries:
                 logging.warning(f"No expiries with DTE >= {min_dte}. Aborting sizing.")
                 return None, 0, 0
-            expiry_date = valid_expiries[0]
+
+            # Professional DTE sweet spot: 5-10 calendar days.
+            # Enough time value to survive one adverse bar; enough gamma to
+            # profit from a 0.5% underlying move. Fall back to nearest valid
+            # expiry if no contract falls in the window (e.g. on expiry week).
+            preferred_dte = [d for d in valid_expiries if 5 <= (d - today).days <= 10]
+            expiry_date = preferred_dte[0] if preferred_dte else valid_expiries[0]
+            logging.info(
+                f"Expiry selected: {expiry_date} "
+                f"({(expiry_date - today).days} DTE"
+                + (" — preferred 5-10 DTE window" if preferred_dte else " — fallback to nearest")
+                + ")"
+            )
 
             symbol = None
             lot_size = 0
@@ -1140,6 +1152,16 @@ class OrderExecutionAgent:
                     f"→ {risk_pct * dte_factor:.2f}% (DTE factor={dte_factor:.2f})"
                 )
                 risk_pct *= dte_factor
+
+            # Professional size multiplier: progressive loss reduction × time-of-day factor.
+            # Written to config by the orchestrator before calling place_trade().
+            pro_multiplier = float(self.config.get('_effective_risk_pct_multiplier', 1.0) or 1.0)
+            if pro_multiplier != 1.0:
+                logging.info(
+                    f"[ProSize] Applying size multiplier {pro_multiplier:.2f} "
+                    f"to risk_pct ({risk_pct:.2f}% -> {risk_pct * pro_multiplier:.2f}%)"
+                )
+                risk_pct *= pro_multiplier
             risk_amount = capital * (risk_pct / 100.0)
 
             sl_pct = float(self.flags.get("stop_loss_percent", 25.0)) / 100.0
@@ -1261,9 +1283,37 @@ class PositionManagementAgent:
         self.active_trade["trailing_stop_loss"] = sl_price
         self.active_trade["high_water_mark"] = self.active_trade.get("entry_price", 0)
         self.active_trade.setdefault("sl_order_id", None)
+
+        # Partial-exit state — enabled only when at least 2 lots are held so we can
+        # actually split the position. With 1 lot there is nothing to split.
+        pe_cfg = self.config.get('partial_exits') or {}
+        lot_size = int(self.active_trade.get('lot_size', 1) or 1)
+        qty = int(self.active_trade.get('quantity', 0) or 0)
+        pe_eligible = pe_cfg.get('enable', False) and qty >= lot_size * 2
+        self.active_trade['_pe_enabled']       = pe_eligible
+        self.active_trade['_pe_original_qty']  = qty
+        self.active_trade['_pe_t1_hit']        = False
+        self.active_trade['_pe_t2_hit']        = False
+        self.active_trade['_pe_realized_pnl']  = 0.0
+
+        # Snapshot the underlying spot price at entry for the give-up rule
+        # (detects IV crush when spot moves in favour but premium stays flat).
+        try:
+            underlying_name = self.flags.get('underlying_instrument', 'NIFTY 50')
+            nse = get_instruments(self.kite, 'NSE')
+            match = nse[nse['tradingsymbol'] == underlying_name]
+            if not match.empty:
+                token = str(int(match.iloc[0]['instrument_token']))
+                data = self.kite.ltp(token)
+                spot = float((data or {}).get(token, {}).get('last_price', 0))
+                self.active_trade['_entry_spot'] = spot if spot > 0 else 0
+        except Exception:
+            self.active_trade.setdefault('_entry_spot', 0)
+
         logging.info(
             f"Managing {self.active_trade['symbol']} entry={self.active_trade['entry_price']:.2f} "
-            f"hard_SL={sl_price:.2f}"
+            f"hard_SL={sl_price:.2f} partial_exits={'ON' if pe_eligible else 'OFF'} "
+            f"entry_spot={self.active_trade.get('_entry_spot', 0):.2f}"
         )
         self._save_state()
 
@@ -1395,12 +1445,71 @@ class PositionManagementAgent:
                 current_price = max(0.0, float(current_price) - float(short_price))
             # If short LTP is unavailable, fall back to long LTP only (conservative).
 
-        # 3. Update trailing stop and (if live) modify the SL-M trigger upward.
+        # 3. Hard time exit — never hold options past 14:00 IST.
+        #    Theta and bid-ask spread widen sharply in the last 75 min.
+        _hard_close_time = datetime.time(14, 0)
+        if datetime.datetime.now().time() >= _hard_close_time:
+            logging.info(
+                f"Hard time exit: {datetime.datetime.now().strftime('%H:%M')} >= 14:00 — "
+                f"closing {symbol} to avoid theta/spread damage."
+            )
+            return await self.exit_trade(
+                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+            )
+
+        # 4. Partial exits (T1 / T2 premium targets) — before the SL check so that
+        #    a winning trade books partial profits rather than waiting for a reversal.
+        if self.active_trade.get('_pe_enabled'):
+            pe_result = await self._check_partial_exits(current_price, is_paper_trade)
+            if pe_result == 'FULLY_EXITED':
+                return await self._book_completed_trade(
+                    current_price, underlying_hist_df, sentiment_agent, gemini_api_key,
+                    exit_order_id=None, exit_reason='PARTIAL_EXITS_COMPLETE',
+                )
+
+        # 5. Give-up rule: underlying moved in our favour but the premium
+        #    didn't respond — IV crush has already started. Exit before it
+        #    accelerates. Threshold: ≥0.3% underlying move, <10% premium gain.
+        if underlying_hist_df is not None and not underlying_hist_df.empty:
+            entry_spot = float(self.active_trade.get('_entry_spot', 0) or 0)
+            if entry_spot > 0:
+                current_spot = float(underlying_hist_df.iloc[-1]['close'])
+                spot_move_pct = (current_spot - entry_spot) / entry_spot * 100.0
+                side = self.active_trade['type']
+                favorable_move = spot_move_pct if side == 'BUY' else -spot_move_pct
+                if favorable_move >= 0.3:
+                    entry_px = float(self.active_trade['entry_price'])
+                    expected_min_gain = entry_px * 0.10
+                    actual_gain = current_price - entry_px
+                    if actual_gain < expected_min_gain:
+                        logging.warning(
+                            f"[GiveUp] Underlying moved {favorable_move:.2f}% in favour "
+                            f"but premium only gained {actual_gain:.2f} "
+                            f"(expected ≥{expected_min_gain:.2f}). "
+                            f"IV crush in progress — exiting."
+                        )
+                        return await self.exit_trade(
+                            is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                        )
+
+        # 6. Tighten trail after 13:30 to protect intraday gains from theta drain.
+        _late_tighten_time = datetime.time(13, 30)
+        if datetime.datetime.now().time() >= _late_tighten_time:
+            current_trail_pct = float(self.tsl_config.get("percentage", 15.0))
+            if current_trail_pct > 5.0:
+                self.tsl_config = dict(self.tsl_config)
+                self.tsl_config["percentage"] = 5.0
+                logging.info(
+                    "[TrailTighten] 13:30 reached — tightening trail to 5% "
+                    "to lock intraday gains before theta accelerates."
+                )
+
+        # 7. Update trailing stop (with profit-level tightening) and modify SL-M.
         new_trail = self._update_premium_trailing_stop(current_price)
         if not is_paper_trade and self.active_trade.get("sl_order_id") and new_trail:
             await self._maybe_modify_broker_sl(new_trail)
 
-        # 4. Software backstop: if no broker SL or it's stale, enforce in code.
+        # 8. Software backstop: if no broker SL or it's stale, enforce in code.
         trail = self.active_trade.get("trailing_stop_loss")
         hard = self.active_trade["initial_stop_loss"]
         if current_price <= hard or (trail and current_price <= trail):
@@ -1409,7 +1518,7 @@ class PositionManagementAgent:
                 is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
             )
 
-        # 5. Indicator-based exit (PSAR / MA on the underlying).
+        # 9. Indicator-based exit (PSAR / MA on the underlying).
         if self.tsl_config.get("use_indicator_exit") and underlying_hist_df is not None:
             if self._check_indicator_exit(underlying_hist_df):
                 logging.info(f"Indicator exit triggered for {symbol}.")
@@ -1421,6 +1530,32 @@ class PositionManagementAgent:
 
     # ---------- trailing / indicator exits ----------
 
+    def _dynamic_trail_pct(self, current_price: float) -> float:
+        """
+        Tightens the trailing-stop % as profit grows — protects larger gains
+        more aggressively without killing a trade too early.
+
+        Profit bands (% gain on entry premium):
+          < T1 threshold  → base trail %   (loose, give the trade room)
+          T1 → T2         → 8%             (moderate — first partial already booked)
+          > T2            → 5%             (tight — runner is free money)
+        """
+        pe_cfg = self.config.get('partial_exits') or {}
+        t1_gain = float(pe_cfg.get('t1_gain_pct', 30)) / 100.0
+        t2_gain = float(pe_cfg.get('t2_gain_pct', 60)) / 100.0
+        base_pct = float(self.tsl_config.get('percentage', 15.0))
+
+        entry = float(self.active_trade.get('entry_price', 0) or 0)
+        if entry <= 0:
+            return base_pct
+        gain_pct = (current_price - entry) / entry
+
+        if gain_pct >= t2_gain:
+            return 5.0
+        elif gain_pct >= t1_gain:
+            return 8.0
+        return base_pct
+
     def _update_premium_trailing_stop(self, current_price):
         prev_trail = self.active_trade.get(
             "trailing_stop_loss", self.active_trade.get("initial_stop_loss", 0)
@@ -1431,7 +1566,8 @@ class PositionManagementAgent:
         trail_type = self.tsl_config.get("type", "NONE")
         if trail_type != "PERCENTAGE":
             return None
-        pct = float(self.tsl_config.get("percentage", 15.0))
+        # Use dynamic (profit-level-based) trail % instead of fixed %.
+        pct = self._dynamic_trail_pct(current_price)
         candidate = self.active_trade["high_water_mark"] * (1 - pct / 100.0)
         new_trail = max(prev_trail or 0, candidate)
         if new_trail > (prev_trail or 0):
@@ -1489,6 +1625,125 @@ class PositionManagementAgent:
             return False
 
         return False
+
+    async def _exit_partial_quantity(self, qty_to_exit: int, reason: str,
+                                      is_paper_trade: bool, current_price: float) -> float:
+        """Exit `qty_to_exit` of an active position. Returns actual exit price.
+
+        On first partial: cancels the full-qty broker SL-M (prevents a double-fill
+        against the already-sold lots) and switches to software SL management only.
+        """
+        trade = self.active_trade
+        symbol = trade['symbol']
+        exit_price = current_price
+
+        if not is_paper_trade:
+            # Cancel broker SL-M before the first partial so it doesn't fire on
+            # lots we've already sold.
+            sl_id = trade.get('sl_order_id')
+            if sl_id:
+                await asyncio.to_thread(
+                    _cancel_order_sync, self.api_key, self.access_token,
+                    self.flags['order_variety'], sl_id,
+                )
+                trade['sl_order_id'] = None
+                logging.info(f"Broker SL-M {sl_id} cancelled before partial exit.")
+
+            tick = float(trade.get('tick_size', 0.05))
+            slip = float(self.flags.get('limit_order_slippage_percent', 0.5)) / 100.0
+            limit_px = tick_round(current_price * (1 - slip), tick)
+            params = {
+                'variety': self.flags['order_variety'],
+                'exchange': self.kite.EXCHANGE_NFO,
+                'tradingsymbol': symbol,
+                'transaction_type': self.kite.TRANSACTION_TYPE_SELL,
+                'quantity': qty_to_exit,
+                'product': self.flags['product_type'],
+                'order_type': self.kite.ORDER_TYPE_LIMIT,
+                'price': limit_px,
+            }
+            oid = await asyncio.to_thread(
+                _execute_order_sync, self.api_key, self.access_token, params
+            )
+            if oid:
+                timeout = int(self.flags.get('order_fill_timeout_seconds', 30))
+                status, avg, _ = await _wait_for_fill(
+                    self.api_key, self.access_token, oid, timeout
+                )
+                if status == 'COMPLETE' and avg > 0:
+                    exit_price = avg
+
+        partial_pnl = (exit_price - trade['entry_price']) * qty_to_exit
+        trade['_pe_realized_pnl'] = float(trade.get('_pe_realized_pnl', 0.0)) + partial_pnl
+        trade['quantity'] = int(trade['quantity']) - qty_to_exit
+        logging.info(
+            f"PARTIAL EXIT [{reason}]: {qty_to_exit} lots @ {exit_price:.2f} "
+            f"partial_pnl={partial_pnl:+.2f} | remaining={trade['quantity']} lots"
+        )
+        self._save_state()
+        return exit_price
+
+    async def _check_partial_exits(self, current_price: float,
+                                    is_paper_trade: bool) -> Optional[str]:
+        """Fire T1 / T2 partial exits when premium targets are hit.
+
+        T1 (+t1_gain_pct%): exit t1_exit_pct% of original position; move SL to breakeven.
+        T2 (+t2_gain_pct%): exit t2_exit_pct% of original; trail remainder aggressively.
+
+        Returns 'FULLY_EXITED' if no lots remain after partial exits, else None.
+        Partial exits are SKIPPED if not enough lots to round to a lot boundary.
+        """
+        trade = self.active_trade
+        if not trade.get('_pe_enabled'):
+            return None
+
+        pe_cfg = self.config.get('partial_exits') or {}
+        entry       = float(trade['entry_price'])
+        orig_qty    = int(trade['_pe_original_qty'])
+        lot_size    = int(trade.get('lot_size', 1) or 1)
+        remaining   = int(trade.get('quantity', 0))
+
+        t1_pct      = float(pe_cfg.get('t1_gain_pct', 30)) / 100.0
+        t2_pct      = float(pe_cfg.get('t2_gain_pct', 60)) / 100.0
+        t1_frac     = float(pe_cfg.get('t1_exit_pct', 40)) / 100.0
+        t2_frac     = float(pe_cfg.get('t2_exit_pct', 40)) / 100.0
+
+        # T1 — first partial profit booking
+        if not trade.get('_pe_t1_hit') and current_price >= entry * (1 + t1_pct):
+            raw = orig_qty * t1_frac
+            qty_exit = max(lot_size, int(raw // lot_size) * lot_size)
+            qty_exit = min(qty_exit, remaining)
+            if qty_exit >= lot_size:
+                await self._exit_partial_quantity(qty_exit, 'T1_TARGET', is_paper_trade, current_price)
+                trade['_pe_t1_hit'] = True
+                # Slide SL to breakeven — protect the trade after first win.
+                be = entry
+                trade['trailing_stop_loss'] = max(float(trade.get('trailing_stop_loss', 0)), be)
+                trade['initial_stop_loss']  = max(float(trade['initial_stop_loss']), be)
+                logging.info(
+                    f"T1 target hit @ {current_price:.2f} (+{t1_pct*100:.0f}%). "
+                    f"SL moved to breakeven {be:.2f}."
+                )
+                self._save_state()
+
+        # T2 — second partial profit booking (only after T1 confirmed)
+        remaining = int(trade.get('quantity', 0))
+        if trade.get('_pe_t1_hit') and not trade.get('_pe_t2_hit') and current_price >= entry * (1 + t2_pct):
+            raw = orig_qty * t2_frac
+            qty_exit = max(lot_size, int(raw // lot_size) * lot_size)
+            qty_exit = min(qty_exit, remaining)
+            if qty_exit >= lot_size:
+                await self._exit_partial_quantity(qty_exit, 'T2_TARGET', is_paper_trade, current_price)
+                trade['_pe_t2_hit'] = True
+                logging.info(
+                    f"T2 target hit @ {current_price:.2f} (+{t2_pct*100:.0f}%). "
+                    f"Trailing remainder aggressively."
+                )
+                self._save_state()
+
+        if int(trade.get('quantity', 0)) <= 0:
+            return 'FULLY_EXITED'
+        return None
 
     async def _maybe_modify_broker_sl(self, new_trigger: float):
         """Debounced wrapper around order modify — skip if the move is sub-tick noise."""
@@ -1698,7 +1953,9 @@ class PositionManagementAgent:
     async def _book_completed_trade(self, exit_price, underlying_df, sentiment_agent,
                                     gemini_api_key, exit_order_id=None, exit_reason="UNKNOWN"):
         trade = self.active_trade
-        pnl = (exit_price - trade["entry_price"]) * trade["quantity"] if exit_price > 0 else 0.0
+        # Remaining-lots P&L + any partial-exit P&L already banked at T1/T2.
+        remaining_pnl = (exit_price - trade["entry_price"]) * trade["quantity"] if exit_price > 0 else 0.0
+        pnl = remaining_pnl + float(trade.get('_pe_realized_pnl', 0.0))
         completed = {
             "Timestamp": datetime.datetime.now(),
             "OrderID": trade.get("order_id"),

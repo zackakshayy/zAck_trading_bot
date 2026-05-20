@@ -139,9 +139,6 @@ trading_flags:
   # >25 = tradeable momentum (take it). Start at 15 and tune from logs.
   min_atr_per_bar: 0
   min_atr_lookback_bars: 3
-  # ONE-SHOT diagnostic. When true, the bot bypasses sentiment/VIX/IVR/IV-RV
-  # gates and takes the first non-HOLD signal; auto-disarms after that trade.
-  # Daily-loss limit + liquidity + max-trades + IP whitelist still apply.
   force_one_trade_today: false
   # 15-minute confirmation gate (see pcr_feed block comment above for details).
   enable_15m_confirmation: true
@@ -152,23 +149,43 @@ trading_flags:
   risk_reward_ratio: 2.0
   min_days_to_expiry: 2
   limit_order_slippage_percent: 0.5
-  # Operator-prompt timeout. If no keystroke for this many seconds, the bot
-  # takes its own decision (accepts automated sentiment / skips NL prompt).
   operator_input_timeout_seconds: 20
-  # Pre-market warm-up window. If started at/after this time on a trading
-  # day, the bot does auth + setup + sentiment capture in advance and waits
-  # until 09:15 IST to enter the trading loop.
   pre_market_start_time: "08:50"
-  # Entry-time gating. Default skip-the-noise window after the open is 09:15 -> 09:30.
-  # The bot pulls this forward to 09:15 automatically when:
-  #   (a) today is a known macro event day (FED / RBI / etc.), OR
-  #   (b) the open gap vs prior close >= early_entry_gap_threshold_percent.
   entry_start_time: "09:30"
-  entry_cutoff_time: "14:30"
+  # Hard new-entry cutoff. Professional rule: no new options entries after 13:30.
+  # Theta and bid-ask spreads widen in the last 75 min before close.
+  # Hard close of any open position at 14:00 is enforced in manage().
+  entry_cutoff_time: "13:30"
   early_entry_gap_threshold_percent: 0.4
-  # Strike selection: 0 = ATM, +N = N steps ITM, -N = N steps OTM.
-  # 1-step ITM gives delta ~0.55-0.60 on Nifty -> better risk/reward & lower theta than ATM.
   strike_offset_steps: 1
+  # ── Professional profit + quality controls ─────────────────────────────────
+  # Daily profit target: halt new entries once this % of starting capital is
+  # realized as profit. Protects morning gains from afternoon theta drain.
+  # Set to 0 to disable.
+  max_daily_profit_percent: 3.0
+  # Day quality filter: only take entries on TRENDING days (ADX-based).
+  # RANGE / CHOPPY days bleed theta with no directional persistence.
+  enable_day_quality_filter: true
+  # Trap / false-breakout detection: skips entries where the breakout bar
+  # immediately reverses back inside the prior bar's high/low range.
+  enable_trap_detection: true
+  # Time-of-day position sizing: prime entry windows (09:30-10:15, 11:30-12:30)
+  # get full size; lunch drift (12:30-13:30) gets 50%; after 13:30 = blocked.
+  enable_time_of_day_sizing: true
+# Tiered partial profit booking (professional 40/40/20 framework).
+# T1: book t1_exit_pct% of original position when premium gains t1_gain_pct%;
+#     simultaneously slides SL to breakeven.
+# T2: book t2_exit_pct% when premium gains t2_gain_pct%;
+#     the remaining 20% runner is trailed with a tightening % band.
+# Partial exits are SKIPPED if fewer than 2 lots are held (can't split).
+partial_exits:
+  enable: true
+  t1_gain_pct: 30          # +30% on entry premium → T1 exit
+  t2_gain_pct: 60          # +60% on entry premium → T2 exit
+  t1_exit_pct: 40          # sell 40% of original position at T1
+  t2_exit_pct: 40          # sell 40% of original position at T2
+  # Runner (remaining 20%) trail: tightened automatically by _dynamic_trail_pct
+  # 0→T1: base trail %, T1→T2: 8%, T2+: 5%, after 13:30: forced to 5%
 trailing_stop_loss:
   indicator_exit_type: PSAR
   ma_period: 9
@@ -177,6 +194,31 @@ trailing_stop_loss:
   use_indicator_exit: true
   psar_step: 0.02
   psar_max: 0.2
+# Automatic position-size mode switching.
+# AGGRESSIVE: activated when recent performance warrants larger bets.
+# MODERATE:   default; forced on consecutive losses, high drawdown, or elevated VIX.
+# The effective risk % is injected into agents.py at each setup() call.
+mode_switching:
+  enable: true
+  lookback_trades: 5              # evaluate this many recent trades for the mode decision
+  aggressive_risk_percent: 2.0   # risk_per_trade_percent when AGGRESSIVE (vs 1.0 default)
+  aggressive_trigger_wins: 3     # wins needed in lookback window to go AGGRESSIVE
+  aggressive_max_drawdown: 0.05  # max equity drawdown while staying AGGRESSIVE (5%)
+  moderate_trigger_losses: 2     # consecutive losses to force MODERATE
+  moderate_drawdown: 0.08        # equity drawdown threshold to force MODERATE (8%)
+  moderate_vix_threshold: 18.0   # VIX level that blocks AGGRESSIVE mode
+# Partial exits: book profits progressively instead of all-or-nothing.
+# Requires at least 2 lots (1 lot = can't be split). Disabled by default;
+# enable once you've verified the partial-exit logic in paper mode.
+partial_exits:
+  enable: false
+  t1_gain_pct: 30     # T1 target: +30% of entry premium
+  t2_gain_pct: 60     # T2 target: +60% of entry premium
+  t1_exit_pct: 40     # % of original position to close at T1
+  t2_exit_pct: 40     # % of original position to close at T2
+  # Remaining 20% trails at the normal trailing_stop_loss.percentage setting.
+  # After T1: SL is automatically moved to breakeven (entry price).
+  hard_sl_pct: 40     # hard stop on remaining lots: -40% from entry premium
 strike_steps:
   NIFTY: 50
   BANKNIFTY: 100

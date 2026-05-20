@@ -126,6 +126,7 @@ class TradingBotOrchestrator:
         self.trades_today_count = 0
         self.no_trade_reason = None
         self.bot_state = "STARTING"
+        self._trading_mode = "MODERATE"  # updated each setup() call
         self.last_processed_timestamp = None
         self.awaiting_signal_since = None
         # Realized P&L tracking for daily-loss and weekly-loss circuit breakers.
@@ -151,6 +152,9 @@ class TradingBotOrchestrator:
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
+        # Professional risk controls
+        self._trade_size_multiplier = 1.0   # reduced after losses, restored on wins
+        self._day_quality = 'UNKNOWN'       # set each setup() call
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
@@ -614,6 +618,161 @@ class TradingBotOrchestrator:
             logging.debug(f"ATR momentum gate check failed (non-fatal): {e}")
         return False
 
+    # ------------------------------------------------------------------
+    # Professional entry gates (added by pro-strategy session)
+    # ------------------------------------------------------------------
+
+    async def _is_daily_profit_target_hit(self) -> bool:
+        """Halt new entries when daily profit target is reached.
+        Guards against giving back a good morning in a slow afternoon."""
+        flags = self.config.get('trading_flags', {})
+        target_pct = float(flags.get('max_daily_profit_percent', 0) or 0)
+        if target_pct <= 0:
+            return False
+        if not self.starting_capital or self.starting_capital <= 0:
+            return False
+        target_amt = self.starting_capital * (target_pct / 100.0)
+        if self.realized_pnl_today >= target_amt:
+            logging.info(
+                f"DAILY PROFIT TARGET HIT: realized={self.realized_pnl_today:,.2f} "
+                f"target={target_amt:,.2f} ({target_pct}%). Stopping new entries."
+            )
+            return True
+        return False
+
+    def _classify_day_quality(self, df) -> str:
+        """
+        Classifies the intraday environment as TRENDING, RANGE, CHOPPY, or UNKNOWN.
+
+        A professional sits out RANGE and CHOPPY days — options buying bleeds
+        theta on every losing small move. Only TRENDING days have the directional
+        persistence that makes long-options strategies profitable.
+
+        Returns: 'TRENDING' | 'RANGE' | 'CHOPPY' | 'UNKNOWN'
+        """
+        flags = self.config.get('trading_flags', {})
+        if not flags.get('enable_day_quality_filter', True):
+            return 'TRENDING'  # filter disabled → always allow
+
+        if df is None or len(df) < 8:
+            return 'UNKNOWN'
+
+        try:
+            # ADX — primary trend-strength indicator
+            adx = 0.0
+            if 'adx' in df.columns:
+                adx_val = df.iloc[-1].get('adx')
+                adx = float(adx_val) if adx_val is not None and not pd.isna(adx_val) else 0.0
+
+            # First-30-min range (first 6 bars × 5 min = 30 min from 9:15)
+            today = datetime.date.today()
+            if hasattr(df.index, 'date'):
+                today_bars = df[df.index.date == today]
+            else:
+                today_bars = df.tail(30)
+
+            first_30_range_pct = 0.0
+            if len(today_bars) >= 6:
+                h = float(today_bars.iloc[:6]['high'].max())
+                l = float(today_bars.iloc[:6]['low'].min())
+                o = float(today_bars.iloc[0]['open'])
+                if o > 0:
+                    first_30_range_pct = (h - l) / o * 100.0
+
+            # Direction-change count in last 12 bars (1 hour)
+            closes = df['close'].tail(13).values
+            direction_changes = sum(
+                1 for i in range(1, len(closes) - 1)
+                if (closes[i] > closes[i - 1]) != (closes[i + 1] > closes[i])
+            )
+
+            # Classification
+            if direction_changes >= 7:
+                quality = 'CHOPPY'
+            elif adx > 25 and first_30_range_pct > 0.3:
+                quality = 'TRENDING'
+            elif adx > 20:
+                quality = 'TRENDING'
+            elif first_30_range_pct < 0.25 and adx < 18:
+                quality = 'RANGE'
+            else:
+                quality = 'RANGE'
+
+            logging.info(
+                f"[DayQuality] {quality} — ADX={adx:.1f} "
+                f"first30_range={first_30_range_pct:.2f}% "
+                f"direction_changes={direction_changes}"
+            )
+            return quality
+        except Exception as e:
+            logging.debug(f"Day quality classification failed (non-fatal): {e}")
+            return 'UNKNOWN'
+
+    def _is_false_breakout(self, signal: str, df) -> bool:
+        """
+        Detects trap breakouts: signal fires on bar N but bar N+1 immediately
+        reverses back inside the prior bar's range — a classic stop-hunt pattern.
+
+        BUY trap : breakout bar closed above prior high but current bar closed back below it.
+        SELL trap: breakdown bar closed below prior low but current bar closed back above it.
+        """
+        flags = self.config.get('trading_flags', {})
+        if not flags.get('enable_trap_detection', True):
+            return False
+        if df is None or len(df) < 4:
+            return False
+        try:
+            prev_bar  = df.iloc[-3]
+            break_bar = df.iloc[-2]
+            curr_bar  = df.iloc[-1]
+            if signal == 'BUY':
+                if break_bar['close'] <= prev_bar['high']:
+                    return False  # wasn't a breakout bar
+                if curr_bar['close'] < prev_bar['high']:
+                    logging.warning(
+                        f"[TrapDetect] BUY trap — price reversed back below "
+                        f"prior high {prev_bar['high']:.2f}. Skipping entry."
+                    )
+                    return True
+            elif signal == 'SELL':
+                if break_bar['close'] >= prev_bar['low']:
+                    return False
+                if curr_bar['close'] > prev_bar['low']:
+                    logging.warning(
+                        f"[TrapDetect] SELL trap — price reversed back above "
+                        f"prior low {prev_bar['low']:.2f}. Skipping entry."
+                    )
+                    return True
+        except Exception as e:
+            logging.debug(f"Trap detection failed (non-fatal): {e}")
+        return False
+
+    def _time_of_day_size_factor(self) -> float:
+        """
+        Returns a position-size multiplier based on the current time of day.
+
+        Prime windows (institutional flow, second impulse) → 1.0 (full size).
+        Degraded windows (consolidation, lunch) → 0.5-0.75 (reduced size).
+        After 13:30 → 0.0 (no new entries; covered by entry_cutoff_time but
+        this acts as an additional safety layer).
+        """
+        flags = self.config.get('trading_flags', {})
+        if not flags.get('enable_time_of_day_sizing', True):
+            return 1.0
+
+        now = datetime.datetime.now().time()
+        if now >= datetime.time(13, 30):
+            return 0.0   # block — hard cutoff
+        elif datetime.time(9, 30) <= now < datetime.time(10, 15):
+            return 1.0   # prime: institutional open order flow
+        elif datetime.time(11, 30) <= now < datetime.time(12, 30):
+            return 1.0   # prime: second-impulse window
+        elif datetime.time(10, 15) <= now < datetime.time(11, 30):
+            return 0.75  # moderate: post-open consolidation
+        elif datetime.time(12, 30) <= now < datetime.time(13, 30):
+            return 0.50  # degraded: lunch drift
+        return 0.75      # pre-open edge case
+
     async def _is_vix_too_high(self) -> bool:
         max_vix = float(self.config['trading_flags'].get('max_vix_level', 0) or 0)
         if max_vix <= 0:
@@ -1040,6 +1199,29 @@ class TradingBotOrchestrator:
                     f"Continuing without CPR — strategies that need pivots will skip."
                 )
             
+            # --- Trading mode (MODERATE / AGGRESSIVE) ---
+            # Evaluated each setup() so the mode can step down after consecutive
+            # losses even mid-session (strategy reassessment triggers setup again).
+            _vix_for_mode = 0.0
+            try:
+                _vix_tok = self.market_condition_identifier.vix_token
+                _vix_data = await asyncio.to_thread(self.kite.ltp, str(_vix_tok))
+                _vix_for_mode = float((_vix_data or {}).get(str(_vix_tok), {}).get('last_price', 0))
+            except Exception:
+                pass
+            self._trading_mode = self.rag_service.get_trading_mode(vix_value=_vix_for_mode)
+            mode_cfg = self.config.get('mode_switching') or {}
+            if self._trading_mode == 'AGGRESSIVE':
+                eff_risk = float(mode_cfg.get('aggressive_risk_percent', 2.0))
+            else:
+                eff_risk = float(self.config['trading_flags'].get('risk_per_trade_percent', 1.0))
+            # Written onto the shared config dict — agents.py reads _effective_risk_pct.
+            self.config['trading_flags']['_effective_risk_pct'] = eff_risk
+            logging.info(
+                f"Trading mode: {self._trading_mode} "
+                f"(effective risk {eff_risk:.1f}% per trade)"
+            )
+
             self.bot_state = "AWAITING_SIGNAL"
             self.awaiting_signal_since = datetime.datetime.now() # Reset the reassessment timer
             logging.info(f"Setup complete. Active strategy: '{self.active_strategy.name}'.")
@@ -1537,20 +1719,37 @@ class TradingBotOrchestrator:
         self.realized_pnl_today += amount
         self.realized_pnl_week  += amount
 
-        # Update the consecutive-loss streak.
+        # Update the consecutive-loss streak and progressive size multiplier.
         if amount < 0:
             self.consecutive_losses += 1
             logging.warning(
                 f"[Risk] Consecutive losses: {self.consecutive_losses} "
                 f"(trade P&L={amount:,.2f})"
             )
+            # Progressive loss sizing — reduce size to protect capital.
+            if self.consecutive_losses == 1:
+                self._trade_size_multiplier = 0.5
+                logging.warning(
+                    "[ProSize] 1 consecutive loss: next trade size reduced to 50%."
+                )
+            elif self.consecutive_losses >= 2:
+                self._trade_size_multiplier = 0.25
+                logging.warning(
+                    f"[ProSize] {self.consecutive_losses} consecutive losses: "
+                    f"next trade size reduced to 25%. Requires stricter confirmation."
+                )
         elif amount > 0:
             if self.consecutive_losses > 0:
                 logging.info(
                     f"[Risk] Consecutive-loss streak broken after "
                     f"{self.consecutive_losses} loss(es) — resetting to 0."
                 )
+            if getattr(self, '_trade_size_multiplier', 1.0) < 1.0:
+                logging.info(
+                    "[ProSize] Winning trade: restoring full position size."
+                )
             self.consecutive_losses = 0
+            self._trade_size_multiplier = 1.0
 
         try:
             save_daily_pnl(self._today_str, self.realized_pnl_today)
@@ -1663,6 +1862,14 @@ class TradingBotOrchestrator:
                         self.bot_state = "STOPPED"; continue
                     if await self._is_weekly_loss_breached():
                         self.bot_state = "STOPPED"; continue
+                    if await self._is_daily_profit_target_hit():
+                        self.bot_state = "STOPPED"; continue
+                    # Time-of-day hard cutoff (13:30) — earlier than entry_cutoff_time
+                    # for new entries; protects against theta eating afternoon gains.
+                    if self._time_of_day_size_factor() == 0.0:
+                        logging.debug("Past 13:30 — no new entries allowed.")
+                        await asyncio.sleep(30)
+                        continue
                     max_trades = int(self.config['trading_flags']['max_trades_per_day'])
                     if getattr(self, "is_expiry_day", False):
                         exp_cfg = self.config.get('expiry_day_overrides', {}) or {}
@@ -1717,6 +1924,17 @@ class TradingBotOrchestrator:
                         vix_conditions=self.todays_conditions,
                     )
 
+                    # Day quality filter — only trade on TRENDING days.
+                    # RANGE and CHOPPY days bleed theta with no directional edge.
+                    self._day_quality = self._classify_day_quality(day_df_for_signal)
+                    if self._day_quality in ('RANGE', 'CHOPPY'):
+                        logging.warning(
+                            f"[DayQuality] {self._day_quality} day detected — "
+                            f"skipping new entries. Options buying needs trending conditions."
+                        )
+                        await asyncio.sleep(60)
+                        continue
+
                     if signal != 'HOLD':
                         # The strategy fired *something* — bumps the per-strategy
                         # signal counter so reassessment doesn't cool it down.
@@ -1752,7 +1970,24 @@ class TradingBotOrchestrator:
                                     f"(PCR={pcr_val:.3f if pcr_val else 'N/A'}). "
                                     f"PCR contradicts trade direction — skipping entry."
                                 )
+                            # Trap detection — skip false breakout/breakdown entries.
+                            elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
+                                pass  # already logged inside helper
                             else:
+                                # Inject professional size multiplier so the order
+                                # agent applies progressive loss sizing + time-of-day
+                                # weighting when computing quantity.
+                                tod_factor = self._time_of_day_size_factor()
+                                effective_multiplier = self._trade_size_multiplier * tod_factor
+                                self.config['_effective_risk_pct_multiplier'] = effective_multiplier
+                                if effective_multiplier < 1.0:
+                                    logging.info(
+                                        f"[ProSize] Effective size multiplier: "
+                                        f"{effective_multiplier:.2f} "
+                                        f"(loss_factor={self._trade_size_multiplier:.2f} × "
+                                        f"time_factor={tod_factor:.2f})"
+                                    )
+
                                 # 15-min confirmation gate — bypassed in force mode.
                                 _15m_ok = True
                                 _15m_reason = ""
