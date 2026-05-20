@@ -42,17 +42,32 @@ class BaseStrategy:
         if changed and (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
             logging.info(f"[{self.name}] HOLD: {reason}")
 
+    # ------------------------------------------------------------------
+    # Shared guard helpers — used by multiple strategies
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _bar_time(df, index) -> datetime.time:
-        """Return the time component of the bar at *index*."""
-        return df.index[index].time()
+        """Return the timestamp of bar `index` as a datetime.time (IST-naive)."""
+        try:
+            ts = df.index[index]
+            if hasattr(ts, 'tz') and ts.tz is not None:
+                ts = ts.tz_localize(None)
+            return ts.time()
+        except Exception:
+            return datetime.time(12, 0)   # fallback — middle of session
 
     @staticmethod
     def _bar_weekday(df, index) -> int:
-        """Return the ISO weekday (Mon=0 … Sun=6) of the bar at *index*."""
-        return df.index[index].weekday()
+        """Return weekday of bar `index` (Mon=0 … Fri=4)."""
+        try:
+            ts = df.index[index]
+            return ts.weekday()
+        except Exception:
+            return 0
 
     def _is_vix_high(self, kwargs: dict) -> bool:
+        """True when today's VIX regime tag is VIX_HIGH (set at setup time)."""
         return 'VIX_HIGH' in (kwargs.get('vix_conditions') or set())
 
     def _is_vix_low(self, kwargs: dict) -> bool:
