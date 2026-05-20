@@ -94,6 +94,32 @@ def persist_access_token(token: str, env_path: str = '.env'):
         f.writelines(lines)
     os.environ['ZERODHA_ACCESS_TOKEN'] = token
 
+class _StatusLineAwareHandler(logging.StreamHandler):
+    """
+    A StreamHandler that clears the live status line before emitting any log
+    record so log output never overlaps with the ticker. The status line is
+    redrawn by the 1-second ticker task on its next tick.
+
+    Only emits when the attached bot instance has an interactive TTY; otherwise
+    it falls through to the default handler behaviour so headless / file logs
+    are unaffected.
+    """
+
+    def __init__(self, bot: "TradingBotOrchestrator"):
+        super().__init__(sys.stderr)
+        self._bot = bot
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if self._bot._is_interactive_tty():
+                # Clear the status line first so the log starts at column 0.
+                sys.stderr.write(f"\r{' ' * 119}\r")
+                sys.stderr.flush()
+        except Exception:
+            pass
+        super().emit(record)
+
+
 class TradingBotOrchestrator:
     """
     The central orchestrator for the trading bot. Manages state, coordinates agents,
@@ -346,7 +372,7 @@ class TradingBotOrchestrator:
             equity = margins.get('equity', {}).get('available', {})
             cap = equity.get('live_balance') or equity.get('cash') or equity.get('net') or 0
             self.starting_capital = float(cap or 0)
-            logging.info(f"Starting capital snapshot: {self.starting_capital:,.2f}")
+            logging.debug(f"Starting capital snapshot: {self.starting_capital:,.2f}")
         except Exception as e:
             logging.warning(f"Could not snapshot starting capital: {e}")
             self.starting_capital = 0.0
@@ -416,7 +442,7 @@ class TradingBotOrchestrator:
                     * float(rm.get('max_daily_loss_percent', 2.5))
                     / 100.0
                 )
-                logging.info(
+                logging.debug(
                     f"Capital baseline refreshed: {prev:,.2f} -> {new_capital:,.2f} "
                     f"(new daily-loss limit: {limit:,.2f})"
                 )
@@ -975,7 +1001,7 @@ class TradingBotOrchestrator:
         if chosen == early_start and reason:
             logging.info(f"Early-entry override active: {reason}. Allowing entries from 09:15.")
         else:
-            logging.info(f"Effective entry start: {chosen.strftime('%H:%M')} (default).")
+            logging.debug(f"Effective entry start: {chosen.strftime('%H:%M')} (default).")
         return chosen
 
     def is_market_open(self):
@@ -1064,7 +1090,7 @@ class TradingBotOrchestrator:
         and strategy selection. This can also be called to re-assess the strategy.
         """
         self.bot_state = "SETUP"
-        logging.info("--- Running Bot Setup & Strategy Assessment ---")
+        logging.debug("--- Running Bot Setup & Strategy Assessment ---")
 
         # On reassessment runs (when a starting baseline already exists), refresh
         # capital so the strategy decision and any downstream gates work off
@@ -1114,7 +1140,7 @@ class TradingBotOrchestrator:
                 self._cached_sentiment = self.day_sentiment
                 await self._snapshot_sentiment_context()
             else:
-                logging.info(
+                logging.debug(
                     f"Reusing cached sentiment '{self._cached_sentiment}' — "
                     f"no material market shift since last capture."
                 )
@@ -1124,7 +1150,7 @@ class TradingBotOrchestrator:
                 self.no_trade_reason = "Market sentiment is Neutral. No new entries today."
                 return False
 
-            logging.info(f"Today's Market Conditions: {todays_conditions} | Final Sentiment: {self.day_sentiment}")
+            logging.debug(f"Today's Market Conditions: {todays_conditions} | Final Sentiment: {self.day_sentiment}")
 
             # 3. Get User Prompt — captured once when sentiment is captured. Reused
             # on subsequent reassessments unless we're refreshing (i.e. there was a
@@ -1160,14 +1186,14 @@ class TradingBotOrchestrator:
                 if trade_log_df is not None and not trade_log_df.empty:
                     trading_days = pd.to_datetime(trade_log_df['Timestamp']).dt.date.nunique()
                     if trading_days >= rag_min_days:
-                        logging.info(f"Sufficient historical data found ({trading_days} days). Activating RAG.")
+                        logging.debug(f"Sufficient historical data found ({trading_days} days). Activating RAG.")
                         rag_context = self.rag_service.retrieve_context_for_strategy_selection(todays_conditions)
                     else:
-                        logging.warning(f"RAG disabled: Insufficient data. Found {trading_days}, need {rag_min_days}.")
+                        logging.debug(f"RAG disabled: Insufficient data. Found {trading_days}, need {rag_min_days}.")
                 else:
-                    logging.warning("RAG disabled: No trade log found.")
+                    logging.debug("RAG disabled: No trade log found.")
             else:
-                logging.info("RAG is disabled in config.yaml.")
+                logging.debug("RAG is disabled in config.yaml.")
             
             # 5. Select Strategy — pass full context so the deterministic cascade
             # can apply hard pins / open-gap override / indicator overrides /
@@ -1270,9 +1296,9 @@ class TradingBotOrchestrator:
                     prior = day_df[day_df["date_only"] < today].tail(1)
                     if not prior.empty:
                         self.position_agent.cpr_pivots = calculate_cpr(prior)
-                        logging.info("CPR pivots calculated for the day.")
+                        logging.debug("CPR pivots calculated for the day.")
                     else:
-                        logging.warning(
+                        logging.debug(
                             "No prior-day data; CPR-dependent strategies will skip."
                         )
                 else:
@@ -1299,39 +1325,40 @@ class TradingBotOrchestrator:
 
             if self._trading_mode == 'AGGRESSIVE':
                 eff_risk = float(mode_cfg.get('aggressive_risk_percent', 2.0))
-                # Inject all aggressive overrides so agents pick them up without
-                # needing their own mode check.  Keys are prefixed _agg_ to make
-                # it clear they are runtime overrides, not static config values.
                 tf['_agg_max_trades']   = int(mode_cfg.get('aggressive_max_trades', 5))
                 tf['_agg_trail_pct']    = float(mode_cfg.get('aggressive_trail_pct', 20.0))
                 tf['_agg_t1_gain_pct']  = float(mode_cfg.get('aggressive_t1_gain_pct', 40.0))
                 tf['_agg_t2_gain_pct']  = float(mode_cfg.get('aggressive_t2_gain_pct', 80.0))
-                logging.info(
-                    f"[Mode] AGGRESSIVE — risk {eff_risk:.1f}%/trade  "
-                    f"max_trades {tf['_agg_max_trades']}  "
-                    f"trail {tf['_agg_trail_pct']:.0f}%  "
-                    f"T1/T2 targets +{tf['_agg_t1_gain_pct']:.0f}%/+{tf['_agg_t2_gain_pct']:.0f}%"
-                )
             else:
                 eff_risk = float(tf.get('risk_per_trade_percent', 1.0))
-                # Clear any leftover aggressive overrides so the bot falls back to
-                # the static config values on every MODERATE evaluation.
                 for _k in ('_agg_max_trades', '_agg_trail_pct', '_agg_t1_gain_pct', '_agg_t2_gain_pct'):
                     tf.pop(_k, None)
-                logging.info(
-                    f"[Mode] MODERATE — risk {eff_risk:.1f}%/trade  "
-                    f"max_trades {tf.get('max_trades_per_day', 3)}  "
-                    f"trail {self.config.get('trailing_stop_loss', {}).get('percentage', 15.0):.0f}%  "
-                    f"T1/T2 targets +{self.config.get('partial_exits', {}).get('t1_gain_pct', 30):.0f}%"
-                    f"/+{self.config.get('partial_exits', {}).get('t2_gain_pct', 60):.0f}%"
-                )
 
             # Written into trading_flags — agents.py reads _effective_risk_pct from flags.
             tf['_effective_risk_pct'] = eff_risk
 
             self.bot_state = "AWAITING_SIGNAL"
-            self.awaiting_signal_since = datetime.datetime.now() # Reset the reassessment timer
-            logging.info(f"Setup complete. Active strategy: '{self.active_strategy.name}'.")
+            self.awaiting_signal_since = datetime.datetime.now()
+
+            # ── Setup-complete banner (replaces the wall of individual INFO logs) ──
+            _conds_str  = ', '.join(sorted(todays_conditions)) if todays_conditions else '—'
+            _cap        = self.starting_capital or 0
+            _max_t      = tf.get('_agg_max_trades') or tf.get('max_trades_per_day', 3)
+            _trail      = tf.get('_agg_trail_pct') or self.config.get('trailing_stop_loss', {}).get('percentage', 15.0)
+            _t1         = tf.get('_agg_t1_gain_pct') or self.config.get('partial_exits', {}).get('t1_gain_pct', 30)
+            _t2         = tf.get('_agg_t2_gain_pct') or self.config.get('partial_exits', {}).get('t2_gain_pct', 60)
+            _entry_s    = (self.effective_entry_start_time or datetime.time(9, 30)).strftime('%H:%M')
+            _is_re      = self.starting_capital is not None  # True on reassessment runs
+            _banner_hdr = "RE-ASSESSMENT" if _is_re else "SETUP COMPLETE"
+            self._print_event([
+                f"{_banner_hdr}  {datetime.datetime.now().strftime('%H:%M:%S')}",
+                f"  Strategy   : {self.active_strategy.name}",
+                f"  Sentiment  : {self.day_sentiment}  │  Conditions: {_conds_str}",
+                f"  Mode       : {self._trading_mode}  │  Risk/trade: {eff_risk:.1f}%  │  Max trades: {_max_t}",
+                f"  Targets    : T1 +{_t1:.0f}%  T2 +{_t2:.0f}%  Trail {_trail:.0f}%",
+                f"  Capital    : ₹{_cap:,.0f}  │  Entry from {_entry_s}  │  Cutoff 13:30",
+            ], level="info")
+
             return True
         except Exception as e:
             logging.error(f"Setup failed: {e}", exc_info=True)
@@ -1340,38 +1367,130 @@ class TradingBotOrchestrator:
 
     @staticmethod
     def _is_interactive_tty() -> bool:
-        """True only if stdin is connected to a real terminal — never block on input() in headless runs."""
+        """True only if stdin is connected to a real terminal."""
         try:
             return sys.stdin is not None and sys.stdin.isatty()
         except Exception:
             return False
 
-    def _print_status_line(self) -> None:
-        """Overwrite the current terminal line with a live waiting-timer.
+    # ------------------------------------------------------------------ #
+    #  Terminal UI helpers — live status line + clean event banners        #
+    # ------------------------------------------------------------------ #
 
-        Shows: timestamp | strategy | elapsed wait | current HOLD reason.
-        Only active while AWAITING_SIGNAL in an interactive TTY so log files
-        and headless runs are unaffected.
-        """
-        if not self._is_interactive_tty() or self.bot_state != "AWAITING_SIGNAL":
-            return
-        now = datetime.datetime.now()
-        elapsed = "00:00"
-        if self.awaiting_signal_since:
-            secs = max(0, int((now - self.awaiting_signal_since).total_seconds()))
-            elapsed = f"{secs // 60:02d}:{secs % 60:02d}"
-        strategy = self.active_strategy_name or "—"
-        hold_reason = ""
-        if self.active_strategy and self.active_strategy._last_hold_reason:
-            hold_reason = self.active_strategy._last_hold_reason
-        line = f"[{now.strftime('%H:%M:%S')}]  {strategy}  |  waiting {elapsed}  |  {hold_reason}"
+    def _terminal_width(self) -> int:
         try:
             import shutil
-            width = shutil.get_terminal_size(fallback=(120, 24)).columns - 1
+            return shutil.get_terminal_size(fallback=(120, 24)).columns - 1
         except Exception:
-            width = 119
-        # Pad to full width so previous longer lines are fully overwritten.
-        print(f"\r{line[:width].ljust(width)}", end="", flush=True)
+            return 119
+
+    def _clear_status_line(self) -> None:
+        """Erase the current status line so a log message can print cleanly."""
+        if not self._is_interactive_tty():
+            return
+        print(f"\r{' ' * self._terminal_width()}\r", end="", flush=True)
+
+    def _print_status_line(self) -> None:
+        """
+        Overwrite the current terminal line with a rich live-status ticker.
+
+        AWAITING_SIGNAL:
+          ⏳ HH:MM:SS  AWAITING │ Strategy │ MODE │ Sentiment │ DayQuality │ P&L │ ⏱ mm:ss │ hold: …
+
+        IN_POSITION:
+          📈 HH:MM:SS  IN TRADE │ Symbol │ entry ₹X │ trail ₹Y │ P&L today ₹Z
+
+        STOPPED / SETUP:
+          ⏹  HH:MM:SS  STOPPED / ⚙ SETTING UP
+
+        Only active on interactive TTY; log files and headless runs are unaffected.
+        """
+        if not self._is_interactive_tty():
+            return
+
+        now = datetime.datetime.now()
+        ts  = now.strftime('%H:%M:%S')
+        w   = self._terminal_width()
+
+        state = self.bot_state
+
+        if state == "AWAITING_SIGNAL":
+            elapsed = "00:00"
+            if self.awaiting_signal_since:
+                secs    = max(0, int((now - self.awaiting_signal_since).total_seconds()))
+                elapsed = f"{secs // 60:02d}:{secs % 60:02d}"
+            strategy = self.active_strategy_name or "—"
+            mode     = getattr(self, '_trading_mode', 'MODERATE')
+            sent     = (getattr(self, 'day_sentiment', '') or '—')[:10]
+            dq       = getattr(self, '_day_quality', '') or ''
+            dq_part  = f" │ {dq}" if dq and dq not in ('UNKNOWN', 'TRENDING') else ""
+            pnl      = getattr(self, 'realized_pnl_today', 0.0) or 0.0
+            pnl_str  = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
+            trades   = getattr(self, 'trades_today_count', 0)
+            hold_reason = ""
+            if self.active_strategy and getattr(self.active_strategy, '_last_hold_reason', ''):
+                hold_reason = f" │ {self.active_strategy._last_hold_reason[:60]}"
+            line = (
+                f"⏳ {ts}  AWAITING │ {strategy} │ {mode} │ {sent}{dq_part}"
+                f" │ {pnl_str} ({trades}T) │ ⏱ {elapsed}{hold_reason}"
+            )
+
+        elif state == "IN_POSITION":
+            trade   = (getattr(self, 'position_agent', None) and
+                       self.position_agent.active_trade) or {}
+            symbol  = trade.get('symbol', '—')
+            entry   = trade.get('entry_price', 0)
+            trail   = trade.get('trailing_stop_loss', 0)
+            pnl     = getattr(self, 'realized_pnl_today', 0.0) or 0.0
+            pnl_str = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
+            entry_s = f"entry ₹{entry:.2f}" if entry else ""
+            trail_s = f" │ trail ₹{trail:.2f}" if trail else ""
+            line = (
+                f"📈 {ts}  IN TRADE │ {symbol} │ {entry_s}{trail_s}"
+                f" │ P&L today {pnl_str}"
+            )
+
+        elif state == "SETUP":
+            line = f"⚙  {ts}  SETTING UP  …"
+
+        elif state == "STOPPED":
+            pnl     = getattr(self, 'realized_pnl_today', 0.0) or 0.0
+            pnl_str = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
+            line    = f"⏹  {ts}  STOPPED  │  P&L today {pnl_str}"
+
+        else:
+            line = f"   {ts}  {state}"
+
+        print(f"\r{line[:w].ljust(w)}", end="", flush=True)
+
+    def _print_event(self, lines: list, level: str = "info") -> None:
+        """
+        Print a clean bordered event banner to the terminal, compatible with
+        the live status line. The status line is cleared before and redrawn after.
+
+        `level` controls the left-border char: info="─", warn="!", error="✗", trade="▶"
+        """
+        if not self._is_interactive_tty():
+            return
+        self._clear_status_line()
+        border_char = {"info": "─", "warn": "!", "error": "✗", "trade": "▶"}.get(level, "─")
+        w = min(self._terminal_width(), 76)
+        sep = border_char * w
+        print(sep)
+        for ln in lines:
+            print(f"  {ln}")
+        print(sep, flush=True)
+        # Status line will be redrawn by the ticker on the next 1-second tick.
+
+    async def _run_ticker(self) -> None:
+        """Background coroutine: refreshes the status line every second."""
+        try:
+            while True:
+                self._print_status_line()
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            self._clear_status_line()
+            raise
 
     async def _input_with_timeout(self, prompt: str, timeout: float = 20.0):
         """
@@ -1877,18 +1996,43 @@ class TradingBotOrchestrator:
             print("\n" + "=" * 78)
             print(f"  Pre-market start at {now_str} — running setup ahead of 09:15 open.")
             print("=" * 78)
-            logging.info("Started during pre-market window; running setup in advance.")
+
+        # Install a log handler that clears the status line before every log
+        # message so multi-line logs don't overlap the live status ticker.
+        _root_logger = logging.getLogger()
+        _status_handler = _StatusLineAwareHandler(self)
+        _status_handler.setFormatter(logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s'
+        ))
+        _root_logger.addHandler(_status_handler)
+
+        # Remove the default StreamHandler so messages aren't printed twice.
+        _orig_handlers = [h for h in _root_logger.handlers if h is not _status_handler]
+        for h in _orig_handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                _root_logger.removeHandler(h)
+
+        # Start the 1-second status ticker.
+        ticker = asyncio.ensure_future(self._run_ticker())
 
         try:
             await self._run_inner()
         except (KeyboardInterrupt, asyncio.CancelledError, SystemExit) as e:
-            logging.info(f"Bot shutdown signal: {type(e).__name__}.")
+            self._clear_status_line()
+            print(f"\nBot stopped: {type(e).__name__}.")
         except Exception as e:
             logging.error(f"Unhandled exception in run(): {e}", exc_info=True)
         finally:
-            # Always send the daily report on exit — Ctrl+C, token expiry,
-            # daily-loss breach, crash, normal market close. Whatever trades
-            # happened today get emailed; if none, a "no trades" report goes out.
+            ticker.cancel()
+            try:
+                await ticker
+            except asyncio.CancelledError:
+                pass
+            # Restore original handlers.
+            _root_logger.removeHandler(_status_handler)
+            for h in _orig_handlers:
+                _root_logger.addHandler(h)
+            # Always send the daily report on exit.
             self._send_shutdown_report_once()
 
     async def _run_inner(self):
@@ -1951,7 +2095,7 @@ class TradingBotOrchestrator:
         await self._compute_effective_entry_start()
 
         is_paper = self.config['trading_flags']['paper_trading']
-        logging.info(f"Bot running in {'PAPER TRADING' if is_paper else 'LIVE TRADING'} mode.")
+        logging.debug(f"Bot running in {'PAPER TRADING' if is_paper else 'LIVE TRADING'} mode.")
         if resumed:
             self.bot_state = "IN_POSITION"
             logging.info("Resuming management of pre-existing position.")
