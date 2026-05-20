@@ -201,9 +201,15 @@ trailing_stop_loss:
 mode_switching:
   enable: true
   lookback_trades: 5              # evaluate this many recent trades for the mode decision
-  aggressive_risk_percent: 2.0   # risk_per_trade_percent when AGGRESSIVE (vs 1.0 default)
+  # --- AGGRESSIVE thresholds ---
   aggressive_trigger_wins: 3     # wins needed in lookback window to go AGGRESSIVE
   aggressive_max_drawdown: 0.05  # max equity drawdown while staying AGGRESSIVE (5%)
+  aggressive_risk_percent: 2.0   # risk_per_trade_percent when AGGRESSIVE (vs 1.0 default)
+  aggressive_max_trades: 5       # max trades/day in AGGRESSIVE mode (vs 3 in MODERATE)
+  aggressive_trail_pct: 20.0     # base trailing-stop % in AGGRESSIVE (vs 15%)
+  aggressive_t1_gain_pct: 40.0   # T1 profit target in AGGRESSIVE (vs 30%)
+  aggressive_t2_gain_pct: 80.0   # T2 profit target in AGGRESSIVE (vs 60%)
+  # --- MODERATE thresholds ---
   moderate_trigger_losses: 2     # consecutive losses to force MODERATE
   moderate_drawdown: 0.08        # equity drawdown threshold to force MODERATE (8%)
   moderate_vix_threshold: 18.0   # VIX level that blocks AGGRESSIVE mode

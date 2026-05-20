@@ -1211,16 +1211,39 @@ class TradingBotOrchestrator:
                 pass
             self._trading_mode = self.rag_service.get_trading_mode(vix_value=_vix_for_mode)
             mode_cfg = self.config.get('mode_switching') or {}
+            tf = self.config['trading_flags']
+
             if self._trading_mode == 'AGGRESSIVE':
                 eff_risk = float(mode_cfg.get('aggressive_risk_percent', 2.0))
+                # Inject all aggressive overrides so agents pick them up without
+                # needing their own mode check.  Keys are prefixed _agg_ to make
+                # it clear they are runtime overrides, not static config values.
+                tf['_agg_max_trades']   = int(mode_cfg.get('aggressive_max_trades', 5))
+                tf['_agg_trail_pct']    = float(mode_cfg.get('aggressive_trail_pct', 20.0))
+                tf['_agg_t1_gain_pct']  = float(mode_cfg.get('aggressive_t1_gain_pct', 40.0))
+                tf['_agg_t2_gain_pct']  = float(mode_cfg.get('aggressive_t2_gain_pct', 80.0))
+                logging.info(
+                    f"[Mode] AGGRESSIVE — risk {eff_risk:.1f}%/trade  "
+                    f"max_trades {tf['_agg_max_trades']}  "
+                    f"trail {tf['_agg_trail_pct']:.0f}%  "
+                    f"T1/T2 targets +{tf['_agg_t1_gain_pct']:.0f}%/+{tf['_agg_t2_gain_pct']:.0f}%"
+                )
             else:
-                eff_risk = float(self.config['trading_flags'].get('risk_per_trade_percent', 1.0))
-            # Written onto the shared config dict — agents.py reads _effective_risk_pct.
-            self.config['trading_flags']['_effective_risk_pct'] = eff_risk
-            logging.info(
-                f"Trading mode: {self._trading_mode} "
-                f"(effective risk {eff_risk:.1f}% per trade)"
-            )
+                eff_risk = float(tf.get('risk_per_trade_percent', 1.0))
+                # Clear any leftover aggressive overrides so the bot falls back to
+                # the static config values on every MODERATE evaluation.
+                for _k in ('_agg_max_trades', '_agg_trail_pct', '_agg_t1_gain_pct', '_agg_t2_gain_pct'):
+                    tf.pop(_k, None)
+                logging.info(
+                    f"[Mode] MODERATE — risk {eff_risk:.1f}%/trade  "
+                    f"max_trades {tf.get('max_trades_per_day', 3)}  "
+                    f"trail {self.config.get('trailing_stop_loss', {}).get('percentage', 15.0):.0f}%  "
+                    f"T1/T2 targets +{self.config.get('partial_exits', {}).get('t1_gain_pct', 30):.0f}%"
+                    f"/+{self.config.get('partial_exits', {}).get('t2_gain_pct', 60):.0f}%"
+                )
+
+            # Written into trading_flags — agents.py reads _effective_risk_pct from flags.
+            tf['_effective_risk_pct'] = eff_risk
 
             self.bot_state = "AWAITING_SIGNAL"
             self.awaiting_signal_since = datetime.datetime.now() # Reset the reassessment timer
@@ -1870,7 +1893,10 @@ class TradingBotOrchestrator:
                         logging.debug("Past 13:30 — no new entries allowed.")
                         await asyncio.sleep(30)
                         continue
-                    max_trades = int(self.config['trading_flags']['max_trades_per_day'])
+                    # AGGRESSIVE mode can raise the daily trade cap; expiry day
+                    # overrides always take the minimum (tightest) of all limits.
+                    tf = self.config['trading_flags']
+                    max_trades = int(tf.get('_agg_max_trades') or tf['max_trades_per_day'])
                     if getattr(self, "is_expiry_day", False):
                         exp_cfg = self.config.get('expiry_day_overrides', {}) or {}
                         if exp_cfg.get('enable', True):

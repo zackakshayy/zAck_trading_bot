@@ -1137,11 +1137,11 @@ class OrderExecutionAgent:
                 logging.error(f"Could not determine available capital from margins: {equity}")
                 return None, 0, 0
 
-            # Base risk percentage: honour a runtime override injected into the
-            # shared config dict (key "_effective_risk_pct") so the orchestrator
-            # can dial risk up/down mid-session without touching flags.
+            # Base risk percentage: honour a runtime override injected into
+            # trading_flags by setup() each session (AGGRESSIVE / MODERATE mode
+            # switching, manual override). Falls back to the static config value.
             risk_pct = float(
-                self.config.get("_effective_risk_pct")
+                self.flags.get("_effective_risk_pct")
                 or self.flags["risk_per_trade_percent"]
             )
             # Continuous DTE scaling supersedes the old binary expiry_risk_factor.
@@ -1539,11 +1539,20 @@ class PositionManagementAgent:
           < T1 threshold  → base trail %   (loose, give the trade room)
           T1 → T2         → 8%             (moderate — first partial already booked)
           > T2            → 5%             (tight — runner is free money)
+
+        In AGGRESSIVE mode the base trail is wider (default 20% vs 15%) so the
+        trade gets more room before being stopped out — matching the higher-risk
+        profile of that mode.
         """
         pe_cfg = self.config.get('partial_exits') or {}
-        t1_gain = float(pe_cfg.get('t1_gain_pct', 30)) / 100.0
-        t2_gain = float(pe_cfg.get('t2_gain_pct', 60)) / 100.0
-        base_pct = float(self.tsl_config.get('percentage', 15.0))
+        flags  = self.config.get('trading_flags', {})
+
+        # Use T1/T2 gain targets from the active mode (aggressive overrides static config).
+        t1_gain = float(flags.get('_agg_t1_gain_pct', pe_cfg.get('t1_gain_pct', 30))) / 100.0
+        t2_gain = float(flags.get('_agg_t2_gain_pct', pe_cfg.get('t2_gain_pct', 60))) / 100.0
+
+        # Base trail: aggressive mode uses a wider % to give winners more room.
+        base_pct = float(flags.get('_agg_trail_pct') or self.tsl_config.get('percentage', 15.0))
 
         entry = float(self.active_trade.get('entry_price', 0) or 0)
         if entry <= 0:
@@ -1698,13 +1707,16 @@ class PositionManagementAgent:
             return None
 
         pe_cfg = self.config.get('partial_exits') or {}
+        flags  = self.config.get('trading_flags', {})
         entry       = float(trade['entry_price'])
         orig_qty    = int(trade['_pe_original_qty'])
         lot_size    = int(trade.get('lot_size', 1) or 1)
         remaining   = int(trade.get('quantity', 0))
 
-        t1_pct      = float(pe_cfg.get('t1_gain_pct', 30)) / 100.0
-        t2_pct      = float(pe_cfg.get('t2_gain_pct', 60)) / 100.0
+        # In AGGRESSIVE mode, let winners run further before booking partials.
+        # _agg_t1/t2_gain_pct are injected by setup() when mode = AGGRESSIVE.
+        t1_pct      = float(flags.get('_agg_t1_gain_pct', pe_cfg.get('t1_gain_pct', 30))) / 100.0
+        t2_pct      = float(flags.get('_agg_t2_gain_pct', pe_cfg.get('t2_gain_pct', 60))) / 100.0
         t1_frac     = float(pe_cfg.get('t1_exit_pct', 40)) / 100.0
         t2_frac     = float(pe_cfg.get('t2_exit_pct', 40)) / 100.0
 
