@@ -118,14 +118,19 @@ class YouTubeSentimentAgent:
             return self._verdicts
 
         verdicts = []
-        for ch in self.channels:
+        for idx, ch in enumerate(self.channels):
+            # Small inter-channel delay so back-to-back Gemini calls don't
+            # immediately hit the free-tier RPM cap (15 req/min on flash).
+            if idx > 0:
+                await asyncio.sleep(5)
             try:
                 v = await self._process_channel(ch)
                 if v:
                     verdicts.append(v)
             except Exception as e:
                 logging.warning(
-                    f"YouTubeSentiment: channel {ch.get('handle','?')} failed: {e}"
+                    f"YouTubeSentiment: channel {ch.get('handle','?')} failed: "
+                    f"{self._sanitize_error(e)}"
                 )
 
         self._verdicts = verdicts
@@ -391,6 +396,19 @@ class YouTubeSentimentAgent:
                 keep.append(entry.get("text") or "")
         return " ".join(keep)
 
+    # ---------- helpers ----------
+
+    def _sanitize_error(self, err: Exception) -> str:
+        """
+        Strip the Gemini API key from aiohttp exception messages before logging.
+        aiohttp embeds the full request URL (including ?key=...) in its exception
+        repr, which would leak the key to log files / stdout.
+        """
+        msg = str(err)
+        if self.gemini_api_key and self.gemini_api_key in msg:
+            msg = msg.replace(self.gemini_api_key, "****")
+        return msg
+
     # ---------- Gemini extraction ----------
 
     async def _extract_verdict(self, cleaned_text: str, video: dict,
@@ -439,7 +457,8 @@ Transcript:
 {cleaned_text}
 """
 
-        url = (
+        # Keep the key out of any log: build URL separately, never log it.
+        gemini_url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.gemini_model}:generateContent?key={self.gemini_api_key}"
         )
@@ -450,17 +469,54 @@ Transcript:
                 "temperature": 0.2,
             },
         }
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as s:
-                async with s.post(url, json=payload) as resp:
-                    resp.raise_for_status()
-                    result = await resp.json()
-            text = result["candidates"][0]["content"]["parts"][0]["text"]
-            verdict_data = json.loads(text)
-        except Exception as e:
+
+        # Retry with exponential backoff on 429 (rate-limit).
+        # Other HTTP errors (4xx that aren't 429, 5xx) abort immediately.
+        _MAX_RETRIES   = 3
+        _BACKOFF_BASE  = 15   # seconds — generous gap for free-tier RPM reset
+        video_title = video.get("title", "?")
+        verdict_data = None
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=45)
+                ) as session:
+                    async with session.post(gemini_url, json=payload) as resp:
+                        if resp.status == 429:
+                            wait = _BACKOFF_BASE * (2 ** attempt)
+                            logging.warning(
+                                f"YouTubeSentiment: Gemini rate-limited (429) for "
+                                f"'{video_title}' — waiting {wait}s before retry "
+                                f"(attempt {attempt + 1}/{_MAX_RETRIES})."
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        resp.raise_for_status()
+                        result = await resp.json()
+
+                raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                verdict_data = json.loads(raw_text)
+                break  # success
+
+            except aiohttp.ClientResponseError as e:
+                # Sanitize: ClientResponseError includes the URL in its message.
+                logging.warning(
+                    f"YouTubeSentiment: Gemini HTTP error for '{video_title}': "
+                    f"status={e.status} message={e.message!r}"
+                )
+                return None
+            except Exception as e:
+                logging.warning(
+                    f"YouTubeSentiment: Gemini extraction failed for "
+                    f"'{video_title}': {self._sanitize_error(e)}"
+                )
+                return None
+
+        if verdict_data is None:
             logging.warning(
-                f"YouTubeSentiment: Gemini extraction failed for "
-                f"{video.get('title','?')}: {e}"
+                f"YouTubeSentiment: Gemini still rate-limited after "
+                f"{_MAX_RETRIES} retries for '{video_title}'. Skipping."
             )
             return None
 
