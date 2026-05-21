@@ -213,7 +213,7 @@ class PCRFeed:
                 "expiry":  nearest_expiry.strftime("%Y-%m-%d"),
                 "atm":     atm,
             }
-            logging.info(
+            logging.debug(
                 f"[PCRFeed] PCR={pcr:.3f} ({tag})  "
                 f"puts={total_put_oi:,}  calls={total_call_oi:,}  "
                 f"expiry={result['expiry']}  ATM={atm:.0f}  "

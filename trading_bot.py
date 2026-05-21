@@ -181,6 +181,7 @@ class TradingBotOrchestrator:
         # Professional risk controls
         self._trade_size_multiplier = 1.0   # reduced after losses, restored on wins
         self._day_quality = 'UNKNOWN'       # set each setup() call
+        self._last_reported_day_quality: str | None = None  # suppresses repeat DayQuality logs
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
@@ -724,7 +725,7 @@ class TradingBotOrchestrator:
             else:
                 quality = 'RANGE'
 
-            logging.info(
+            logging.debug(
                 f"[DayQuality] {quality} — ADX={adx:.1f} "
                 f"first30_range={first_30_range_pct:.2f}% "
                 f"direction_changes={direction_changes}"
@@ -2200,12 +2201,15 @@ class TradingBotOrchestrator:
                     #   RANGE    → scalp mode (VWAP/RSI-extreme, half-size, tight targets).
                     #   CHOPPY   → fully blocked; too many direction changes for any edge.
                     self._day_quality = self._classify_day_quality(day_df_for_signal)
+                    # Log day quality only when it changes — avoid repeating the
+                    # same line every 60 s while conditions are stable.
+                    if self._day_quality != self._last_reported_day_quality:
+                        logging.info(f"[DayQuality] → {self._day_quality}")
+                        self._last_reported_day_quality = self._day_quality
+
                     if self._day_quality == 'CHOPPY':
                         self._exit_range_scalp_mode()
-                        logging.warning(
-                            "[DayQuality] CHOPPY — too noisy for any entries (7+ "
-                            "direction changes). Waiting 60 s."
-                        )
+                        logging.debug("[DayQuality] CHOPPY — skipping entry, sleeping 60 s.")
                         await asyncio.sleep(60)
                         continue
                     elif self._day_quality == 'RANGE':
