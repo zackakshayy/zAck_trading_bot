@@ -1363,7 +1363,7 @@ class TradingBotOrchestrator:
             # go straight to STOPPED — no point waiting in AWAITING_SIGNAL all day.
             _now_time = datetime.datetime.now().time()
             _cutoff_dt = self._parse_hhmm(self.config['trading_flags'].get('entry_cutoff_time', '13:30'))
-            if _cutoff_dt and _now_time > _cutoff_dt.time():
+            if _cutoff_dt and _now_time > _cutoff_dt:
                 logging.warning(
                     f"Setup completed after entry cutoff "
                     f"({_now_time.strftime('%H:%M')} > {_cutoff_dt.strftime('%H:%M')}). "
