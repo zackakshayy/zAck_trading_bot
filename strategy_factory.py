@@ -40,7 +40,7 @@ class BaseStrategy:
         changed = reason != self._last_hold_reason
         self._last_hold_reason = reason
         if changed and (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
-            logging.info(f"[{self.name}] HOLD: {reason}")
+            logging.debug(f"[{self.name}] HOLD: {reason}")
 
     # ------------------------------------------------------------------
     # Shared guard helpers — used by multiple strategies

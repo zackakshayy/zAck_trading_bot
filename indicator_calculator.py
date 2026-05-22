@@ -15,6 +15,7 @@ _INDICATOR_COLS_TO_FFILL = (
     "vwap",
     "bb_upper", "bb_lower", "bb_mid", "bb_bandwidth", "bb_bandwidth_ma",
     "psar_long", "psar_short",
+    "adx",
 )
 
 
@@ -119,6 +120,15 @@ def calculate_all_indicators(df: pd.DataFrame, config: dict):
         df['bb_mid'] = bbands['BBM_20_2.0']
         df['bb_bandwidth'] = bbands['BBB_20_2.0']
         df['bb_bandwidth_ma'] = _safe_rolling_mean(df['bb_bandwidth'], window=20)
+
+    # ADX — trend strength indicator used by day-quality classification.
+    # Needs at least 28 bars to warm up (2 × period=14). Silently skipped on
+    # very short intraday windows where pandas_ta returns an empty result.
+    adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+    if adx_df is not None and not adx_df.empty:
+        adx_col = next((c for c in adx_df.columns if c.startswith('ADX_')), None)
+        if adx_col:
+            df['adx'] = adx_df[adx_col]
 
     # PSAR for indicator-based exits (long_psar = trailing stop for long positions).
     psar = ta.psar(df['high'], df['low'], df['close'], af=0.02, max_af=0.2)

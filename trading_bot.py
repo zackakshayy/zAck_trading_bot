@@ -182,6 +182,7 @@ class TradingBotOrchestrator:
         self._trade_size_multiplier = 1.0   # reduced after losses, restored on wins
         self._day_quality = 'UNKNOWN'       # set each setup() call
         self._last_reported_day_quality: str | None = None  # suppresses repeat DayQuality logs
+        self._last_reported_scalp_state: bool = False       # suppresses repeat RangeScalp logs
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
@@ -713,13 +714,18 @@ class TradingBotOrchestrator:
                 if (closes[i] > closes[i - 1]) != (closes[i + 1] > closes[i])
             )
 
-            # Classification
-            if direction_changes >= 7:
-                quality = 'CHOPPY'
+            # Classification.
+            # ADX overrides direction-changes so a genuinely trending day
+            # (institutional flow, strong impulse) isn't blocked just because
+            # price oscillated during a consolidation phase.
+            if adx > 20:
+                quality = 'TRENDING'
             elif adx > 25 and first_30_range_pct > 0.3:
                 quality = 'TRENDING'
-            elif adx > 20:
-                quality = 'TRENDING'
+            elif direction_changes >= 7 and adx < 20:
+                # Only CHOPPY when trend strength is also weak — prevents
+                # blocking a trending session with micro-oscillations.
+                quality = 'CHOPPY'
             elif first_30_range_pct < 0.25 and adx < 18:
                 quality = 'RANGE'
             else:
@@ -841,12 +847,15 @@ class TradingBotOrchestrator:
         size_factor = float(scalp_cfg.get('size_factor', 0.5))
         current_mult = float(self._trade_size_multiplier)
         tf['_effective_risk_pct_multiplier'] = current_mult * size_factor
-        logging.info(
-            f"[RangeScalp] Scalp mode active — strategy={self.active_strategy_name}  "
-            f"size={current_mult:.2f}×{size_factor:.2f}={current_mult*size_factor:.2f}  "
-            f"T1/T2 +{tf['_scalp_t1_gain_pct']:.0f}%/+{tf['_scalp_t2_gain_pct']:.0f}%  "
-            f"trail {tf['_scalp_trail_pct']:.0f}%"
-        )
+        # Log once when scalp mode first activates; suppress on every subsequent tick.
+        if not self._last_reported_scalp_state:
+            logging.info(
+                f"[RangeScalp] Scalp mode active — strategy={self.active_strategy_name}  "
+                f"size={current_mult:.2f}×{size_factor:.2f}={current_mult*size_factor:.2f}  "
+                f"T1/T2 +{tf['_scalp_t1_gain_pct']:.0f}%/+{tf['_scalp_t2_gain_pct']:.0f}%  "
+                f"trail {tf['_scalp_trail_pct']:.0f}%"
+            )
+            self._last_reported_scalp_state = True
         return True
 
     def _exit_range_scalp_mode(self):
@@ -857,6 +866,7 @@ class TradingBotOrchestrator:
             tf.pop(k, None)
         # Also clear the size override set by _enter_range_scalp_mode.
         tf.pop('_effective_risk_pct_multiplier', None)
+        self._last_reported_scalp_state = False  # reset so next entry logs once
 
     def _time_of_day_size_factor(self) -> float:
         """
@@ -864,15 +874,17 @@ class TradingBotOrchestrator:
 
         Prime windows (institutional flow, second impulse) → 1.0 (full size).
         Degraded windows (consolidation, lunch) → 0.5-0.75 (reduced size).
-        After 13:30 → 0.0 (no new entries; covered by entry_cutoff_time but
-        this acts as an additional safety layer).
+        After entry_cutoff_time → 0.0 (no new entries; additional safety layer
+        on top of the explicit cutoff check in the trading loop).
         """
         flags = self.config.get('trading_flags', {})
         if not flags.get('enable_time_of_day_sizing', True):
             return 1.0
 
+        # Read cutoff from config so it stays in sync with entry_cutoff_time.
+        cutoff = self._parse_hhmm(flags.get('entry_cutoff_time', '13:30')) or datetime.time(13, 30)
         now = datetime.datetime.now().time()
-        if now >= datetime.time(13, 30):
+        if now >= cutoff:
             return 0.0   # block — hard cutoff
         elif datetime.time(9, 30) <= now < datetime.time(10, 15):
             return 1.0   # prime: institutional open order flow
@@ -880,7 +892,7 @@ class TradingBotOrchestrator:
             return 1.0   # prime: second-impulse window
         elif datetime.time(10, 15) <= now < datetime.time(11, 30):
             return 0.75  # moderate: post-open consolidation
-        elif datetime.time(12, 30) <= now < datetime.time(13, 30):
+        elif datetime.time(12, 30) <= now < cutoff:
             return 0.50  # degraded: lunch drift
         return 0.75      # pre-open edge case
 
@@ -1357,13 +1369,13 @@ class TradingBotOrchestrator:
                 f"  Sentiment  : {self.day_sentiment}  │  Conditions: {_conds_str}",
                 f"  Mode       : {self._trading_mode}  │  Risk/trade: {eff_risk:.1f}%  │  Max trades: {_max_t}",
                 f"  Targets    : T1 +{_t1:.0f}%  T2 +{_t2:.0f}%  Trail {_trail:.0f}%",
-                f"  Capital    : ₹{_cap:,.0f}  │  Entry from {_entry_s}  │  Cutoff 13:30",
+                f"  Capital    : ₹{_cap:,.0f}  │  Entry from {_entry_s}  │  Cutoff 15:20",
             ], level="info")
 
             # Fix: if setup completed but we're already past the entry cutoff,
             # go straight to STOPPED — no point waiting in AWAITING_SIGNAL all day.
             _now_time = datetime.datetime.now().time()
-            _cutoff_dt = self._parse_hhmm(self.config['trading_flags'].get('entry_cutoff_time', '13:30'))
+            _cutoff_dt = self._parse_hhmm(self.config['trading_flags'].get('entry_cutoff_time', '15:20'))
             if _cutoff_dt and _now_time > _cutoff_dt:
                 logging.warning(
                     f"Setup completed after entry cutoff "
@@ -2152,10 +2164,11 @@ class TradingBotOrchestrator:
                         if not await self.setup():
                             self.bot_state = "STOPPED"; continue
 
-                    # Time-of-day hard cutoff (13:30) — earlier than entry_cutoff_time
+                    # Time-of-day hard cutoff — earlier than entry_cutoff_time
                     # for new entries; protects against theta eating afternoon gains.
                     if self._time_of_day_size_factor() == 0.0:
-                        logging.debug("Past 13:30 — no new entries allowed.")
+                        _cutoff_str = self.config['trading_flags'].get('entry_cutoff_time', '13:30')
+                        logging.debug(f"Past {_cutoff_str} — no new entries allowed.")
                         await asyncio.sleep(30)
                         continue
                     # AGGRESSIVE mode can raise the daily trade cap; expiry day
