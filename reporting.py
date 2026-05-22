@@ -10,6 +10,15 @@ from email.mime.text import MIMEText
 LOG_FILE = 'output/trade_log.xlsx'
 os.makedirs('output', exist_ok=True)
 
+_SORRY_BANNER = """
+<div style="background:#fff3cd;border:2px solid #e0a800;border-radius:8px;
+            padding:18px 24px;margin-bottom:24px;font-family:Arial,sans-serif;">
+  <p style="font-size:1.3em;margin:0 0 6px 0;">🙏 Sorry maine aapka loss karwa diya aaj,</p>
+  <p style="font-size:1.2em;margin:0 0 6px 0;">iska reason to sun lo please!!</p>
+  <p style="font-size:1.25em;font-weight:bold;margin:0;">Sorry Shaktimaan!! 😔</p>
+</div>
+"""
+
 def initialize_trade_log():
     """Creates the trade log Excel file with all necessary columns if it doesn't exist."""
     if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
@@ -91,6 +100,12 @@ def send_loss_analysis_email(config, report_text, trade):
         safe = (report_text or "").replace("<", "&lt;").replace(">", "&gt;")
         html = f"<html><body><pre>{safe}</pre></body></html>"
 
+    # Prepend apology banner — inject after <body> tag (or at the top if absent).
+    if "<body>" in html:
+        html = html.replace("<body>", f"<body>{_SORRY_BANNER}", 1)
+    else:
+        html = _SORRY_BANNER + html
+
     sym = trade.get('Symbol', '?')
     pnl = trade.get('ProfitLoss', 0)
     try:
@@ -150,7 +165,14 @@ def send_daily_report(config, date_str, no_trades_reason=None):
         
         # --- FIX: Generate segregated summary and get separate P/L values ---
         daily_html, live_pnl, paper_pnl = generate_daily_summary(df, today, no_trades_reason)
-        
+
+        # Prepend apology banner when live trades ended in a loss.
+        if live_pnl is not None and live_pnl < 0:
+            if "<body>" in daily_html:
+                daily_html = daily_html.replace("<body>", f"<body>{_SORRY_BANNER}", 1)
+            else:
+                daily_html = _SORRY_BANNER + daily_html
+
         # Build a dynamic subject line
         subject_parts = [f"Trading Report for {today.strftime('%d %b, %Y')}"]
         if live_pnl is not None:
