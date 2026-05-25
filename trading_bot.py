@@ -2270,7 +2270,7 @@ class TradingBotOrchestrator:
                                 pcr_val = (self._pcr_data or {}).get("pcr")
                                 logging.warning(
                                     f"PCR gate: {signal} blocked by {pcr_tag} "
-                                    f"(PCR={pcr_val:.3f if pcr_val else 'N/A'}). "
+                                    f"(PCR={f'{pcr_val:.3f}' if pcr_val else 'N/A'}). "
                                     f"PCR contradicts trade direction — skipping entry."
                                 )
                             # Trap detection — skip false breakout/breakdown entries.
