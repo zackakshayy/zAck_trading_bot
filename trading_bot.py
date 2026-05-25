@@ -2077,6 +2077,11 @@ class TradingBotOrchestrator:
             logging.warning(f"Reconciliation skipped: {e}")
             resumed = False
 
+        # Fetch capital BEFORE setup so the setup banner shows the real balance.
+        # _capture_starting_capital is safe pre-market — Zerodha margins API
+        # works at any time once the access token is valid.
+        await self._capture_starting_capital()
+
         if not await self.setup():
             logging.warning(f"Setup failed. Reason: {self.no_trade_reason or 'Unknown'}. Bot will exit.")
             return  # Finally block in run() will send the report.
@@ -2085,8 +2090,6 @@ class TradingBotOrchestrator:
         # historical signals before today's session starts. Uses an aligned date
         # window so the generated data falls within RAG's recency_window_days.
         await self._run_startup_backtest()
-
-        await self._capture_starting_capital()
 
         # ---------- Expiry-day detection + banner (no LTP needed; safe pre-market) ----------
         self.is_expiry_day = False
