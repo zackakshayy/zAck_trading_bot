@@ -54,40 +54,111 @@ MARKET_TERMS = [
     "FED rate", "repo rate", "Indian budget", "SEBI",
 ]
 
-# Post-fetch relevance filter. An article must contain at least ONE of these
-# substrings (case-insensitive) in title+description to be retained. Mix of
-# index/regulator names + first-name fragments of major constituents.
-_CONSTITUENT_FRAGMENTS = [c.lower().split()[0] for c in NIFTY_50_KEY_NAMES]
+# ---------------------------------------------------------------------------
+# Hard exclusion: non-financial topic keywords.
+# If ANY of these appear in title+description the article is dropped
+# immediately — before any anchor check. Prevents sports/entertainment
+# headlines from sneaking through via ambiguous weak anchors like "hero",
+# "sun", "trade deadline", "market for pitchers", etc.
+# ---------------------------------------------------------------------------
+NON_FINANCIAL_EXCLUSION_KEYWORDS = sorted([
+    # Sports — American
+    "baseball", "softball", "home run", "home runs", "innings", "pitcher",
+    "batter", "mlb ", "nfl ", "nba ", "nhl ", "mls ",
+    "touchdown", "quarterback", "nfl draft", "super bowl",
+    "world series", "playoffs", "batting average",
+    # Sports — general
+    "cricket match", "ipl match", "test match", "odi match",
+    "football match", "premier league", "champions league",
+    "la liga", "bundesliga", "serie a",
+    "tennis tournament", "wimbledon", "us open tennis",
+    "golf tournament", "pga tour", "masters golf",
+    "olympics", "commonwealth games", "asian games",
+    "world cup cricket", "t20 world cup",
+    "college softball", "college baseball", "ncaa",
+    # Entertainment / celebrity
+    "box office", "box-office", "film review", "movie review",
+    "box office collection", "bollywood gossip", "celebrity",
+    "award show", "grammy", "oscar", "golden globe", "emmy",
+    "music video", "album release", "concert tour",
+])
+
+# ---------------------------------------------------------------------------
+# Source domains that should NEVER contribute to market sentiment.
+# These are entertainment, sports, or general lifestyle outlets that
+# occasionally produce finance-tagged content but are structurally noisy.
+# ---------------------------------------------------------------------------
+EXCLUDED_SOURCE_DOMAINS = {
+    "yahoo.com/entertainment", "entertainment.yahoo.com",
+    "roundtable.io", "sports.yahoo.com",
+    "espn.com", "bleacherreport.com", "cbssports.com",
+    "nbcsports.com", "foxsports.com", "theathletic.com",
+    "sportskeeda.com", "scroll.in/field",
+    "people.com", "tmz.com", "eonline.com",
+}
+
+# ---------------------------------------------------------------------------
+# Post-fetch relevance filter.
+# ---------------------------------------------------------------------------
+# Safe multi-word fragments for constituents whose first word is a common
+# English word (sun, hero, tech, state, power, coal, asian).
+# These replace the naive split()[0] fragments for those companies so we
+# don't match "sun rises", "hero of the match", "tech startup", etc.
+_SAFE_MULTI_WORD = {
+    "sun pharma", "hero motocorp", "tech mahindra",
+    "state bank", "power grid", "coal india", "asian paints",
+    "tata consumer", "tata steel", "tata motors",
+    "jsw steel", "sbi life", "hdfc life", "hdfc bank",
+    "hcl tech", "bajaj finserv", "bajaj finance", "bajaj auto",
+    "eicher motors", "ultratech cement", "grasim industries",
+}
+
+# Single-word fragments are only kept for companies where the first word
+# is genuinely distinctive (won't match sports/entertainment noise).
+_SAFE_SINGLE_WORD_COMPANIES = {
+    "reliance", "infosys", "wipro", "cipla", "nestle",
+    "britannia", "maruti", "ongc", "ntpc", "kotak",
+    "indusind", "icici", "hdfc", "axis", "bharti",
+    "adani", "ambani", "mahindra", "bajaj", "tata",
+}
+_CONSTITUENT_FRAGMENTS = sorted(
+    _SAFE_MULTI_WORD | _SAFE_SINGLE_WORD_COMPANIES
+)
 
 # "Strong" anchors — substrings that on their own definitively place the article
 # in Nifty/India financial context. Articles containing any of these pass the
-# filter unconditionally.
+# filter unconditionally (after exclusion check).
 STRONG_ANCHORS = sorted(set([
     "nifty", "sensex", "bse", "nse", "rbi", "sebi",
     "fii flows", "dii flows", "dalal street",
     "indian markets", "indian economy", "indian stock",
     "indian shares", "indian equities", "rupee",
-    "ambani", "adani",
+    "ambani", "adani", "repo rate", "monetary policy",
+    "stock market india", "share market india",
 ]))
 
-# "Weak" anchors — single-word stock surnames that *may* appear in non-financial
-# contexts (e.g. "Bharti" as a person's name in a film). When only weak anchors
-# match, we additionally require a FINANCIAL_CONTEXT keyword in the same article.
+# "Weak" anchors — company names or India references that need FINANCIAL_CONTEXT
+# confirmation (2+ terms required now — raises the bar vs the old 1-term check).
 WEAK_ANCHORS = sorted(set([
-    "indian", "india", "mumbai", "tata", "bajaj", "mahindra",
+    "indian", "india", "mumbai", "dalal",
 ] + _CONSTITUENT_FRAGMENTS))
 
-# Financial-context keywords. Disambiguates weak anchors like "Tata" from a
-# personal surname to "Tata Motors / Tata Group". Article must contain at least
-# one of these alongside a weak anchor to qualify.
+# Financial-context keywords. Ambiguous words removed:
+#   "trade"   → appears as "trade deadline" in sports
+#   "market"  → appears as "player market" in sports
+#   "loss"    → appears as "team loss" in sports
+#   "results" → appears as "game results" in sports
+#   "rate"    → too generic
+# Kept only unambiguously financial terms.
 FINANCIAL_CONTEXT = sorted(set([
     "stock", "stocks", "shares", "share price", "equity", "equities",
-    "market", "markets", "index", "trading", "trader", "trade",
-    "earnings", "profit", "loss", "revenue", "results", "quarterly",
+    "earnings", "profit", "revenue", "quarterly results",
     "q1", "q2", "q3", "q4",
     "crore", "lakh", "rupee", "rupees", " rs ", "₹",
-    "bse", "nse", "ipo", "broker", "investor", "investment",
-    "bourse", "fund", "yield", "rate", "policy",
+    "ipo", "broker", "investor", "investment",
+    "bourse", "fund", "yield", "interest rate", "policy rate",
+    "nse", "bse", "sebi", "exchange", "listed", "valuation",
+    "dividend", "buyback", "stake", "shareholding", "portfolio",
 ]))
 
 # Convenience union for legacy callers.
@@ -156,22 +227,43 @@ class SentimentAgent:
     @staticmethod
     def _is_relevant(article: dict) -> bool:
         """
-        Strict two-tier relevance:
-          1. If a STRONG_ANCHOR matches -> keep.
-          2. Else if a WEAK_ANCHOR matches AND a FINANCIAL_CONTEXT term also
-             matches -> keep. (Disambiguates "Bharti's latest film" from
-             "Bharti Airtel beats Q4 estimates".)
+        Four-stage relevance gate:
+          0. Hard exclusion — drop if source domain is in EXCLUDED_SOURCE_DOMAINS
+             OR if any NON_FINANCIAL_EXCLUSION_KEYWORD appears in the text.
+             Eliminates sports/entertainment articles regardless of anchors.
+          1. Strong anchor — if a STRONG_ANCHOR matches, keep unconditionally.
+          2. Weak anchor + 2 financial-context terms — raises bar vs old 1-term
+             check so ambiguous words like "trade", "market", "loss" alone can't
+             let a sports article through.
           3. Else drop.
         """
+        # Stage 0a: block known non-financial source domains.
+        source_url = (article.get('url') or '').lower()
+        source_name = (article.get('source', {}).get('name') or '').lower()
+        if any(d in source_url or d in source_name for d in EXCLUDED_SOURCE_DOMAINS):
+            return False
+
         text = (
             (article.get('title') or '') + ' '
             + (article.get('description') or '') + ' '
             + (article.get('content') or '')
         ).lower()
+
+        # Stage 0b: hard-exclude non-financial topics (sports, entertainment).
+        if any(kw in text for kw in NON_FINANCIAL_EXCLUSION_KEYWORDS):
+            return False
+
+        # Stage 1: strong India/market anchor — keep unconditionally.
         if any(kw in text for kw in STRONG_ANCHORS):
             return True
+
+        # Stage 2: weak anchor must be accompanied by 2+ unambiguous financial
+        # terms (raised from 1 to avoid "trade deadline" / "market for pitchers"
+        # false positives from ambiguous single-word constituent fragments).
         if any(kw in text for kw in WEAK_ANCHORS):
-            return any(ctx in text for ctx in FINANCIAL_CONTEXT)
+            fin_matches = sum(1 for ctx in FINANCIAL_CONTEXT if ctx in text)
+            return fin_matches >= 2
+
         return False
 
     def _filter_relevant(self, articles: list) -> list:
