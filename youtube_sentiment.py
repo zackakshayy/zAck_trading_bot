@@ -536,9 +536,13 @@ Transcript:
         }
 
         # Retry with exponential backoff on 429 (rate-limit).
-        # Other HTTP errors (4xx that aren't 429, 5xx) abort immediately.
+        # Free-tier Gemini resets every 60s (15 RPM). Strategy:
+        #   attempt 1 → wait 20s (let the RPM window partially reset)
+        #   attempt 2 → wait 45s (more headroom)
+        #   attempt 3 → skip and return None so setup isn't blocked
+        # Other HTTP errors (4xx != 429, 5xx) abort immediately.
         _MAX_RETRIES   = 3
-        _BACKOFF_BASE  = 15   # seconds — generous gap for free-tier RPM reset
+        _BACKOFF_SECS  = [20, 45]   # waits before attempt 2 and 3; attempt 3 failing = skip
         video_title = video.get("title", "?")
         verdict_data = None
 
@@ -549,13 +553,20 @@ Transcript:
                 ) as session:
                     async with session.post(gemini_url, json=payload) as resp:
                         if resp.status == 429:
-                            wait = _BACKOFF_BASE * (2 ** attempt)
-                            logging.warning(
-                                f"YouTubeSentiment: Gemini rate-limited (429) for "
-                                f"'{video_title}' — waiting {wait}s before retry "
-                                f"(attempt {attempt + 1}/{_MAX_RETRIES})."
-                            )
-                            await asyncio.sleep(wait)
+                            if attempt < len(_BACKOFF_SECS):
+                                wait = _BACKOFF_SECS[attempt]
+                                logging.warning(
+                                    f"YouTubeSentiment: Gemini rate-limited (429) for "
+                                    f"'{video_title}' — waiting {wait}s before retry "
+                                    f"(attempt {attempt + 1}/{_MAX_RETRIES})."
+                                )
+                                await asyncio.sleep(wait)
+                            else:
+                                logging.warning(
+                                    f"YouTubeSentiment: Gemini still rate-limited after "
+                                    f"{_MAX_RETRIES} attempts for '{video_title}'. "
+                                    f"Skipping — news-only sentiment will be used today."
+                                )
                             continue
                         resp.raise_for_status()
                         result = await resp.json()

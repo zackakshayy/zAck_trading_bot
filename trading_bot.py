@@ -183,6 +183,7 @@ class TradingBotOrchestrator:
         self._day_quality = 'UNKNOWN'       # set each setup() call
         self._last_reported_day_quality: str | None = None  # suppresses repeat DayQuality logs
         self._last_reported_scalp_state: bool = False       # suppresses repeat RangeScalp logs
+        self._ticker_paused: bool = False                   # paused while operator types input
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
         # Signed open-gap % vs prior close (set by _compute_effective_entry_start
@@ -1509,10 +1510,13 @@ class TradingBotOrchestrator:
         # Status line will be redrawn by the ticker on the next 1-second tick.
 
     async def _run_ticker(self) -> None:
-        """Background coroutine: refreshes the status line every second."""
+        """Background coroutine: refreshes the status line every second.
+        Paused automatically while operator input is in progress so keystrokes
+        aren't overwritten by the live status line."""
         try:
             while True:
-                self._print_status_line()
+                if not self._ticker_paused:
+                    self._print_status_line()
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             self._clear_status_line()
@@ -1524,14 +1528,14 @@ class TradingBotOrchestrator:
         line, "" if the user just pressed Enter, or None if no input arrived
         within `timeout` seconds (the bot will then take its own decision).
 
-        Implementation note: uses POSIX select() in a worker thread so the
-        asyncio event loop stays responsive and no thread is leaked on timeout
-        (select doesn't consume any data — readline() is only called if input
-        is actually ready).
+        Pauses the status-line ticker while waiting so keystrokes aren't
+        overwritten by the 1-second refresh.
         """
         if not self._is_interactive_tty():
             return None  # headless: caller falls back to its default
 
+        self._ticker_paused = True
+        self._clear_status_line()
         print(prompt, end='', flush=True)
 
         def _wait_for_line():
@@ -1549,6 +1553,7 @@ class TradingBotOrchestrator:
             return line if line else None  # readline returns "" on EOF
 
         line = await asyncio.to_thread(_wait_for_line)
+        self._ticker_paused = False
         if line is None:
             print(f"\n  [no response in {int(timeout)}s — bot will take its own decision]")
             logging.info(f"Operator input timeout ({int(timeout)}s); bot using its own default.")
@@ -1710,8 +1715,16 @@ class TradingBotOrchestrator:
                 title = h["title"]
                 if len(title) > 100:
                     title = title[:97] + "..."
-                src = f"  ({h['source']})" if h.get("source") else ""
-                print(f"  {marker} {p:+.3f}  {title}{src}")
+                src = h.get("source") or ""
+                pub = h.get("published_at") or ""
+                try:
+                    pub_fmt = datetime.datetime.fromisoformat(
+                        pub.replace("Z", "+00:00")
+                    ).strftime("%d %b %H:%M")
+                except Exception:
+                    pub_fmt = ""
+                meta = f"  ({src}{', ' + pub_fmt if pub_fmt else ''})" if src or pub_fmt else ""
+                print(f"  {marker} {p:+.3f}  {title}{meta}")
             print("-" * 78)
             print(f"  {len(headlines)} headlines analysed:  +{n_pos} bullish  {n_neg} bearish  ~{n_neu} neutral")
             print("=" * 78)
