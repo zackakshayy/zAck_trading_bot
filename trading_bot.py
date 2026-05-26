@@ -2223,6 +2223,7 @@ class TradingBotOrchestrator:
                         day_df_for_signal, self.day_sentiment,
                         cpr_pivots=self.position_agent.cpr_pivots,
                         vix_conditions=self.todays_conditions,
+                        is_expiry_day=getattr(self, "is_expiry_day", False),
                     )
 
                     # Day quality filter.
