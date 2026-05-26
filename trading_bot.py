@@ -228,6 +228,10 @@ class TradingBotOrchestrator:
         self._force_mode_armed = bool(
             (config.get('trading_flags') or {}).get('force_one_trade_today', False)
         )
+        # Rate-limit the "invalid input" warning so a typo doesn't spam the log.
+        self._last_stdin_override_warn: float = 0.0
+        # Printed once after the first sentiment lock-in; not repeated on refreshes.
+        self._override_hint_shown: bool = False
 
     def authenticate(self, request_token_override=None):
         """
@@ -1153,6 +1157,11 @@ class TradingBotOrchestrator:
                 self.day_sentiment = await self._resolve_sentiment()
                 self._cached_sentiment = self.day_sentiment
                 await self._snapshot_sentiment_context()
+                # Print the mid-session override hint once per session so
+                # the operator knows they can change sentiment at any time.
+                if not self._override_hint_shown:
+                    self._print_override_hint()
+                    self._override_hint_shown = True
             else:
                 logging.debug(
                     f"Reusing cached sentiment '{self._cached_sentiment}' — "
@@ -1560,6 +1569,103 @@ class TradingBotOrchestrator:
             return None
         return line.rstrip("\n").strip()
 
+    # ------------------------------------------------------------------ #
+    #  Mid-session sentiment override                                      #
+    # ------------------------------------------------------------------ #
+    _VALID_SENTIMENTS: set = {"Very Bullish", "Bullish", "Neutral", "Bearish", "Very Bearish"}
+    _SENTIMENT_BY_NORM: dict = {
+        " ".join(s.split()).lower(): s
+        for s in {"Very Bullish", "Bullish", "Neutral", "Bearish", "Very Bearish"}
+    }
+
+    async def _check_mid_session_override(self) -> "str | None":
+        """
+        Non-blocking check for a mid-session sentiment override. Called at the
+        start of every AWAITING_SIGNAL iteration.
+
+        Two sources (checked in order):
+          1. File  — create  output/sentiment_override.txt  and write the
+                     desired sentiment (e.g. 'Bullish'). The bot reads it,
+                     applies it, and deletes the file.
+          2. Stdin — while the bot is running, just type a sentiment and press
+                     Enter in the same terminal. The loop's non-blocking select()
+                     picks it up on the next iteration without interrupting the
+                     status line. Type '?' + Enter to print valid options.
+
+        Returns the canonical sentiment string when an override is pending,
+        otherwise None. Caller is responsible for applying the new value.
+        """
+        # ── 1. File sentinel (works headless / remote) ──────────────────
+        override_file = os.path.join("output", "sentiment_override.txt")
+        if os.path.exists(override_file):
+            try:
+                raw = open(override_file).read().strip()
+                try:
+                    os.remove(override_file)
+                except OSError:
+                    pass
+            except Exception as _fe:
+                logging.debug(f"[SentimentOverride] Could not read override file: {_fe}")
+                raw = ""
+            if raw:
+                canonical = self._SENTIMENT_BY_NORM.get(" ".join(raw.split()).lower())
+                if canonical:
+                    return canonical
+                logging.warning(
+                    f"[SentimentOverride] File contained invalid value '{raw}'. "
+                    f"Valid: {sorted(self._VALID_SENTIMENTS)}"
+                )
+
+        # ── 2. Non-blocking stdin check (TTY only) ──────────────────────
+        if not self._is_interactive_tty() or self._ticker_paused:
+            return None
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+        except Exception:
+            return None
+        if not ready:
+            return None
+
+        # Input is waiting — pause the ticker so it doesn't overwrite what
+        # the operator typed, then read the buffered line.
+        self._ticker_paused = True
+        self._clear_status_line()
+        try:
+            raw = sys.stdin.readline().strip()
+        except Exception:
+            raw = ""
+        finally:
+            self._ticker_paused = False
+
+        if not raw:
+            return None
+
+        # '?' / 'help' → print options, don't override.
+        if raw.lower() in ("?", "help", "h"):
+            valid_sorted = sorted(self._VALID_SENTIMENTS)
+            print(
+                f"\n  Current sentiment : {self.day_sentiment}\n"
+                f"  Valid values      : {valid_sorted}\n"
+                f"  Stdin             : type the value + Enter in this terminal\n"
+                f"  File              : echo 'Bullish' > output/sentiment_override.txt\n"
+            )
+            return None
+
+        canonical = self._SENTIMENT_BY_NORM.get(" ".join(raw.split()).lower())
+        if canonical:
+            return canonical
+
+        # Unknown input — rate-limit the warning to once per 30 s.
+        import time as _time
+        _now = _time.monotonic()
+        if _now - self._last_stdin_override_warn > 30:
+            self._last_stdin_override_warn = _now
+            logging.warning(
+                f"[SentimentOverride] '{raw}' is not a valid sentiment. "
+                f"Type '?' for help. Valid: {sorted(self._VALID_SENTIMENTS)}"
+            )
+        return None
+
     def _send_shutdown_report_once(self):
         """
         Sends the daily P&L report, idempotently. Fires at end-of-day, on
@@ -1760,6 +1866,25 @@ class TradingBotOrchestrator:
                 f"Invalid input '{user_input}'. Choose from {prompt_options} "
                 f"(case-insensitive) or press Enter to accept '{automated}'."
             )
+
+    def _print_override_hint(self) -> None:
+        """
+        Prints a one-time instruction block explaining how to override sentiment
+        mid-session. Called once after the startup sentiment is locked in.
+        Only prints on a real TTY; silent in headless/CI runs.
+        """
+        if not self._is_interactive_tty():
+            return
+        print(
+            "\n" + "─" * 78 + "\n"
+            "  💡 Mid-session sentiment override (while bot is running):\n"
+            "     • Stdin  : type  Bullish / Bearish / Very Bullish / Very Bearish / Neutral\n"
+            "                then press Enter in this terminal at any time.\n"
+            "     • File   : echo 'Bullish' > output/sentiment_override.txt\n"
+            "                (useful from a second terminal or a script)\n"
+            "     • Help   : type  ?  + Enter  to see the current value and valid options.\n"
+            + "─" * 78
+        )
 
     async def display_market_closed_info(self):
         """Fetches and displays EOD info when the bot is run outside trading hours."""
@@ -2157,6 +2282,32 @@ class TradingBotOrchestrator:
                         self.bot_state = "STOPPED"; continue
                     if await self._is_daily_profit_target_hit():
                         self.bot_state = "STOPPED"; continue
+
+                    # ── Mid-session sentiment override ────────────────────────
+                    # Check stdin (non-blocking) and the sentinel file on every
+                    # loop tick. When the operator overrides, apply immediately
+                    # and reset the auto-refresh baselines so the refresh logic
+                    # doesn't flip back over the manual choice.
+                    _override = await self._check_mid_session_override()
+                    if _override and _override != self.day_sentiment:
+                        _old_sent = self.day_sentiment
+                        self.day_sentiment = _override
+                        self._cached_sentiment = _override
+                        # Reset baselines so sentiment_refresh doesn't undo the
+                        # operator's choice on the very next reassessment cycle.
+                        self._sentiment_baseline_auto = _override
+                        logging.info(
+                            f"[SentimentOverride] {_old_sent} → {_override} "
+                            f"(operator mid-session override)"
+                        )
+                        self._print_event(
+                            [
+                                f"Sentiment overridden by operator:  {_old_sent}  →  {_override}",
+                                "Strategy will apply the new sentiment from the next signal evaluation.",
+                            ],
+                            level="warn",
+                        )
+
                     # Strategy reassessment timer — runs BEFORE the time gate so
                     # that the strategy keeps rotating even after 13:30 (e.g. when
                     # the bot started late). The `continue` inside the time gate
