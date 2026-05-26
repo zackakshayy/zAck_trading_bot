@@ -125,11 +125,16 @@ class TradingBotOrchestrator:
     The central orchestrator for the trading bot. Manages state, coordinates agents,
     and runs the main trading loop.
     """
-    def __init__(self, config):
+    def __init__(self, config, manual_mode: bool = False):
         self.config = config
         self.kite = KiteConnect(api_key=config['zerodha']['api_key'], timeout=120, debug=True)
         self.active_strategy_name = "None"
         self.active_strategy = None
+        # Manual strategy selection mode (--manual flag).
+        # When True, the operator picks the strategy from a numbered menu instead
+        # of the automated selector. All other logic (SL, targets, risk) is identical.
+        self._manual_mode: bool = manual_mode
+        self._manual_strategy_name: str | None = None  # operator-chosen strategy
 
         # Initialize core services
         self.rag_service = RAGService(config)
@@ -1237,40 +1242,63 @@ class TradingBotOrchestrator:
             except Exception as e:
                 logging.debug(f"Bars-for-selector fetch failed (non-fatal): {e}")
 
-            best_strategy_name = await self.langgraph_agent.get_recommended_strategy(
-                market_conditions=todays_conditions,
-                sentiment=self.day_sentiment,
-                is_expiry_day=is_expiry_day_now,
-                open_gap_pct=self.open_gap_pct,
-                underlying_bars=bars_for_selector,
-                exclude_strategies=self._currently_cooled(),
-                user_prompt=user_prompt,
-                rag_context=rag_context,
-            )
-            # Safety valve: every cascade layer is excluded by active cooldowns.
-            # Clear the entire cooldown set (gives every strategy a fresh shot)
-            # and retry the cascade once. If anything still doesn't fire next
-            # window, the cooldowns rebuild naturally.
-            if not best_strategy_name and self._strategy_cooldown_until:
-                cleared = sorted(self._strategy_cooldown_until.keys())
-                logging.warning(
-                    f"All strategies currently cooled ({cleared}). Clearing "
-                    f"cooldowns and retrying the cascade with a clean slate."
-                )
-                self._strategy_cooldown_until.clear()
+            # ── Strategy selection ──────────────────────────────────────────
+            # Manual mode: operator picks from a numbered menu. The choice is
+            # cached in _manual_strategy_name and reused on every reassessment
+            # so the bot doesn't keep asking. The operator can re-pick at any
+            # time by typing 'm' + Enter while the bot is awaiting signals.
+            #
+            # Auto mode: 5-layer deterministic cascade (LangGraphAgent).
+            if self._manual_mode:
+                if self._manual_strategy_name is None:
+                    # First run — must pick now.
+                    chosen = await self._prompt_strategy_picker()
+                    if chosen:
+                        self._manual_strategy_name = chosen
+                        logging.info(f"[ManualMode] Operator chose strategy: {chosen}")
+                    else:
+                        # Timed out or bad input on first pick — fall back to auto.
+                        logging.warning(
+                            "[ManualMode] No strategy chosen at startup; "
+                            "falling back to auto-selector for this cycle."
+                        )
+                best_strategy_name = self._manual_strategy_name  # may still be None → auto below
+
+            else:
+                best_strategy_name = None  # will be filled by auto-selector below
+
+            # Auto-selector path (used in auto mode, or as fallback in manual mode).
+            if best_strategy_name is None:
                 best_strategy_name = await self.langgraph_agent.get_recommended_strategy(
                     market_conditions=todays_conditions,
                     sentiment=self.day_sentiment,
                     is_expiry_day=is_expiry_day_now,
                     open_gap_pct=self.open_gap_pct,
                     underlying_bars=bars_for_selector,
-                    exclude_strategies=set(),
+                    exclude_strategies=self._currently_cooled(),
                     user_prompt=user_prompt,
                     rag_context=rag_context,
                 )
+                # Safety valve: every cascade layer excluded by active cooldowns.
+                if not best_strategy_name and self._strategy_cooldown_until:
+                    cleared = sorted(self._strategy_cooldown_until.keys())
+                    logging.warning(
+                        f"All strategies currently cooled ({cleared}). Clearing "
+                        f"cooldowns and retrying the cascade with a clean slate."
+                    )
+                    self._strategy_cooldown_until.clear()
+                    best_strategy_name = await self.langgraph_agent.get_recommended_strategy(
+                        market_conditions=todays_conditions,
+                        sentiment=self.day_sentiment,
+                        is_expiry_day=is_expiry_day_now,
+                        open_gap_pct=self.open_gap_pct,
+                        underlying_bars=bars_for_selector,
+                        exclude_strategies=set(),
+                        user_prompt=user_prompt,
+                        rag_context=rag_context,
+                    )
+
             if not best_strategy_name:
-                # Even with cleared cooldowns the cascade returned nothing —
-                # shouldn't happen given Layer 5's Gemini_Default, but be safe.
                 self.no_trade_reason = "Selector returned no strategy."
                 logging.error(self.no_trade_reason)
                 return False
@@ -1456,6 +1484,7 @@ class TradingBotOrchestrator:
                 secs    = max(0, int((now - self.awaiting_signal_since).total_seconds()))
                 elapsed = f"{secs // 60:02d}:{secs % 60:02d}"
             strategy = self.active_strategy_name or "—"
+            manual_tag = "[M] " if getattr(self, '_manual_mode', False) else ""
             mode     = getattr(self, '_trading_mode', 'MODERATE')
             sent     = (getattr(self, 'day_sentiment', '') or '—')[:10]
             dq       = getattr(self, '_day_quality', '') or ''
@@ -1467,7 +1496,7 @@ class TradingBotOrchestrator:
             if self.active_strategy and getattr(self.active_strategy, '_last_hold_reason', ''):
                 hold_reason = f" │ {self.active_strategy._last_hold_reason[:60]}"
             line = (
-                f"⏳ {ts}  AWAITING │ {strategy} │ {mode} │ {sent}{dq_part}"
+                f"⏳ {ts}  AWAITING │ {manual_tag}{strategy} │ {mode} │ {sent}{dq_part}"
                 f" │ {pnl_str} ({trades}T) │ ⏱ {elapsed}{hold_reason}"
             )
 
@@ -1640,16 +1669,39 @@ class TradingBotOrchestrator:
         if not raw:
             return None
 
-        # '?' / 'help' → print options, don't override.
+        # '?' / 'help' → print current state and valid options.
         if raw.lower() in ("?", "help", "h"):
             valid_sorted = sorted(self._VALID_SENTIMENTS)
+            strat = self.active_strategy_name or "—"
+            mode_tag = " (manual)" if self._manual_mode else " (auto)"
             print(
                 f"\n  Current sentiment : {self.day_sentiment}\n"
-                f"  Valid values      : {valid_sorted}\n"
-                f"  Stdin             : type the value + Enter in this terminal\n"
-                f"  File              : echo 'Bullish' > output/sentiment_override.txt\n"
+                f"  Current strategy  : {strat}{mode_tag}\n"
+                f"\n  Sentiment values  : {valid_sorted}\n"
+                f"  Stdin override    : type a sentiment value + Enter\n"
+                f"  File override     : echo 'Bullish' > output/sentiment_override.txt\n"
+                f"\n  Strategy re-pick  : type  m  + Enter\n"
             )
             return None
+
+        # 'm' / 'manual' → strategy picker (works in both manual and auto mode).
+        if raw.lower() in ("m", "manual", "strategy"):
+            chosen = await self._prompt_strategy_picker()
+            if chosen:
+                old_name = self.active_strategy_name
+                self._manual_strategy_name = chosen
+                self.active_strategy_name = chosen
+                self.active_strategy = get_strategy(chosen, self.kite, self.config)
+                self._signals_seen_for_active_strategy = 0
+                logging.info(f"[ManualMode] Strategy switched: {old_name} → {chosen}")
+                self._print_event(
+                    [
+                        f"Strategy switched by operator:  {old_name}  →  {chosen}",
+                        "Bot will use this strategy from the next signal evaluation.",
+                    ],
+                    level="warn",
+                )
+            return None  # not a sentiment value
 
         canonical = self._SENTIMENT_BY_NORM.get(" ".join(raw.split()).lower())
         if canonical:
@@ -1661,8 +1713,8 @@ class TradingBotOrchestrator:
         if _now - self._last_stdin_override_warn > 30:
             self._last_stdin_override_warn = _now
             logging.warning(
-                f"[SentimentOverride] '{raw}' is not a valid sentiment. "
-                f"Type '?' for help. Valid: {sorted(self._VALID_SENTIMENTS)}"
+                f"[Override] '{raw}' not recognised as sentiment or command. "
+                f"Type '?' for help. Sentiment options: {sorted(self._VALID_SENTIMENTS)}"
             )
         return None
 
@@ -1875,16 +1927,125 @@ class TradingBotOrchestrator:
         """
         if not self._is_interactive_tty():
             return
+        manual_line = (
+            "     • Strategy: type  m  + Enter  to re-pick the active strategy.\n"
+            if self._manual_mode else
+            "     • Strategy: type  m  + Enter  to manually pick a strategy.\n"
+        )
         print(
             "\n" + "─" * 78 + "\n"
-            "  💡 Mid-session sentiment override (while bot is running):\n"
-            "     • Stdin  : type  Bullish / Bearish / Very Bullish / Very Bearish / Neutral\n"
-            "                then press Enter in this terminal at any time.\n"
-            "     • File   : echo 'Bullish' > output/sentiment_override.txt\n"
-            "                (useful from a second terminal or a script)\n"
-            "     • Help   : type  ?  + Enter  to see the current value and valid options.\n"
+            "  💡 Mid-session overrides (while bot is running):\n"
+            "     • Sentiment: type  Bullish / Bearish / Very Bullish / Very Bearish / Neutral\n"
+            "                  then press Enter — or write to output/sentiment_override.txt\n"
+            + manual_line +
+            "     • Help     : type  ?  + Enter  to see current values and valid options.\n"
             + "─" * 78
         )
+
+    # ------------------------------------------------------------------ #
+    #  Manual Strategy Selection                                          #
+    # ------------------------------------------------------------------ #
+
+    # One-liner description shown in the picker menu for each strategy.
+    _STRATEGY_DESCRIPTIONS: dict = {
+        "Gemini_Default":               "AI-driven adaptive strategy (default fallback)",
+        "Supertrend_MACD":              "Trend-following — Supertrend + MACD confirmation",
+        "Volatility_Cluster_Reversal":  "Mean reversion after volatility-cluster bursts",
+        "Volume_Spread_Analysis":       "VSA — price+volume relationship, smart-money signals",
+        "Momentum_VWAP_RSI":            "Momentum burst above VWAP with RSI confirmation",
+        "Breakout_Prev_Day_HL":         "Breakout above/below previous day high-low",
+        "Opening_Range_Breakout":       "ORB — first 15-min range breakout (news/event days)",
+        "BB_Squeeze_Breakout":          "Bollinger Band squeeze → volatility expansion entry",
+        "MA_Crossover":                 "Moving-average crossover signal",
+        "RSI_Divergence":               "RSI divergence from price — reversal signal",
+        "EMA_Cross_RSI":                "EMA 20/50 crossover filtered by RSI — trending days",
+        "Reversal_Detector":            "Multi-indicator reversal (hammer, engulf, PSAR flip)",
+        "VWAP_Reversion":               "Mean reversion to VWAP — overextended range days",
+        "NR7_Compression":              "NR7 compression breakout — tightest range in 7 bars",
+        "Expiry_Momentum_Scalp":        "Expiry-day scalp — momentum + gamma pin risk",
+    }
+
+    async def _prompt_strategy_picker(self) -> "str | None":
+        """
+        Shows a numbered strategy menu and waits for the operator to pick one.
+        Returns the canonical strategy name, or None on timeout / invalid input.
+
+        Pauses the ticker while waiting so keystrokes aren't overwritten.
+        Can be called at startup (first setup) or mid-session ('m' command).
+        """
+        if not self._is_interactive_tty():
+            return None
+
+        names = list(self._STRATEGY_DESCRIPTIONS.keys())
+        w = 78
+
+        self._ticker_paused = True
+        self._clear_status_line()
+        try:
+            print("\n" + "═" * w)
+            print("  📊  Manual Strategy Selection")
+            sent = getattr(self, 'day_sentiment', '') or 'Unknown'
+            conds = ", ".join(sorted(getattr(self, 'todays_conditions', set()) or set())) or "—"
+            print(f"  Sentiment: {sent}  │  Conditions: {conds}")
+            print("═" * w)
+            for i, name in enumerate(names, 1):
+                desc = self._STRATEGY_DESCRIPTIONS.get(name, "")
+                print(f"  {i:>2}.  {name:<35} {desc}")
+            print("═" * w)
+            timeout = float(self.config['trading_flags'].get('operator_input_timeout_seconds', 60))
+            print(
+                f"  Enter number (1–{len(names)}) or strategy name "
+                f"({int(timeout)}s timeout → auto-selector takes over): ",
+                end="", flush=True,
+            )
+
+            def _wait_for_line():
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+                except Exception:
+                    return None
+                if not ready:
+                    return None
+                try:
+                    line = sys.stdin.readline()
+                    return line if line else None
+                except Exception:
+                    return None
+
+            raw_line = await asyncio.to_thread(_wait_for_line)
+        finally:
+            self._ticker_paused = False
+
+        if raw_line is None:
+            print(f"\n  [no response in {int(timeout)}s — falling back to auto-selector]")
+            logging.info("Strategy picker timed out; auto-selector will be used.")
+            return None
+
+        raw = raw_line.strip()
+        if not raw:
+            logging.info("Strategy picker: empty input; auto-selector will be used.")
+            return None
+
+        # Accept a number.
+        if raw.isdigit():
+            idx = int(raw) - 1
+            if 0 <= idx < len(names):
+                chosen = names[idx]
+                print(f"  ✔  Selected: {chosen}")
+                return chosen
+            print(f"  ✘  '{raw}' out of range (1–{len(names)}). Using auto-selector.")
+            return None
+
+        # Accept a strategy name (case-insensitive, underscore/space tolerant).
+        norm = raw.replace(" ", "_").strip().lower()
+        for name in names:
+            if name.lower() == norm or name.replace("_", "").lower() == norm.replace("_", ""):
+                print(f"  ✔  Selected: {name}")
+                return name
+
+        print(f"  ✘  '{raw}' not recognised. Using auto-selector.")
+        logging.warning(f"[ManualMode] Unrecognised strategy input: '{raw}'")
+        return None
 
     async def display_market_closed_info(self):
         """Fetches and displays EOD info when the bot is run outside trading hours."""
@@ -2597,7 +2758,20 @@ class TradingBotOrchestrator:
 
 
 if __name__ == "__main__":
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="zAck Trading Bot")
+    _ap.add_argument(
+        "--manual", action="store_true",
+        help=(
+            "Manual strategy selection mode: you choose the strategy from a "
+            "numbered menu at startup instead of the automated selector. "
+            "Type 'm' + Enter while the bot is running to switch strategies "
+            "mid-session. All other logic (SL, targets, risk) is unchanged."
+        ),
+    )
+    _args = _ap.parse_args()
+
     multiprocessing.freeze_support()
-    bot = TradingBotOrchestrator(load_config())
+    bot = TradingBotOrchestrator(load_config(), manual_mode=_args.manual)
     if bot.authenticate():
         asyncio.run(bot.run())
