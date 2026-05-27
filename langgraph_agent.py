@@ -49,15 +49,17 @@ def _detect_indicator_override(df, excluded: Optional[set] = None) -> Optional[T
                 f"BB-bandwidth compression (bw={bw:.3f} < 0.7 x MA={bw_ma:.3f})",
             ))
 
-    # 2. NR7: the narrowest of the last 8 bars is within the last 3 (fresh).
+    # 2. NR7: the narrowest of the last 8 *completed* bars is within the last 3.
+    #    Use iloc[-9:-1] to exclude the current (still-forming) bar whose range
+    #    is near-zero mid-candle, causing a false "fresh NR7" detection.
     try:
-        ranges_8 = (df["high"] - df["low"]).iloc[-8:]
-        if not ranges_8.isna().any():
+        ranges_8 = (df["high"] - df["low"]).iloc[-9:-1]  # 8 completed bars
+        if len(ranges_8) == 8 and not ranges_8.isna().any() and ranges_8.min() > 0:
             min_idx_in_8 = int(ranges_8.values.argmin())
-            if min_idx_in_8 >= 5:
+            if min_idx_in_8 >= 5:  # narrowest in last 3 of 8 completed bars
                 candidates.append((
                     "NR7_Compression",
-                    f"Fresh NR7 compression (narrowest bar in last 3, "
+                    f"Fresh NR7 compression (narrowest completed bar in last 3, "
                     f"range={float(ranges_8.min()):.2f})",
                 ))
     except Exception:
@@ -144,9 +146,12 @@ def _regime_table_pick(market_conditions: set, sentiment: str) -> Optional[str]:
 
     if "VIX_LOW" in market_conditions:
         if not iv_high:
-            # Quiet, slow session — VWAP reversion suits a grind in either
-            # direction. BB_Squeeze and NR7 are still reachable via Layer-3.
-            return "VWAP_Reversion"
+            # Quiet low-vol session.
+            # Bullish  → trend-following (EMA momentum along the drift).
+            # Bearish  → mean reversion suits a slow fade.
+            # VWAP_Reversion on a bullish day produces constant HOLDs because
+            # price stays above VWAP and never gives a reversion entry.
+            return "EMA_Cross_RSI" if is_bull else "VWAP_Reversion"
         return "Volume_Spread_Analysis" if is_bull else "RSI_Divergence"
 
     return None

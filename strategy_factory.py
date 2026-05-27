@@ -1000,10 +1000,10 @@ class NR7_Compression_Breakout_Strategy(BaseStrategy):
             return 'HOLD'
         nr7_idx_in_window = int(ranges.values.argmin())
         bars_since_nr7 = len(window) - 1 - nr7_idx_in_window
-        if bars_since_nr7 > 3:
+        if bars_since_nr7 > 6:
             self._log_hold(
                 f"NR7 too stale: narrowest bar was {bars_since_nr7} bars ago "
-                f"(need <= 3 to count as 'fresh' compression)"
+                f"(need <= 6 to count as 'fresh' compression, i.e. within 30 min)"
             )
             return 'HOLD'
 

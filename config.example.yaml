@@ -99,7 +99,7 @@ pcr_feed:
 trading_flags:
   backtest_years: 2
   chart_timeframe: 5minute
-  ema_cross_lookback: 20
+  ema_cross_lookback: 50
   enable_natural_language_prompt: true
   enable_parallel_processing: true
   enable_gemini_loss_analysis: true
