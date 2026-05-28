@@ -2314,27 +2314,8 @@ class TradingBotOrchestrator:
         # Accept startup during market hours OR the pre-market warm-up window
         # (default 08:50 -> 09:15 IST). Anything else -> closed-info banner.
         if not (self.is_market_open() or self.is_pre_market_window()):
-            now_dt = datetime.datetime.now()
-            # Weekday but market closed → it's a holiday. Print a fun banner.
-            if now_dt.weekday() < 5 and is_nse_holiday(now_dt.date()):
-                _holiday_msgs = [
-                    "NSE ne aaj chutti di hai 🎉  Markets bandh hain — go touch some grass.",
-                    "Aaj holiday hai bhai! Shaktimaan bhi rest karta hai kabhi kabhi 🦸",
-                    "Market holiday! Even the algo needs chai & nap time ☕😴",
-                    "NSE: Gone fishing 🎣  Come back tomorrow with fresh setups.",
-                    "Holiday mode ON 🏖️  No charts, no stress — Sebi approved.",
-                    "Aaj koi trade nahi! Bot is out of office 📴  Auto-reply: Try tomorrow.",
-                ]
-                import random as _rand
-                msg = _rand.choice(_holiday_msgs)
-                holiday_name = NSE_HOLIDAY_NAMES.get(
-                    now_dt.strftime("%Y-%m-%d"), "Market Holiday"
-                )
-                print("\n" + "🎊 " * 19)
-                print(f"  🏦  {holiday_name.upper()}  —  NSE is closed today.")
-                print(f"  {msg}")
-                print("🎊 " * 19 + "\n")
-                logging.info(f"Market holiday ({holiday_name}). Bot will not trade today.")
+            # Safety net for edge case: bot started just after 15:30 close.
+            # Holiday / weekend exits are caught in __main__ before auth runs.
             await self.display_market_closed_info()
             return  # No report — bot never attempted trading.
 
@@ -2781,6 +2762,8 @@ class TradingBotOrchestrator:
 
 if __name__ == "__main__":
     import argparse as _argparse
+    import random as _rand
+
     _ap = _argparse.ArgumentParser(description="zAck Trading Bot")
     _ap.add_argument(
         "--manual", action="store_true",
@@ -2793,6 +2776,37 @@ if __name__ == "__main__":
     )
     _args = _ap.parse_args()
 
+    # ── Zero-cost holiday / weekend guard ────────────────────────────────
+    # Runs BEFORE config load, Zerodha auth, NewsAPI, YouTube — nothing.
+    # No wasted API credits, no 60-second prompts, no email on a day off.
+    _today = datetime.date.today()
+    _today_str = _today.strftime("%Y-%m-%d")
+    _HOLIDAY_MSGS = [
+        "Aaj chutti hai bhai! Shaktimaan bhi rest karta hai kabhi kabhi 🦸",
+        "NSE ne bhi OOO laga diya aaj 🏖️  Bot agrees — go touch some grass.",
+        "Market holiday! Even the algo needs chai & nap time ☕ 😴",
+        "NSE: Gone fishing 🎣  Come back tomorrow with fresh setups.",
+        "Aaj koi trade nahi! Bot is out of office 📴  Auto-reply: Try tomorrow.",
+        "Holiday mode ON 🏖️  No charts, no stress — SEBI approved.",
+    ]
+
+    if _today.weekday() >= 5:
+        _day = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][_today.weekday()]
+        print("\n" + "📅 " * 19)
+        print(f"  Today is {_day} — markets are closed on weekends.")
+        print(f"  {_rand.choice(_HOLIDAY_MSGS)}")
+        print("📅 " * 19 + "\n")
+        sys.exit(0)
+
+    if is_nse_holiday(_today):
+        _holiday_name = NSE_HOLIDAY_NAMES.get(_today_str, "Market Holiday")
+        print("\n" + "🎊 " * 19)
+        print(f"  🏦  {_holiday_name.upper()}  —  NSE is closed today.")
+        print(f"  {_rand.choice(_HOLIDAY_MSGS)}")
+        print("🎊 " * 19 + "\n")
+        sys.exit(0)
+
+    # ── Normal trading day — full startup ────────────────────────────────
     multiprocessing.freeze_support()
     bot = TradingBotOrchestrator(load_config(), manual_mode=_args.manual)
     if bot.authenticate():

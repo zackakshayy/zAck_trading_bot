@@ -75,14 +75,18 @@ def _send_email(config, subject, html_body) -> bool:
         msg['To'] = email_conf['receiver_email']
         msg['Subject'] = subject
         msg.attach(MIMEText(html_body, 'html'))
-        with smtplib.SMTP(email_conf['smtp_server'], email_conf['smtp_port']) as server:
+        with smtplib.SMTP(
+            email_conf['smtp_server'],
+            email_conf['smtp_port'],
+            timeout=15,          # fail fast — don't hang the bot for 80s
+        ) as server:
             server.starttls()
             server.login(email_conf['sender_email'], email_conf['sender_password'])
             server.send_message(msg)
         logging.info(f"Email sent: {subject!r}")
         return True
     except Exception as e:
-        logging.error(f"Failed to send email {subject!r}: {e}", exc_info=True)
+        logging.warning(f"Email skipped ({subject!r}): {e}")
         return False
 
 
@@ -187,7 +191,7 @@ def send_daily_report(config, date_str, no_trades_reason=None):
         msg['Subject'] = subject
         msg.attach(MIMEText(daily_html, 'html'))
         
-        with smtplib.SMTP(email_conf['smtp_server'], email_conf['smtp_port']) as server:
+        with smtplib.SMTP(email_conf['smtp_server'], email_conf['smtp_port'], timeout=15) as server:
             server.starttls()
             server.login(email_conf['sender_email'], email_conf['sender_password'])
             server.send_message(msg)
