@@ -28,6 +28,7 @@ from rag_service import RAGService
 from pcr_feed import PCRFeed
 from infra import (
     is_nse_holiday,
+    NSE_HOLIDAY_NAMES,
     load_daily_pnl,
     load_weekly_pnl,
     safe_ltp,
@@ -2313,6 +2314,27 @@ class TradingBotOrchestrator:
         # Accept startup during market hours OR the pre-market warm-up window
         # (default 08:50 -> 09:15 IST). Anything else -> closed-info banner.
         if not (self.is_market_open() or self.is_pre_market_window()):
+            now_dt = datetime.datetime.now()
+            # Weekday but market closed → it's a holiday. Print a fun banner.
+            if now_dt.weekday() < 5 and is_nse_holiday(now_dt.date()):
+                _holiday_msgs = [
+                    "NSE ne aaj chutti di hai 🎉  Markets bandh hain — go touch some grass.",
+                    "Aaj holiday hai bhai! Shaktimaan bhi rest karta hai kabhi kabhi 🦸",
+                    "Market holiday! Even the algo needs chai & nap time ☕😴",
+                    "NSE: Gone fishing 🎣  Come back tomorrow with fresh setups.",
+                    "Holiday mode ON 🏖️  No charts, no stress — Sebi approved.",
+                    "Aaj koi trade nahi! Bot is out of office 📴  Auto-reply: Try tomorrow.",
+                ]
+                import random as _rand
+                msg = _rand.choice(_holiday_msgs)
+                holiday_name = NSE_HOLIDAY_NAMES.get(
+                    now_dt.strftime("%Y-%m-%d"), "Market Holiday"
+                )
+                print("\n" + "🎊 " * 19)
+                print(f"  🏦  {holiday_name.upper()}  —  NSE is closed today.")
+                print(f"  {msg}")
+                print("🎊 " * 19 + "\n")
+                logging.info(f"Market holiday ({holiday_name}). Bot will not trade today.")
             await self.display_market_closed_info()
             return  # No report — bot never attempted trading.
 

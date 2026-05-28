@@ -1863,7 +1863,12 @@ class PositionManagementAgent:
         Place a LIMIT order to close one option leg; fall back to MARKET on
         non-fill.  Returns (fill_price, order_id).
         """
-        tick  = self._tick_size_for(symbol)
+        # _tick_size_for lives in OrderExecutionAgent (needs nfo_instruments).
+        # PositionManagementAgent stores tick_size in active_trade at entry;
+        # use that for the main leg, and 0.05 (standard NFO minimum) as a
+        # safe fallback for spread short legs.
+        _stored_trade = self.active_trade or {}
+        tick = float(_stored_trade.get("tick_size") or 0.05)
         slip  = float(self.flags.get("limit_order_slippage_percent", 0.5)) / 100.0
 
         is_sell = transaction_type == self.kite.TRANSACTION_TYPE_SELL

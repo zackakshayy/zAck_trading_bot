@@ -165,17 +165,48 @@ def tick_round(price: float, tick_size: float = 0.05) -> float:
 # NSE trading-day calendar
 # ---------------------------------------------------------------------------
 
-# Static list of full-day market holidays. Keep updated annually.
+# Static list of full-day NSE market holidays with their names.
 # Sourced from https://www.nseindia.com/resources/exchange-communication-holidays
-NSE_HOLIDAYS = {
-    # 2025
-    "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14",
-    "2025-04-18", "2025-05-01", "2025-08-15", "2025-08-27", "2025-10-02",
-    "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25",
-    # 2026 (placeholder — verify before relying on these)
-    "2026-01-26", "2026-03-03", "2026-03-19", "2026-04-03", "2026-05-01",
-    "2026-08-15", "2026-10-02", "2026-11-12", "2026-12-25",
+# Update NSE_HOLIDAY_NAMES every December for the coming year.
+# NSE_HOLIDAYS is derived automatically — do NOT edit it separately.
+NSE_HOLIDAY_NAMES: dict = {
+    # ── 2025 ──────────────────────────────────────────────────────────────
+    "2025-02-26": "Mahashivratri",
+    "2025-03-14": "Holi",
+    "2025-03-31": "Id-Ul-Fitr (Eid)",
+    "2025-04-10": "Shri Ram Navami",
+    "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2025-04-18": "Good Friday",
+    "2025-05-01": "Maharashtra Day",
+    "2025-08-15": "Independence Day",
+    "2025-08-27": "Ganesh Chaturthi",
+    "2025-10-02": "Gandhi Jayanti",
+    "2025-10-21": "Diwali – Lakshmi Puja",
+    "2025-10-22": "Diwali – Balipratipada",
+    "2025-11-05": "Guru Nanak Jayanti",
+    "2025-12-25": "Christmas",
+    # ── 2026 ──────────────────────────────────────────────────────────────
+    # Verify exact dates at NSE each December before the new year begins.
+    "2026-01-26": "Republic Day",
+    "2026-03-03": "Mahashivratri",
+    "2026-03-19": "Holi",
+    "2026-04-03": "Good Friday",
+    "2026-04-10": "Shri Ram Navami",
+    "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+    "2026-05-01": "Maharashtra Day",
+    "2026-05-27": "Buddha Purnima",
+    "2026-06-27": "Id-Ul-Adha (Bakri Eid)",
+    "2026-07-17": "Muharram",
+    "2026-08-15": "Independence Day",
+    "2026-10-02": "Gandhi Jayanti",
+    "2026-10-20": "Dussehra (Vijaya Dashami)",
+    "2026-11-09": "Diwali – Lakshmi Puja",
+    "2026-11-24": "Guru Nanak Jayanti",
+    "2026-12-25": "Christmas",
 }
+
+# Derived automatically — single source of truth is NSE_HOLIDAY_NAMES above.
+NSE_HOLIDAYS: set = set(NSE_HOLIDAY_NAMES.keys())
 
 
 def is_nse_holiday(d) -> bool:
