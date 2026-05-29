@@ -86,6 +86,9 @@ class YouTubeSentimentAgent:
         self.gemini_model = cfg.get("gemini_model", "gemini-2.0-flash")
         self._verdicts: list = []
         self._ready = False
+        # Set once the "loaded N cached verdicts" line has been printed, so the
+        # per-tick fetch_today() cache-hit path doesn't reprint it every loop.
+        self._cache_log_emitted = False
         # Channels that definitively had no recent video (stop fetching them).
         self._no_video_channels: set = set()
         # Channels that errored last time (Gemini 429, network, etc.) — retry.
@@ -126,9 +129,11 @@ class YouTubeSentimentAgent:
         if isinstance(cached, dict) and isinstance(cached.get("channels"), list):
             self._verdicts = cached["channels"]
             self._ready = True
-            logging.info(
-                f"YouTubeSentiment: loaded {len(self._verdicts)} cached verdicts for today."
-            )
+            if not self._cache_log_emitted:
+                logging.info(
+                    f"YouTubeSentiment: loaded {len(self._verdicts)} cached verdicts for today."
+                )
+                self._cache_log_emitted = True
             return self._verdicts
 
         # On retry runs, only re-process channels that errored last time.

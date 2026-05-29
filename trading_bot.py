@@ -189,6 +189,7 @@ class TradingBotOrchestrator:
         self._day_quality = 'UNKNOWN'       # set each setup() call
         self._last_reported_day_quality: str | None = None  # suppresses repeat DayQuality logs
         self._last_reported_scalp_state: bool = False       # suppresses repeat RangeScalp logs
+        self._last_counter_signal: tuple | None = None       # suppresses repeat COUNTER-SIGNAL logs
         self._ticker_paused: bool = False                   # paused while operator types input
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
@@ -2671,7 +2672,15 @@ class TradingBotOrchestrator:
                                                 "subsequent entries this session."
                                             )
                         else:
-                            logging.warning(f"COUNTER-SIGNAL DETECTED: '{signal}' vs sentiment '{self.day_sentiment}'.")
+                            # Log only when the (signal, sentiment) pair changes —
+                            # otherwise this fires every tick and floods the terminal.
+                            _counter_key = (signal, self.day_sentiment)
+                            if _counter_key != self._last_counter_signal:
+                                logging.warning(
+                                    f"COUNTER-SIGNAL DETECTED: '{signal}' vs sentiment "
+                                    f"'{self.day_sentiment}'. (Suppressing repeats until this changes.)"
+                                )
+                                self._last_counter_signal = _counter_key
 
                 elif self.bot_state == "IN_POSITION":
                     underlying_df_hist = await self._get_underlying_bars()

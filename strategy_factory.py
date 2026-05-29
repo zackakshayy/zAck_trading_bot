@@ -18,6 +18,9 @@ class BaseStrategy:
         self.is_reversal_trade = False
         # Tracks the last HOLD reason for the terminal status line and log dedup.
         self._last_hold_reason: str = ""
+        # Tracks the last emitted signal log so identical lines aren't repeated
+        # every tick while the same condition persists.
+        self._last_signal_log: str = ""
 
     def generate_signals(self, day_df, sentiment, index=None, **kwargs):
         """
@@ -41,6 +44,17 @@ class BaseStrategy:
         self._last_hold_reason = reason
         if changed and (self.config.get("trading_flags") or {}).get("log_hold_reasons", False):
             logging.debug(f"[{self.name}] HOLD: {reason}")
+
+    def _log_signal(self, message: str):
+        """
+        Emit a strategy signal log line only when it differs from the last one.
+        Strategies re-evaluate every tick, so an unchanged BUY/SELL condition
+        would otherwise print the identical line every few seconds. This keeps
+        the signal-detection behaviour identical and only de-duplicates output.
+        """
+        if message != self._last_signal_log:
+            logging.info(message)
+            self._last_signal_log = message
 
     # ------------------------------------------------------------------
     # Shared guard helpers — used by multiple strategies
@@ -110,7 +124,7 @@ class Gemini_Default_Strategy(BaseStrategy):
         logging.debug(f"[{self.name}] Check on {current_candle.name}: Primary Met={primary_signal_met}, Confirmations Met={confirmation_signals_met}")
 
         if primary_signal_met and confirmation_signals_met >= 1:
-            logging.info(f"[{self.name}] Signal confirmed: Primary condition and {confirmation_signals_met} confirmation(s) met.")
+            self._log_signal(f"[{self.name}] Signal confirmed: Primary condition and {confirmation_signals_met} confirmation(s) met.")
             return 'BUY' if sentiment == 'Bullish' else 'SELL'
 
         if not primary_signal_met:
@@ -170,10 +184,10 @@ class Supertrend_MACD_Strategy(BaseStrategy):
         is_bearish_signal = st_dir == -1 and (macd or 0) < (macd_sig or 0)
 
         if is_bullish_signal:
-            logging.info(f"[{self.name}] BUY Signal condition met.")
+            self._log_signal(f"[{self.name}] BUY Signal condition met.")
             return 'BUY'
         if is_bearish_signal:
-            logging.info(f"[{self.name}] SELL Signal condition met.")
+            self._log_signal(f"[{self.name}] SELL Signal condition met.")
             return 'SELL'
 
         self._log_hold(
@@ -233,7 +247,7 @@ class VolatilityClusterStrategy(BaseStrategy):
         if sentiment in ['Bullish', 'Very Bullish']:
             is_reversal_candle = last_completed_candle['close'] < last_completed_candle['open']
             if is_high_volatility and is_large_move and is_reversal_candle:
-                logging.info(f"[{self.name}] Reversal BUY signal: High volatility detected after a large down move.")
+                self._log_signal(f"[{self.name}] Reversal BUY signal: High volatility detected after a large down move.")
                 return 'BUY'
             self._log_hold(
                 f"need high_vol AND large_down_candle. "
@@ -244,7 +258,7 @@ class VolatilityClusterStrategy(BaseStrategy):
         elif sentiment in ['Bearish', 'Very Bearish']:
             is_reversal_candle = last_completed_candle['close'] > last_completed_candle['open']
             if is_high_volatility and is_large_move and is_reversal_candle:
-                logging.info(f"[{self.name}] Reversal SELL signal: High volatility detected after a large up move.")
+                self._log_signal(f"[{self.name}] Reversal SELL signal: High volatility detected after a large up move.")
                 return 'SELL'
             self._log_hold(
                 f"need high_vol AND large_up_candle. "
@@ -290,7 +304,7 @@ class VSA_Strategy(BaseStrategy):
             is_down_bar = last_candle['close'] < last_candle['open']
             is_high_close = last_candle['close'] > (last_candle['low'] + last_candle['spread'] * 0.5)
             if is_down_bar and is_high_volume and is_wide_spread and is_high_close:
-                logging.info(f"[{self.name}] Signal confirmed: Sign of Strength detected.")
+                self._log_signal(f"[{self.name}] Signal confirmed: Sign of Strength detected.")
                 return 'BUY'
             self._log_hold(
                 f"need down_bar AND high_vol AND wide_spread AND high_close. "
@@ -303,7 +317,7 @@ class VSA_Strategy(BaseStrategy):
             is_up_bar = last_candle['close'] > last_candle['open']
             is_low_close = last_candle['close'] < (last_candle['low'] + last_candle['spread'] * 0.5)
             if is_up_bar and is_high_volume and is_wide_spread and is_low_close:
-                logging.info(f"[{self.name}] Signal confirmed: Sign of Weakness detected.")
+                self._log_signal(f"[{self.name}] Signal confirmed: Sign of Weakness detected.")
                 return 'SELL'
             self._log_hold(
                 f"need up_bar AND high_vol AND wide_spread AND low_close. "
@@ -460,7 +474,7 @@ class Opening_Range_Breakout_Strategy(BaseStrategy):
 
         if sentiment in ['Bullish', 'Very Bullish']:
             if last['close'] < self.orb_high and current['close'] > self.orb_high and vol_ok:
-                logging.info(f"[{self.name}] BUY Signal on ORB High breakout.")
+                self._log_signal(f"[{self.name}] BUY Signal on ORB High breakout.")
                 return 'BUY'
             self._log_hold(
                 f"need break above ORB high ({self.orb_high:.2f}) with vol>1.5x_MA. "
@@ -469,7 +483,7 @@ class Opening_Range_Breakout_Strategy(BaseStrategy):
             )
         elif sentiment in ['Bearish', 'Very Bearish']:
             if last['close'] > self.orb_low and current['close'] < self.orb_low and vol_ok:
-                logging.info(f"[{self.name}] SELL Signal on ORB Low breakdown.")
+                self._log_signal(f"[{self.name}] SELL Signal on ORB Low breakdown.")
                 return 'SELL'
             self._log_hold(
                 f"need break below ORB low ({self.orb_low:.2f}) with vol>1.5x_MA. "
@@ -619,7 +633,7 @@ class RSI_Divergence_Strategy(BaseStrategy):
             # Require RSI to be oversold (< 40) to confirm the divergence is
             # meaningful rather than a mid-range wobble.
             if cur_rsi < 40:
-                logging.info(f"[{self.name}] BUY: bullish divergence with RSI {cur_rsi:.1f} < 40.")
+                self._log_signal(f"[{self.name}] BUY: bullish divergence with RSI {cur_rsi:.1f} < 40.")
                 return 'BUY'
             self._log_hold(
                 f"bullish divergence detected but RSI {cur_rsi:.1f} >= 40 "
@@ -630,7 +644,7 @@ class RSI_Divergence_Strategy(BaseStrategy):
         if sentiment in ['Bearish', 'Very Bearish'] and divergence == 'Bearish':
             # Require RSI to be overbought (> 60) to confirm meaningful divergence.
             if cur_rsi > 60:
-                logging.info(f"[{self.name}] SELL: bearish divergence with RSI {cur_rsi:.1f} > 60.")
+                self._log_signal(f"[{self.name}] SELL: bearish divergence with RSI {cur_rsi:.1f} > 60.")
                 return 'SELL'
             self._log_hold(
                 f"bearish divergence detected but RSI {cur_rsi:.1f} <= 60 "
@@ -711,7 +725,7 @@ class EMACrossRSIStrategy(BaseStrategy):
                     break  # Found the recent cross, no need to look further
             
             if recent_golden_cross:
-                logging.info(f"[{self.name}] BUY Signal: 9/15 EMA in bullish state post-crossover with RSI > 50.")
+                self._log_signal(f"[{self.name}] BUY Signal: 9/15 EMA in bullish state post-crossover with RSI > 50.")
                 return 'BUY'
             self._log_hold(
                 f"bullish state confirmed but no golden cross in last {lookback_period} bars. "
@@ -743,7 +757,7 @@ class EMACrossRSIStrategy(BaseStrategy):
                     break
 
             if recent_death_cross:
-                logging.info(f"[{self.name}] SELL Signal: 9/15 EMA in bearish state post-crossover with RSI < 50.")
+                self._log_signal(f"[{self.name}] SELL Signal: 9/15 EMA in bearish state post-crossover with RSI < 50.")
                 return 'SELL'
             self._log_hold(
                 f"bearish state confirmed but no death-cross in last {lookback_period} bars. "
@@ -833,7 +847,7 @@ class Reversal_Detector_Strategy(BaseStrategy):
         # Look for a Bearish Reversal signal
         if trend_status == "Uptrend" and rsi_divergence == "Bearish":
             if current_candle['close'] < current_candle['ema_9']:
-                logging.info(f"[{self.name}] Bearish Reversal Signal: Overextended uptrend with RSI divergence confirmed by close below 9-EMA.")
+                self._log_signal(f"[{self.name}] Bearish Reversal Signal: Overextended uptrend with RSI divergence confirmed by close below 9-EMA.")
                 return 'SELL'
             self._log_hold(
                 f"uptrend+bearish_divergence confirmed but price not below ema9. "
@@ -841,7 +855,7 @@ class Reversal_Detector_Strategy(BaseStrategy):
             )
         elif trend_status == "Downtrend" and rsi_divergence == "Bullish":
             if current_candle['close'] > current_candle['ema_9']:
-                logging.info(f"[{self.name}] Bullish Reversal Signal: Overextended downtrend with RSI divergence confirmed by close above 9-EMA.")
+                self._log_signal(f"[{self.name}] Bullish Reversal Signal: Overextended downtrend with RSI divergence confirmed by close above 9-EMA.")
                 return 'BUY'
             self._log_hold(
                 f"downtrend+bullish_divergence confirmed but price not above ema9. "
@@ -917,7 +931,7 @@ class VWAP_Reversion_Strategy(BaseStrategy):
             reclaimed = (prev_close <= prev_vwap) and (cur_close > cur_vwap)
             momentum_ok = cur_rsi > 45
             if reclaimed and momentum_ok:
-                logging.info(f"[{self.name}] BUY: VWAP reclaim with RSI {cur_rsi:.1f} > 45.")
+                self._log_signal(f"[{self.name}] BUY: VWAP reclaim with RSI {cur_rsi:.1f} > 45.")
                 return 'BUY'
             self._log_hold(
                 f"need VWAP-reclaim (prev close<=VWAP AND curr close>VWAP) AND RSI>45. "
@@ -934,7 +948,7 @@ class VWAP_Reversion_Strategy(BaseStrategy):
             lost = (prev_close >= prev_vwap) and (cur_close < cur_vwap)
             momentum_ok = cur_rsi < 55
             if lost and momentum_ok:
-                logging.info(f"[{self.name}] SELL: VWAP loss with RSI {cur_rsi:.1f} < 55.")
+                self._log_signal(f"[{self.name}] SELL: VWAP loss with RSI {cur_rsi:.1f} < 55.")
                 return 'SELL'
             self._log_hold(
                 f"need VWAP-loss (prev close>=VWAP AND curr close<VWAP) AND RSI<55. "
@@ -1025,13 +1039,13 @@ class NR7_Compression_Breakout_Strategy(BaseStrategy):
 
         nr7_high, nr7_low = nr7_bar['high'], nr7_bar['low']
         if sentiment in ['Bullish', 'Very Bullish'] and cur_close > nr7_high:
-            logging.info(
+            self._log_signal(
                 f"[{self.name}] BUY: close {cur_close:.2f} > NR7 high "
                 f"{nr7_high:.2f} on volume {cur_vol:.0f} vs MA {cur_vol_ma:.0f}."
             )
             return 'BUY'
         if sentiment in ['Bearish', 'Very Bearish'] and cur_close < nr7_low:
-            logging.info(
+            self._log_signal(
                 f"[{self.name}] SELL: close {cur_close:.2f} < NR7 low "
                 f"{nr7_low:.2f} on volume {cur_vol:.0f} vs MA {cur_vol_ma:.0f}."
             )
@@ -1196,12 +1210,12 @@ class ExpiryMomentumScalpStrategy(BaseStrategy):
 
         # ── Signal ───────────────────────────────────────────────────────────
         if cross_bull:
-            logging.info(
+            self._log_signal(
                 f"[{self.name}] BUY: EMA9 crossed above EMA21 (last 3 bars) "
                 f"RSI={cur_rsi:.1f} t={t.strftime('%H:%M')}"
             )
             return 'BUY'
-        logging.info(
+        self._log_signal(
             f"[{self.name}] SELL: EMA9 crossed below EMA21 (last 3 bars) "
             f"RSI={cur_rsi:.1f} t={t.strftime('%H:%M')}"
         )

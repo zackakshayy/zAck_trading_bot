@@ -204,6 +204,15 @@ class SentimentAgent:
         # blends its verdicts with the news-derived score using the
         # `youtube_sentiment.overall_weight_vs_news` config multiplier.
         self.youtube_agent = youtube_agent
+        # Change-only log dedup. get_market_sentiment() and the cache read run
+        # every loop tick; without this they reprint identical lines constantly.
+        self._last_logs: dict = {}
+
+    def _log_changed(self, key: str, message: str):
+        """Emit `message` only when it differs from the last one logged for `key`."""
+        if self._last_logs.get(key) != message:
+            logging.info(message)
+            self._last_logs[key] = message
 
     # ---------- query builders ----------
 
@@ -309,7 +318,8 @@ class SentimentAgent:
             try:
                 with open(cache_path, 'r') as f:
                     cached = json.load(f)
-                logging.info(
+                self._log_changed(
+                    "cache_load",
                     f"SentimentAgent: loaded {len(cached.get('articles', []))} cached "
                     f"relevant articles (< 60min old)."
                 )
@@ -464,18 +474,21 @@ class SentimentAgent:
 
         if yt_n == 0:
             final_avg = news_avg
-            logging.info(
+            self._log_changed(
+                "final_avg",
                 f"SentimentAgent: news-only avg = {final_avg:+.3f} (over {news_n} headlines)."
             )
         elif news_n == 0:
             final_avg = yt_avg
-            logging.info(
+            self._log_changed(
+                "final_avg",
                 f"SentimentAgent: YouTube-only avg = {final_avg:+.3f} (over {yt_n} verdicts)."
             )
         else:
             news_w, yt_w = 1.0, yt_overall_weight
             final_avg = (news_w * news_avg + yt_w * yt_avg) / (news_w + yt_w)
-            logging.info(
+            self._log_changed(
+                "final_avg",
                 f"SentimentAgent: combined sentiment - "
                 f"news avg {news_avg:+.3f} (n={news_n}) | "
                 f"yt avg {yt_avg:+.3f} (n={yt_n}, weight={yt_overall_weight}x) | "
