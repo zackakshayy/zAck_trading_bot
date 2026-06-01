@@ -800,6 +800,13 @@ class TradingBotOrchestrator:
     })
     # Preferred order for range-day strategy selection (first available wins).
     _RANGE_SCALP_STRATEGIES = ('VWAP_Reversion', 'Reversal_Detector', 'RSI_Divergence')
+    # Mean-reversion / counter-trend strategies. These trade AGAINST the short-
+    # term move by design, so the 15-min trend-confirmation gate is skipped for
+    # them — a higher-timeframe trend filter would reject every reversion entry.
+    _MEAN_REVERSION_STRATEGIES = frozenset({
+        'VWAP_Reversion', 'RSI_Divergence', 'Reversal_Detector',
+        'Volatility_Cluster_Reversal',
+    })
 
     def _enter_range_scalp_mode(self, day_df) -> bool:
         """
@@ -2587,100 +2594,143 @@ class TradingBotOrchestrator:
                                 f"Will auto-disarm after this trade fires."
                             )
 
-                        if force_mode_now or getattr(self.active_strategy, 'is_reversal_trade', False) or is_primary_signal:
-                            # ATR momentum gate — bypassed in force mode.
-                            if not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
-                                pass  # already logged inside helper
-                            # VIX gate — bypassed in force mode.
-                            elif not force_mode_now and await self._is_vix_too_high():
-                                logging.warning("Skipping entry due to VIX gate.")
-                            # PCR gate — bypassed in force mode.
-                            elif not force_mode_now and not self._is_pcr_aligned(signal):
-                                pcr_tag = (self._pcr_data or {}).get("tag", "?")
-                                pcr_val = (self._pcr_data or {}).get("pcr")
-                                logging.warning(
-                                    f"PCR gate: {signal} blocked by {pcr_tag} "
-                                    f"(PCR={f'{pcr_val:.3f}' if pcr_val else 'N/A'}). "
-                                    f"PCR contradicts trade direction — skipping entry."
-                                )
-                            # Trap detection — skip false breakout/breakdown entries.
-                            elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
-                                pass  # already logged inside helper
-                            else:
-                                # Inject professional size multiplier so the order
-                                # agent applies progressive loss sizing + time-of-day
-                                # weighting when computing quantity.
-                                tod_factor = self._time_of_day_size_factor()
-                                effective_multiplier = self._trade_size_multiplier * tod_factor
-                                self.config['_effective_risk_pct_multiplier'] = effective_multiplier
-                                if effective_multiplier < 1.0:
-                                    logging.info(
-                                        f"[ProSize] Effective size multiplier: "
-                                        f"{effective_multiplier:.2f} "
-                                        f"(loss_factor={self._trade_size_multiplier:.2f} × "
-                                        f"time_factor={tod_factor:.2f})"
-                                    )
-
-                                # 15-min confirmation gate — bypassed in force mode.
-                                _15m_ok = True
-                                _15m_reason = ""
-                                if not force_mode_now and self.config.get(
-                                    "trading_flags", {}
-                                ).get("enable_15m_confirmation", True):
-                                    try:
-                                        df_15m = await self._get_15min_bars()
-                                        _15m_ok, _15m_reason = self._check_15min_confirmation(
-                                            signal, df_15m
-                                        )
-                                    except Exception as _15m_exc:
-                                        logging.debug(
-                                            f"15m confirmation check failed (bypassed): "
-                                            f"{_15m_exc}"
-                                        )
-                                        _15m_ok, _15m_reason = True, "error — bypassed"
-
-                                if not _15m_ok:
-                                    logging.warning(
-                                        f"15-min confirmation gate: {signal} blocked. "
-                                        f"{_15m_reason}"
-                                    )
-                                else:
-                                    if _15m_reason:
-                                        logging.info(f"15-min gate: {_15m_reason}")
-                                    trade_details = (
-                                        await self.order_agent.place_trade(signal, force_mode=force_mode_now)
-                                        if not is_paper
-                                        else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
-                                    )
-                                    if trade_details:
-                                        trade_details['Strategy'] = self.active_strategy_name
-                                        self.position_agent.start_trade(trade_details)
-                                        if not is_paper:
-                                            await self.position_agent.attach_broker_stop_loss(self.order_agent)
-                                        self.trades_today_count += 1
-                                        # Clear the \r status line before trade logs print.
-                                        if self._is_interactive_tty():
-                                            print(flush=True)
-                                        self.bot_state = "IN_POSITION"
-                                        self.awaiting_signal_since = None
-                                        # Auto-disarm force mode after the first trade.
-                                        if self._force_mode_armed:
-                                            self._force_mode_armed = False
-                                            logging.warning(
-                                                "FORCE-TRADE MODE disarmed: first diagnostic "
-                                                "trade fired. Normal gating resumes for any "
-                                                "subsequent entries this session."
-                                            )
-                        else:
-                            # Log only when the (signal, sentiment) pair changes —
-                            # otherwise this fires every tick and floods the terminal.
+                        # ── SOFT sentiment gate (Balanced fix) ────────────────
+                        # Counter-sentiment signals are no longer HARD-BLOCKED.
+                        # A signal that agrees with the locked sentiment (or a
+                        # reversal strategy / force mode) is "full conviction" and
+                        # trades at full size. A counter-sentiment signal still
+                        # trades, but at a reduced size (counter_sentiment_size_factor,
+                        # default 0.5). Every genuine risk control below
+                        # (momentum / VIX / PCR / trap / 15m / SL / loss limits)
+                        # is unchanged and still applies.
+                        is_full_conviction = (
+                            force_mode_now
+                            or getattr(self.active_strategy, 'is_reversal_trade', False)
+                            or is_primary_signal
+                        )
+                        is_counter_sentiment = not is_full_conviction
+                        if is_counter_sentiment:
+                            # Log only when (signal, sentiment) changes — avoids
+                            # flooding the terminal every tick.
                             _counter_key = (signal, self.day_sentiment)
                             if _counter_key != self._last_counter_signal:
+                                _cs_factor = float(
+                                    (self.config.get('trading_flags', {}) or {})
+                                    .get('counter_sentiment_size_factor', 0.5)
+                                )
                                 logging.warning(
-                                    f"COUNTER-SIGNAL DETECTED: '{signal}' vs sentiment "
-                                    f"'{self.day_sentiment}'. (Suppressing repeats until this changes.)"
+                                    f"COUNTER-SENTIMENT: '{signal}' disagrees with "
+                                    f"sentiment '{self.day_sentiment}'. Taking it at "
+                                    f"reduced size (×{_cs_factor:.2f}). "
+                                    f"(Suppressing repeats until this changes.)"
                                 )
                                 self._last_counter_signal = _counter_key
+
+                        # ATR momentum gate — bypassed in force mode.
+                        if not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
+                            pass  # already logged inside helper
+                        # VIX gate — bypassed in force mode.
+                        elif not force_mode_now and await self._is_vix_too_high():
+                            logging.warning("Skipping entry due to VIX gate.")
+                        # PCR gate — bypassed in force mode.
+                        elif not force_mode_now and not self._is_pcr_aligned(signal):
+                            pcr_tag = (self._pcr_data or {}).get("tag", "?")
+                            pcr_val = (self._pcr_data or {}).get("pcr")
+                            logging.warning(
+                                f"PCR gate: {signal} blocked by {pcr_tag} "
+                                f"(PCR={f'{pcr_val:.3f}' if pcr_val else 'N/A'}). "
+                                f"PCR contradicts trade direction — skipping entry."
+                            )
+                        # Trap detection — skip false breakout/breakdown entries.
+                        elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
+                            pass  # already logged inside helper
+                        else:
+                            # Inject professional size multiplier so the order
+                            # agent applies progressive loss sizing + time-of-day
+                            # weighting when computing quantity.
+                            tod_factor = self._time_of_day_size_factor()
+                            effective_multiplier = self._trade_size_multiplier * tod_factor
+                            # Counter-sentiment haircut (soft sentiment gate): trade
+                            # the signal but at reduced size.
+                            if is_counter_sentiment:
+                                effective_multiplier *= float(
+                                    (self.config.get('trading_flags', {}) or {})
+                                    .get('counter_sentiment_size_factor', 0.5)
+                                )
+                            self.config['_effective_risk_pct_multiplier'] = effective_multiplier
+                            if effective_multiplier < 1.0:
+                                logging.info(
+                                    f"[ProSize] Effective size multiplier: "
+                                    f"{effective_multiplier:.2f} "
+                                    f"(loss_factor={self._trade_size_multiplier:.2f} × "
+                                    f"time_factor={tod_factor:.2f}"
+                                    + (" × counter_sentiment)" if is_counter_sentiment else ")")
+                                )
+
+                            # 15-min confirmation gate — bypassed in force mode AND
+                            # for mean-reversion / reversal strategies. Those trade
+                            # AGAINST the short-term move by design, so a higher-
+                            # timeframe trend-confirm filter would reject every one
+                            # of their entries (the core structural contradiction).
+                            _is_mean_reversion = (
+                                getattr(self.active_strategy, 'is_reversal_trade', False)
+                                or self.active_strategy_name in self._MEAN_REVERSION_STRATEGIES
+                            )
+                            _15m_ok = True
+                            _15m_reason = ""
+                            if (not force_mode_now
+                                    and not _is_mean_reversion
+                                    and (self.config.get("trading_flags", {}) or {})
+                                        .get("enable_15m_confirmation", True)):
+                                try:
+                                    df_15m = await self._get_15min_bars()
+                                    _15m_ok, _15m_reason = self._check_15min_confirmation(
+                                        signal, df_15m
+                                    )
+                                except Exception as _15m_exc:
+                                    logging.debug(
+                                        f"15m confirmation check failed (bypassed): "
+                                        f"{_15m_exc}"
+                                    )
+                                    _15m_ok, _15m_reason = True, "error — bypassed"
+                            elif _is_mean_reversion:
+                                _15m_reason = (
+                                    "15m trend-confirm skipped — mean-reversion/"
+                                    "reversal strategy trades against the move by design"
+                                )
+
+                            if not _15m_ok:
+                                logging.warning(
+                                    f"15-min confirmation gate: {signal} blocked. "
+                                    f"{_15m_reason}"
+                                )
+                            else:
+                                if _15m_reason:
+                                    logging.info(f"15-min gate: {_15m_reason}")
+                                trade_details = (
+                                    await self.order_agent.place_trade(signal, force_mode=force_mode_now)
+                                    if not is_paper
+                                    else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
+                                )
+                                if trade_details:
+                                    trade_details['Strategy'] = self.active_strategy_name
+                                    self.position_agent.start_trade(trade_details)
+                                    if not is_paper:
+                                        await self.position_agent.attach_broker_stop_loss(self.order_agent)
+                                    self.trades_today_count += 1
+                                    # Clear the \r status line before trade logs print.
+                                    if self._is_interactive_tty():
+                                        print(flush=True)
+                                    self.bot_state = "IN_POSITION"
+                                    self.awaiting_signal_since = None
+                                    # Auto-disarm force mode after the first trade.
+                                    if self._force_mode_armed:
+                                        self._force_mode_armed = False
+                                        logging.warning(
+                                            "FORCE-TRADE MODE disarmed: first diagnostic "
+                                            "trade fired. Normal gating resumes for any "
+                                            "subsequent entries this session."
+                                        )
 
                 elif self.bot_state == "IN_POSITION":
                     underlying_df_hist = await self._get_underlying_bars()

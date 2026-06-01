@@ -141,7 +141,17 @@ trading_flags:
   min_atr_lookback_bars: 3
   force_one_trade_today: false
   # 15-minute confirmation gate (see pcr_feed block comment above for details).
+  # NOTE: this gate is automatically skipped for mean-reversion / reversal
+  # strategies (VWAP_Reversion, RSI_Divergence, Reversal_Detector,
+  # Volatility_Cluster_Reversal), which trade against the short-term move by
+  # design — a higher-timeframe trend filter would reject every such entry.
   enable_15m_confirmation: true
+  # SOFT sentiment gate: a signal whose direction disagrees with the locked
+  # day-sentiment is no longer hard-blocked — it is taken at this fraction of
+  # normal size (0.0–1.0). Set to 1.0 to fully ignore the sentiment direction,
+  # or lower it to penalise counter-sentiment trades more. Full-conviction
+  # trades (signal agrees with sentiment, or reversal/force mode) always use 1.0.
+  counter_sentiment_size_factor: 0.5
   underlying_instrument: NIFTY 50
   use_rag: true
   win_rate_threshold: 55.0
