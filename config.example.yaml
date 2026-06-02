@@ -75,6 +75,29 @@ risk_management:
   # Disabled by default — opt in by setting enable_weekly_loss_limit: true.
   enable_weekly_loss_limit: false
   max_weekly_loss_percent: 5.0
+# ---------------------------------------------------------------------------
+# Transaction costs (brokerage, STT, exchange/SEBI charges, stamp duty, GST).
+# A small gross profit on an options scalp is often a NET LOSS once these are
+# deducted. With enable: true the bot:
+#   • reports & tracks NET P&L (gross − costs) — loss limits use net too;
+#   • refuses to ENTER a trade whose best-case target can't net min_net_profit_inr;
+#   • refuses to BOOK a profit-taking indicator exit that can't clear costs+margin
+#     (loss-protective exits and the trailing stop are never blocked).
+# Rates below are Zerodha equity-options reference values (FY2024-25). Verify
+# against your own contract note and adjust if you use a different broker.
+transaction_costs:
+  enable: true
+  brokerage_per_order: 20.0       # flat ₹20 per executed order (options)
+  stt_sell_pct: 0.001             # 0.10% STT, charged on SELL-side premium only
+  exchange_txn_pct: 0.0003503     # NSE option txn charge on premium (both sides)
+  sebi_pct: 0.000001              # SEBI ₹10 per crore
+  stamp_duty_buy_pct: 0.00003     # 0.003% stamp duty, BUY side only
+  gst_pct: 0.18                   # 18% GST on (brokerage + txn + SEBI)
+  # Minimum NET profit (INR, after all costs) required to take/book a trade.
+  # Entry gate: skip if best-case target nets less than this.
+  # Exit guard: keep holding rather than booking a profit smaller than this.
+  min_net_profit_inr: 150.0
+  guard_profit_exits: true        # apply the min-net guard to profit-taking indicator exits
 strategy_signals:
   use_cpr_breakout: true
   use_ema_20_crossover: true

@@ -28,6 +28,7 @@ from infra import (
     append_iv_snapshot,
     atomic_write_json,
     compute_ivr,
+    estimate_options_cost,
     get_instruments,
     read_json,
     retry_call,
@@ -1182,6 +1183,32 @@ class OrderExecutionAgent:
                 f"risk_amt={risk_amount:.0f} ref_price={ref_price:.2f} "
                 f"risk_per_share={risk_per_share:.2f}"
             )
+
+            # ── Net-edge gate: skip trades that can't clear costs ──────────────
+            # Estimate round-trip cost and the BEST-CASE gross profit (the R:R
+            # target). If even hitting the full target wouldn't net at least
+            # `min_net_profit_inr` after costs, the trade isn't worth taking —
+            # the brokerage + STT + GST would eat the move. Bypassed in force
+            # mode and when transaction_costs.enable is false.
+            tc_cfg = (self.config.get("transaction_costs") or {})
+            min_net = float(tc_cfg.get("min_net_profit_inr", 0) or 0)
+            if not force_mode and tc_cfg.get("enable", True) and min_net > 0:
+                rr = float(self.flags.get("risk_reward_ratio", 2.0))
+                target_px      = ref_price + risk_per_share * rr
+                expected_gross = risk_per_share * rr * quantity
+                est = estimate_options_cost(
+                    ref_price * quantity, target_px * quantity, 2, self.config
+                )
+                expected_net = expected_gross - est["total"]
+                if expected_net < min_net:
+                    logging.warning(
+                        f"Net-edge gate: {symbol} skipped — best-case net "
+                        f"₹{expected_net:,.0f} (gross ₹{expected_gross:,.0f} − costs "
+                        f"₹{est['total']:,.0f}) < min ₹{min_net:,.0f}. "
+                        f"Position too small to beat brokerage/STT/GST."
+                    )
+                    return None, 0, 0
+
             return symbol, quantity, lot_size
         except Exception as e:
             logging.error(f"Error in _get_trade_details: {e}", exc_info=True)
@@ -1521,12 +1548,52 @@ class PositionManagementAgent:
         # 9. Indicator-based exit (PSAR / MA on the underlying).
         if self.tsl_config.get("use_indicator_exit") and underlying_hist_df is not None:
             if self._check_indicator_exit(underlying_hist_df):
-                logging.info(f"Indicator exit triggered for {symbol}.")
-                return await self.exit_trade(
-                    is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
-                )
+                # Net-profit guard: don't book a *profit-taking* indicator exit
+                # whose gain wouldn't even clear transaction costs + margin —
+                # that just converts a sub-cost scalp into a guaranteed net loss.
+                # Loss-protective exits (price at/below entry) are NEVER blocked;
+                # the trailing stop (step 7/8) still caps downside if we hold.
+                if self._exit_clears_costs(current_price):
+                    logging.info(f"Indicator exit triggered for {symbol}.")
+                    return await self.exit_trade(
+                        is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                    )
+                else:
+                    logging.info(
+                        f"[NetGuard] Indicator exit suppressed for {symbol} @ "
+                        f"{current_price:.2f}: net gain wouldn't clear costs+margin. "
+                        f"Holding — trailing stop still protects downside."
+                    )
 
         return "ACTIVE"
+
+    def _exit_clears_costs(self, current_price: float) -> bool:
+        """
+        Decide whether a *profit-taking* exit at `current_price` is worth booking
+        once transaction costs are deducted.
+
+        Returns True (allow the exit) when:
+          • the cost guard is disabled in config, OR
+          • we're not in profit (gross ≤ 0) — never block a loss-cut/protective exit, OR
+          • the NET gain (gross − round-trip costs) ≥ min_net_profit_inr.
+
+        Returns False only when we're in a small profit that wouldn't survive costs.
+        """
+        tc_cfg = (self.config.get("transaction_costs") or {})
+        if not tc_cfg.get("enable", True) or not tc_cfg.get("guard_profit_exits", True):
+            return True
+        trade = self.active_trade or {}
+        entry = float(trade.get("entry_price", 0) or 0)
+        qty   = int(trade.get("quantity", 0) or 0)
+        if entry <= 0 or qty <= 0 or current_price is None:
+            return True
+        gross = (float(current_price) - entry) * qty
+        if gross <= 0:
+            return True  # protective exit — always allow cutting a loser
+        est = estimate_options_cost(entry * qty, float(current_price) * qty, 2, self.config)
+        net = gross - est["total"]
+        min_net = float(tc_cfg.get("min_net_profit_inr", 0) or 0)
+        return net >= min_net
 
     # ---------- trailing / indicator exits ----------
 
@@ -1979,7 +2046,30 @@ class PositionManagementAgent:
         trade = self.active_trade
         # Remaining-lots P&L + any partial-exit P&L already banked at T1/T2.
         remaining_pnl = (exit_price - trade["entry_price"]) * trade["quantity"] if exit_price > 0 else 0.0
-        pnl = remaining_pnl + float(trade.get('_pe_realized_pnl', 0.0))
+        gross_pnl = remaining_pnl + float(trade.get('_pe_realized_pnl', 0.0))
+
+        # ── Transaction costs → NET P&L ────────────────────────────────────
+        # Brokerage + STT + exchange/SEBI charges + stamp duty + GST. A small
+        # gross win is often a NET loss once these are deducted, so everything
+        # downstream (realized-P&L tracking, loss limits, reports) must use NET.
+        qty       = int(trade.get("quantity", 0) or 0)
+        entry_px  = float(trade.get("entry_price", 0) or 0)
+        buy_value  = abs(entry_px) * qty
+        sell_value = abs(float(exit_price)) * qty if exit_price > 0 else 0.0
+        # Order count: 1 entry + 1 final exit, +1 for each partial that fired,
+        # +2 for a debit spread's extra short leg (entry + exit).
+        num_orders = 2
+        if trade.get("_pe_t1_hit"):  num_orders += 1
+        if trade.get("_pe_t2_hit"):  num_orders += 1
+        if trade.get("is_spread"):   num_orders += 2
+        tc_cfg = (self.config.get("transaction_costs") or {})
+        if tc_cfg.get("enable", True):
+            cost_breakdown = estimate_options_cost(buy_value, sell_value, num_orders, self.config)
+            costs = cost_breakdown["total"]
+        else:
+            cost_breakdown, costs = {}, 0.0
+        net_pnl = gross_pnl - costs
+
         completed = {
             "Timestamp": datetime.datetime.now(),
             "OrderID": trade.get("order_id"),
@@ -1990,7 +2080,10 @@ class PositionManagementAgent:
             "EntryPrice": trade["entry_price"],
             "ExitPrice": exit_price,
             "Quantity": trade["quantity"],
-            "ProfitLoss": pnl,
+            "ProfitLoss": net_pnl,            # NET of all costs — used everywhere downstream
+            "GrossProfitLoss": gross_pnl,     # before costs (for transparency / reports)
+            "Costs": costs,
+            "CostBreakdown": cost_breakdown,
             "Status": "CLOSED",
             "Strategy": trade.get("Strategy", "N/A"),
             # Extra context for the loss post-mortem (loss_analyzer.build_loss_report).
@@ -2000,8 +2093,16 @@ class PositionManagementAgent:
             "initial_stop_loss": trade.get("initial_stop_loss"),
             "lot_size": trade.get("lot_size"),
         }
+        if costs:
+            logging.info(
+                f"[Costs] {trade['symbol']}: gross ₹{gross_pnl:,.2f} − costs "
+                f"₹{costs:,.2f} (brokerage ₹{cost_breakdown.get('brokerage',0):.0f}, "
+                f"STT ₹{cost_breakdown.get('stt',0):.0f}, "
+                f"txn ₹{cost_breakdown.get('exchange_txn',0):.0f}, "
+                f"GST ₹{cost_breakdown.get('gst',0):.0f}) = NET ₹{net_pnl:,.2f}"
+            )
 
-        if pnl < 0 and self.flags.get("enable_gemini_loss_analysis") and gemini_api_key:
+        if net_pnl < 0 and self.flags.get("enable_gemini_loss_analysis") and gemini_api_key:
             try:
                 completed["Rationale"] = await self.analyze_losing_trade(
                     completed, underlying_df, sentiment_agent, gemini_api_key

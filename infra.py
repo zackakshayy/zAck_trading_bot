@@ -162,6 +162,67 @@ def tick_round(price: float, tick_size: float = 0.05) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Transaction-cost model (Indian NFO options, Zerodha reference rates)
+# ---------------------------------------------------------------------------
+# A ₹100 gross "profit" on an options scalp can be a net LOSS once brokerage,
+# STT, exchange + SEBI charges, stamp duty and GST are deducted. These helpers
+# let the bot reason in NET terms — both when deciding to enter and when
+# booking the result. All rates are fractions (0.001 = 0.10%) and reflect
+# Zerodha's equity-options charges as of FY2024-25; override any of them under
+# config['transaction_costs'].
+DEFAULT_COST_RATES: dict = {
+    "brokerage_per_order": 20.0,      # flat ₹20 per executed order (options)
+    "stt_sell_pct":        0.001,     # 0.10% STT — charged on the SELL-side premium only
+    "exchange_txn_pct":    0.0003503, # NSE option txn charge on premium turnover (both sides)
+    "sebi_pct":            0.000001,  # SEBI ₹10 per crore = 0.0001%
+    "stamp_duty_buy_pct":  0.00003,   # 0.003% stamp duty — BUY side only
+    "gst_pct":             0.18,      # 18% GST on (brokerage + exchange txn + SEBI)
+}
+
+
+def estimate_options_cost(buy_value: float, sell_value: float,
+                          num_orders: int = 2, config: dict | None = None) -> dict:
+    """
+    Estimate the all-in round-trip transaction cost (INR) for an intraday NFO
+    options trade. `buy_value` / `sell_value` are premium turnovers
+    (price × quantity) for the buy and sell sides respectively.
+
+    Returns a breakdown dict including 'total'. Pure function — cheap enough to
+    call from the hot loop and from pre-trade sizing.
+    """
+    rates = dict(DEFAULT_COST_RATES)
+    user = ((config or {}).get("transaction_costs") or {})
+    for k in rates:
+        if user.get(k) is not None:
+            try:
+                rates[k] = float(user[k])
+            except (TypeError, ValueError):
+                pass
+
+    buy_value  = max(0.0, float(buy_value or 0))
+    sell_value = max(0.0, float(sell_value or 0))
+    turnover   = buy_value + sell_value
+
+    brokerage = rates["brokerage_per_order"] * max(1, int(num_orders))
+    stt       = sell_value * rates["stt_sell_pct"]
+    exch_txn  = turnover   * rates["exchange_txn_pct"]
+    sebi      = turnover   * rates["sebi_pct"]
+    stamp     = buy_value  * rates["stamp_duty_buy_pct"]
+    gst       = (brokerage + exch_txn + sebi) * rates["gst_pct"]
+    total     = brokerage + stt + exch_txn + sebi + stamp + gst
+
+    return {
+        "brokerage":    round(brokerage, 2),
+        "stt":          round(stt, 2),
+        "exchange_txn": round(exch_txn, 2),
+        "sebi":         round(sebi, 2),
+        "stamp_duty":   round(stamp, 2),
+        "gst":          round(gst, 2),
+        "total":        round(total, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # NSE trading-day calendar
 # ---------------------------------------------------------------------------
 
