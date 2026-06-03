@@ -35,6 +35,9 @@ from infra import (
     safe_ltp,
     save_daily_pnl,
     save_weekly_pnl,
+    state_path,
+    atomic_write_json,
+    read_json,
 )
 import multiprocessing
 import warnings
@@ -191,6 +194,10 @@ class TradingBotOrchestrator:
         self.scratch_today: int = 0
         self.completed_trades: list = []   # [{symbol, type, gross, costs, net, strategy}]
         self._session_summary_printed: bool = False
+        # Restore today's trade ledger from disk so a same-day RESTART shows the
+        # FULL day (trades, W/L, trade count) — not just trades since this run
+        # started. The end-of-day report/summary then always covers the whole day.
+        self._load_ledger()
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
@@ -2382,6 +2389,54 @@ class TradingBotOrchestrator:
             return False
         return True
 
+    def _ledger_path(self) -> str:
+        return state_path(f"trade_ledger_{self._today_str}.json")
+
+    def _persist_ledger(self) -> None:
+        """
+        Persist today's trade ledger + counters to disk so a same-day RESTART
+        restores the full day (for the end-of-day summary AND the daily-max
+        trade cap). Written on every entry and every completed trade. Realized
+        P&L itself is already persisted separately (daily_pnl.json).
+        """
+        try:
+            atomic_write_json(self._ledger_path(), {
+                "date": self._today_str,
+                "trades_today_count": int(self.trades_today_count),
+                "wins": int(self.wins_today),
+                "losses": int(self.losses_today),
+                "scratch": int(self.scratch_today),
+                "completed_trades": self.completed_trades,
+            })
+        except Exception as e:
+            logging.debug(f"Could not persist trade ledger: {e}")
+
+    def _load_ledger(self) -> None:
+        """
+        Restore today's ledger from disk on startup (same-day restart). No-op if
+        the file is missing or belongs to a previous day — so a fresh day starts
+        clean. Keeps the EOD report/summary and the daily-max cap correct across
+        restarts.
+        """
+        try:
+            data = read_json(self._ledger_path(), default=None)
+            if not isinstance(data, dict) or data.get("date") != self._today_str:
+                return
+            self.completed_trades = data.get("completed_trades", []) or []
+            self.wins_today    = int(data.get("wins", 0) or 0)
+            self.losses_today  = int(data.get("losses", 0) or 0)
+            self.scratch_today = int(data.get("scratch", 0) or 0)
+            self.trades_today_count = int(data.get("trades_today_count", 0) or 0)
+            if self.completed_trades or self.trades_today_count:
+                logging.info(
+                    f"Restored today's ledger from disk: {self.trades_today_count} "
+                    f"trade(s) placed, {len(self.completed_trades)} closed "
+                    f"(W:{self.wins_today} L:{self.losses_today}). "
+                    f"Daily-max cap and EOD summary now cover the full day."
+                )
+        except Exception as e:
+            logging.debug(f"Could not load trade ledger: {e}")
+
     def _current_balance(self) -> tuple:
         """
         Returns (balance, label) for the running account balance.
@@ -2896,6 +2951,7 @@ class TradingBotOrchestrator:
                                     if not is_paper:
                                         await self.position_agent.attach_broker_stop_loss(self.order_agent)
                                     self.trades_today_count += 1
+                                    self._persist_ledger()   # daily-max cap survives restarts
                                     # Clear the \r status line before trade logs print.
                                     if self._is_interactive_tty():
                                         print(flush=True)
@@ -2954,6 +3010,7 @@ class TradingBotOrchestrator:
                             'net':      float(status.get('ProfitLoss', 0) or 0),
                             'strategy': status.get('Strategy', '?'),
                         })
+                        self._persist_ledger()   # survive same-day restarts
                         # On a losing trade, build a detailed post-mortem,
                         # print it to the terminal, and email it.
                         if float(status.get('ProfitLoss', 0) or 0) < 0:
