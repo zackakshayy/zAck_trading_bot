@@ -103,6 +103,40 @@ strategy_signals:
   use_ema_20_crossover: true
   use_ema_50_crossover: true
   use_rsi_divergence: true
+# ---------------------------------------------------------------------------
+# Pre-market price-action / global-cues trend module (market_trend.py).
+# When enable: true, the day's directional bias (CE = buy calls / bullish,
+# PE = buy puts / bearish) is decided from global markets + GIFT-Nifty implied
+# gap + the NIFTY open gap + recent price action, INSTEAD of the news/YouTube
+# sentiment flow. The operator gets a 20-second window to override (type CE/PE
+# or a sentiment word); otherwise the automated verdict is used.
+# Global feeds use yfinance (no API key). Each source is best-effort — a missing
+# feed just drops out of the weighted score. GIFT Nifty has no reliable free
+# feed: set gift_nifty_ticker to a working yfinance symbol to include it, else
+# it's skipped and the verdict still works from the other cues.
+market_trend:
+  enable: false                       # set true to use price-action trend as the directional driver
+  us_futures_tickers: ["ES=F", "NQ=F", "YM=F"]   # S&P/Nasdaq/Dow futures (overnight, freshest)
+  us_index_tickers:   ["^GSPC", "^IXIC", "^DJI"] # US cash indices (prior close)
+  asia_tickers:       ["^N225", "^HSI"]          # Nikkei / Hang Seng (live in IST pre-open)
+  gift_nifty_ticker:  ""              # optional yfinance symbol for GIFT Nifty ("" = skip)
+  nifty_yf_ticker:    "^NSEI"         # NIFTY 50 prior-close fallback for gap
+  neutral_band: 0.15                  # |score| below this → Neutral (no trade bias)
+  strong_band:  0.50                  # |score| at/above this → "Very" Bullish/Bearish
+  weights:
+    gift_nifty:   0.30
+    gap:          0.25
+    us_futures:   0.18
+    us_indices:   0.10
+    asia:         0.10
+    price_action: 0.07
+  scales:                             # % move that maps to a full ±1.0 component score
+    gift_nifty:   0.50
+    gap:          0.50
+    us_futures:   0.75
+    us_indices:   0.75
+    asia:         0.90
+    price_action: 1.00
 # Put-Call Ratio feed. Fetches NIFTY option chain OI from Kite (NFO instruments
 # + quote API). Used as a pre-trade gate: a PCR_BEARISH reading blocks BUY
 # entries, PCR_BULLISH blocks SELL entries. Set enable: false to disable.

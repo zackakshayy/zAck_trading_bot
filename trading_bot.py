@@ -14,6 +14,7 @@ from agents import OrderExecutionAgent, PositionManagementAgent
 from sentiment_agent import SentimentAgent
 from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
+from market_trend import MarketTrendAnalyzer
 from strategy_factory import get_strategy
 from backtester import run_backtest
 from reporting import (
@@ -147,6 +148,9 @@ class TradingBotOrchestrator:
             gemini_api_key=(config.get('google_api') or {}).get('api_key', ''),
         )
         self.sentiment_agent = SentimentAgent(config, youtube_agent=self.youtube_agent)
+        # Pre-market price-action / global-cues trend analyzer (CE/PE verdict).
+        # Uses self.kite for NIFTY gap + price action; yfinance for global feeds.
+        self.market_trend_analyzer = MarketTrendAnalyzer(self.kite, config)
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -1174,7 +1178,15 @@ class TradingBotOrchestrator:
                         print("  Please reconfirm market sentiment.")
                         print("!" * 78)
 
-                self.day_sentiment = await self._resolve_sentiment()
+                # Directional bias: when the price-action trend module is on, it
+                # produces the CE/PE verdict (global cues + gap + GIFT + price
+                # action) with its own 20s override. Otherwise fall back to the
+                # news/YouTube sentiment flow. Both honour the same hard config/env
+                # overrides and set self.day_sentiment on the same scale.
+                if (self.config.get('market_trend') or {}).get('enable', False):
+                    self.day_sentiment = await self._resolve_market_trend()
+                else:
+                    self.day_sentiment = await self._resolve_sentiment()
                 self._cached_sentiment = self.day_sentiment
                 await self._snapshot_sentiment_context()
                 # Print the mid-session override hint once per session so
@@ -1785,6 +1797,89 @@ class TradingBotOrchestrator:
             send_loss_analysis_email(self.config, report, completed_trade)
         except Exception as e:
             logging.error(f"Loss-analysis email failed: {e}", exc_info=True)
+
+    async def _resolve_market_trend(self):
+        """
+        Pre-market directional resolver (CE / PE / Neutral) driven by the
+        MarketTrendAnalyzer: global market fluctuations, GIFT-Nifty implied gap,
+        the NIFTY open gap, and recent price action. Mirrors _resolve_sentiment:
+
+          1. Hard config/env override (daily_overrides.sentiment / DAILY_SENTIMENT)
+             wins outright — used for unattended runs.
+          2. Compute the automated price-action verdict and show its drivers.
+          3. On a TTY, give the operator `operator_input_timeout_seconds` (20s
+             default) to override; Enter or timeout accepts the automated verdict.
+          4. Returns a sentiment string on the same scale day_sentiment uses
+             (Very Bullish / Bullish / Neutral / Bearish / Very Bearish), so the
+             rest of the bot (signal-direction gate → CE/PE) is unchanged.
+        """
+        valid = {"Very Bullish", "Bullish", "Bearish", "Very Bearish", "Neutral"}
+
+        # 1. Hard override wins (unattended runs).
+        hard_override = (
+            (self.config.get("daily_overrides", {}) or {}).get("sentiment")
+            or os.environ.get("DAILY_SENTIMENT")
+        )
+        if hard_override and hard_override in valid:
+            logging.info(f"[MarketTrend] Hard-override from config/env: {hard_override}")
+            return hard_override
+
+        # 2. Automated price-action verdict.
+        try:
+            trend = await self.market_trend_analyzer.get_trend()
+        except Exception as e:
+            logging.warning(f"[MarketTrend] analysis failed ({e}); defaulting to Neutral.")
+            trend = {"verdict": "NEUTRAL", "sentiment": "Neutral",
+                     "composite": 0.0, "components": {},
+                     "summary": "analysis failed — Neutral"}
+        automated = trend.get("sentiment", "Neutral")
+        logging.info(
+            f"[MarketTrend] Verdict: {trend.get('verdict')} "
+            f"(score {trend.get('composite'):+.2f}) → {automated}"
+        )
+
+        # Show the driver breakdown on the terminal.
+        if self._is_interactive_tty():
+            try:
+                self._print_event(
+                    self.market_trend_analyzer.format_breakdown(trend), level="info"
+                )
+            except Exception:
+                pass
+
+        # 3. Headless / non-interactive → accept automated silently.
+        if not self._is_interactive_tty():
+            logging.info(f"[MarketTrend] No TTY → using automated verdict '{automated}'.")
+            return automated
+
+        # 4. 20-second operator override.
+        canonical_by_norm = {" ".join(s.split()).lower(): s for s in valid}
+        # Convenience aliases so the operator can just type CE / PE.
+        canonical_by_norm.update({"ce": "Bullish", "pe": "Bearish",
+                                  "buy ce": "Bullish", "buy pe": "Bearish"})
+        timeout = float(self.config['trading_flags'].get('operator_input_timeout_seconds', 20))
+
+        while True:
+            user_input = await self._input_with_timeout(
+                f"\nPre-market trend verdict: {trend.get('verdict')} ({automated})\n"
+                f"Press Enter to accept, type CE / PE, or a sentiment "
+                f"{sorted(valid)} to override (auto-accepts in {int(timeout)}s): ",
+                timeout=timeout,
+            )
+            if user_input is None:
+                logging.info(f"[MarketTrend] Auto-resolved on timeout: {automated}")
+                return automated
+            if user_input == "":
+                logging.info(f"[MarketTrend] Operator accepted automated verdict: {automated}")
+                return automated
+            canonical = canonical_by_norm.get(" ".join(user_input.split()).lower())
+            if canonical:
+                logging.info(f"[MarketTrend] Operator overrode {automated} → {canonical}")
+                return canonical
+            logging.warning(
+                f"Invalid input '{user_input}'. Type CE, PE, one of {sorted(valid)} "
+                f"(case-insensitive), or press Enter to accept '{automated}'."
+            )
 
     async def _resolve_sentiment(self):
         """

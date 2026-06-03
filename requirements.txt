@@ -17,6 +17,9 @@ aiohttp==3.9.5
 requests==2.32.3
 beautifulsoup4==4.12.3
 
+#Global market data for the pre-market trend module (market_trend.py)
+yfinance>=0.2.40
+
 #Configuration
 PyYAML==6.0.1
 python-dotenv>=1.0.0
