@@ -120,6 +120,12 @@ pcr_feed:
 # so a transient outage never silently blocks all trades.
 # Set enable_15m_confirmation: false in trading_flags to disable.
 trading_flags:
+  # BUY-ONLY guarantee. When true (default) the bot NEVER writes/sells an
+  # option to open — it only BUYS long options (CALL for a bullish signal, PUT
+  # for a bearish signal), with risk capped at the premium paid. This hard-
+  # disables debit spreads (whose short leg is a sold option) regardless of the
+  # debit_spread block. Set to false only if you explicitly want option-writing.
+  buy_only: true
   backtest_years: 2
   chart_timeframe: 5minute
   ema_cross_lookback: 50

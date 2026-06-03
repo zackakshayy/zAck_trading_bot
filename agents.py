@@ -500,6 +500,14 @@ class OrderExecutionAgent:
     # ---------- debit spread helpers ----------
 
     def _spread_enabled(self) -> bool:
+        # HARD buy-only guarantee. A debit spread's short leg is a SOLD
+        # (written) option — the only place this bot would ever sell-to-open.
+        # When trading_flags.buy_only is true (the default) we never write an
+        # option, so spreads are disabled regardless of debit_spread.enable.
+        # The bot then only ever BUYS options (long CE for bullish, long PE for
+        # bearish), with risk capped at the premium paid.
+        if (self.config.get("trading_flags") or {}).get("buy_only", True):
+            return False
         return bool((self.config.get("debit_spread") or {}).get("enable", False))
 
     def _select_spread_short_leg(
@@ -801,8 +809,13 @@ class OrderExecutionAgent:
 
         is_spread   = short_symbol is not None and short_ltp is not None
         entry_price = (ltp - short_ltp) if is_spread else ltp
+        # The order placed is always a BUY of a long option. `direction` is the
+        # market view: BUY → long CALL (bullish), SELL → long PUT (bearish).
+        # Label the log by the actual action to avoid "selling options" confusion.
+        _opt_type = "CE" if symbol.endswith("CE") else ("PE" if symbol.endswith("PE") else "OPT")
+        _view = "bullish" if direction == "BUY" else "bearish"
         logging.info(
-            f"[Paper] {direction} {symbol} qty={qty} @ {ltp:.2f}"
+            f"[Paper] BUY {qty} {symbol} @ {ltp:.2f}  (long {_opt_type} — {_view} view)"
             + (f" | spread short={short_symbol} @ {short_ltp:.2f} net_debit={entry_price:.2f}"
                if is_spread else "")
         )
