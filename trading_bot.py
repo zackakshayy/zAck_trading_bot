@@ -181,6 +181,12 @@ class TradingBotOrchestrator:
         # The circuit breaker fires once N losses occur in an unbroken streak
         # within this session; winning trades reset the streak to 0.
         self.consecutive_losses: int = 0
+        # Session trade ledger for the live status line + end-of-day summary.
+        self.wins_today: int = 0
+        self.losses_today: int = 0
+        self.scratch_today: int = 0
+        self.completed_trades: list = []   # [{symbol, type, gross, costs, net, strategy}]
+        self._session_summary_printed: bool = False
         self.starting_capital = None
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
@@ -1504,9 +1510,10 @@ class TradingBotOrchestrator:
             hold_reason = ""
             if self.active_strategy and getattr(self.active_strategy, '_last_hold_reason', ''):
                 hold_reason = f" │ {self.active_strategy._last_hold_reason[:60]}"
+            wl       = f"W:{self.wins_today} L:{self.losses_today}"
             line = (
                 f"⏳ {ts}  AWAITING │ {manual_tag}{strategy} │ {mode} │ {sent}{dq_part}"
-                f" │ {pnl_str} ({trades}T) │ ⏱ {elapsed}{hold_reason}"
+                f" │ {pnl_str} ({trades}T {wl}) │ ⏱ {elapsed}{hold_reason}"
             )
 
         elif state == "IN_POSITION":
@@ -1519,18 +1526,24 @@ class TradingBotOrchestrator:
             pnl_str = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
             entry_s = f"entry ₹{entry:.2f}" if entry else ""
             trail_s = f" │ trail ₹{trail:.2f}" if trail else ""
+            wl      = f"W:{self.wins_today} L:{self.losses_today}"
             line = (
                 f"📈 {ts}  IN TRADE │ {symbol} │ {entry_s}{trail_s}"
-                f" │ P&L today {pnl_str}"
+                f" │ P&L today {pnl_str} ({wl})"
             )
 
         elif state == "SETUP":
             line = f"⚙  {ts}  SETTING UP  …"
 
         elif state == "STOPPED":
-            pnl     = getattr(self, 'realized_pnl_today', 0.0) or 0.0
-            pnl_str = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
-            line    = f"⏹  {ts}  STOPPED  │  P&L today {pnl_str}"
+            pnl      = getattr(self, 'realized_pnl_today', 0.0) or 0.0
+            pnl_str  = f"+₹{pnl:,.0f}" if pnl >= 0 else f"-₹{abs(pnl):,.0f}"
+            bal, lbl = self._current_balance()
+            placed   = getattr(self, 'trades_today_count', 0)
+            line     = (
+                f"⏹  {ts}  STOPPED │ Net {pnl_str} │ {placed}T placed "
+                f"(W:{self.wins_today} L:{self.losses_today}) │ Bal ₹{bal:,.0f} ({lbl})"
+            )
 
         else:
             line = f"   {ts}  {state}"
@@ -2274,10 +2287,79 @@ class TradingBotOrchestrator:
             return False
         return True
 
+    def _current_balance(self) -> tuple:
+        """
+        Returns (balance, label) for the running account balance.
+
+        LIVE  → broker margin (self.starting_capital is re-fetched each loop via
+                _refresh_starting_capital, so it already reflects realized P&L —
+                this is a real-time value, polled every cycle).
+        PAPER → starting capital + simulated realized P&L (paper fills never
+                touch the real broker balance, so we track it ourselves).
+        """
+        start = float(self.starting_capital or 0.0)
+        is_paper = bool((self.config.get('trading_flags') or {}).get('paper_trading', True))
+        if is_paper:
+            return start + float(self.realized_pnl_today or 0.0), "sim"
+        return start, "live"
+
+    def _print_session_summary(self) -> None:
+        """
+        Print a one-time end-of-session summary: every trade taken, gross vs net
+        (after costs), win/loss tally, and the start→end balance with its source
+        (live broker vs simulated). Called from run()'s finally block.
+        """
+        if self._session_summary_printed:
+            return
+        self._session_summary_printed = True
+        if not self._is_interactive_tty():
+            return
+
+        bal, lbl = self._current_balance()
+        start = float(self.starting_capital or 0.0)
+        net   = float(self.realized_pnl_today or 0.0)
+        gross = sum(t['gross'] for t in self.completed_trades)
+        costs = sum(t['costs'] for t in self.completed_trades)
+        net_str = f"+₹{net:,.2f}" if net >= 0 else f"-₹{abs(net):,.2f}"
+        bal_src = ("paper — real broker balance unchanged; this is start + simulated P&L"
+                   if lbl == "sim" else
+                   "live broker balance, polled every loop cycle (real-time)")
+
+        lines = [
+            f"SESSION SUMMARY  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"  Trades placed : {self.trades_today_count}   "
+            f"│  Closed: {len(self.completed_trades)}  "
+            f"(W:{self.wins_today}  L:{self.losses_today}  scratch:{self.scratch_today})",
+            f"  Gross P&L     : ₹{gross:,.2f}   │  Costs: ₹{costs:,.2f}   │  NET: {net_str}",
+            f"  Balance       : ₹{start:,.0f}  →  ₹{bal:,.0f}   ({lbl})",
+            f"                  {bal_src}",
+        ]
+        if self.completed_trades:
+            lines.append("  Trades:")
+            for i, t in enumerate(self.completed_trades, 1):
+                tnet = t['net']
+                tnet_str = f"+₹{tnet:,.2f}" if tnet >= 0 else f"-₹{abs(tnet):,.2f}"
+                lines.append(
+                    f"   {i:>2}. {t['type']:<4} {t['symbol']:<22} "
+                    f"net {tnet_str:>12}  (gross ₹{t['gross']:,.0f} − costs ₹{t['costs']:,.0f})  "
+                    f"[{t['strategy']}]"
+                )
+        else:
+            lines.append("  No trades were taken this session.")
+        self._print_event(lines, level="info")
+
     def _record_realized_pnl(self, delta_pnl: float) -> None:
         amount = float(delta_pnl or 0)
         self.realized_pnl_today += amount
         self.realized_pnl_week  += amount
+
+        # Win/loss tally (on NET P&L — `amount` is already net of costs).
+        if amount > 0:
+            self.wins_today += 1
+        elif amount < 0:
+            self.losses_today += 1
+        else:
+            self.scratch_today += 1
 
         # Update the consecutive-loss streak and progressive size multiplier.
         if amount < 0:
@@ -2368,7 +2450,8 @@ class TradingBotOrchestrator:
             _root_logger.removeHandler(_status_handler)
             for h in _orig_handlers:
                 _root_logger.addHandler(h)
-            # Always send the daily report on exit.
+            # Print the end-of-session trade summary, then send the daily report.
+            self._print_session_summary()
             self._send_shutdown_report_once()
 
     async def _run_inner(self):
@@ -2766,6 +2849,16 @@ class TradingBotOrchestrator:
                     if isinstance(status, dict):
                         log_trade(status)
                         self._record_realized_pnl(status.get('ProfitLoss', 0))
+                        # Ledger entry for the live status line + EOD summary.
+                        self.completed_trades.append({
+                            'symbol':   status.get('Symbol', '?'),
+                            'type':     status.get('TradeType', '?'),
+                            'gross':    float(status.get('GrossProfitLoss',
+                                              status.get('ProfitLoss', 0)) or 0),
+                            'costs':    float(status.get('Costs', 0) or 0),
+                            'net':      float(status.get('ProfitLoss', 0) or 0),
+                            'strategy': status.get('Strategy', '?'),
+                        })
                         # On a losing trade, build a detailed post-mortem,
                         # print it to the terminal, and email it.
                         if float(status.get('ProfitLoss', 0) or 0) < 0:
