@@ -1672,9 +1672,40 @@ class PositionManagementAgent:
         kind = self.tsl_config.get("indicator_exit_type", "NONE")
         if df is None or df.empty:
             return False
+
+        # ── Minimum hold: give the trade room to breathe through entry noise. ──
+        # Without this, a single bar closing on the wrong side of a fast EMA/PSAR
+        # (common in low-vol chop) exits the trade within minutes for a few-point
+        # loss. The hard stop-loss and software trailing stop still protect
+        # against genuine adverse moves during this window.
+        min_hold = float(self.tsl_config.get("indicator_exit_min_hold_minutes", 10) or 0)
+        if min_hold > 0:
+            et = (self.active_trade or {}).get("entry_time")
+            if et:
+                try:
+                    entry_dt = datetime.datetime.fromisoformat(et)
+                    held_min = (datetime.datetime.now() - entry_dt).total_seconds() / 60.0
+                    if held_min < min_hold:
+                        return False
+                except Exception:
+                    pass
+
         last = df.iloc[-1]
         price = last["close"]
         side = self.active_trade["type"]
+
+        # ── Volatility-aware buffer: the underlying must be BEYOND the indicator
+        # by at least atr_mult × ATR before we act, so noise wiggles around the
+        # line don't chop us out. The buffer scales with volatility — bigger ATR
+        # demands a bigger breach. Falls back to 0.1% of price if ATR is missing. ──
+        buf = 0.0
+        atr_mult = float(self.tsl_config.get("indicator_exit_atr_buffer_mult", 0.25) or 0)
+        if atr_mult > 0:
+            atr_val = last.get("atr")
+            if atr_val is not None and not pd.isna(atr_val) and float(atr_val) > 0:
+                buf = atr_mult * float(atr_val)
+            else:
+                buf = 0.001 * float(price)
 
         if kind == "MA":
             period = int(self.tsl_config.get("ma_period", 9))
@@ -1684,9 +1715,9 @@ class PositionManagementAgent:
             ma = df.iloc[-1].get(col)
             if pd.isna(ma):
                 return False
-            if side == "BUY" and price < ma:
+            if side == "BUY" and price < (ma - buf):
                 return True
-            if side == "SELL" and price > ma:
+            if side == "SELL" and price > (ma + buf):
                 return True
             return False
 
@@ -1708,11 +1739,11 @@ class PositionManagementAgent:
                         df["psar_short"] = psar[short_col]
             if side == "BUY":
                 short_val = df.iloc[-1].get("psar_short")
-                if short_val is not None and not pd.isna(short_val) and price < short_val:
+                if short_val is not None and not pd.isna(short_val) and price < (short_val - buf):
                     return True
             else:
                 long_val = df.iloc[-1].get("psar_long")
-                if long_val is not None and not pd.isna(long_val) and price > long_val:
+                if long_val is not None and not pd.isna(long_val) and price > (long_val + buf):
                     return True
             return False
 
@@ -1899,9 +1930,13 @@ class PositionManagementAgent:
                 f"Historical context:\n{rag_context}\n\n"
                 f"Give a 3-sentence rationale for the loss and one specific lesson."
             )
+            # gemini-1.5-flash is retired (404). Use the current model, overridable
+            # via config.google_api.model (defaults match the rest of the bot).
+            model = ((self.config.get("google_api") or {}).get("model")
+                     or "gemini-2.0-flash")
             api_url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-1.5-flash:generateContent?key={gemini_api_key}"
+                f"{model}:generateContent?key={gemini_api_key}"
             )
             payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
             timeout = aiohttp.ClientTimeout(total=30)
