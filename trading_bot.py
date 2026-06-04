@@ -194,6 +194,8 @@ class TradingBotOrchestrator:
         self.scratch_today: int = 0
         self.completed_trades: list = []   # [{symbol, type, gross, costs, net, strategy}]
         self._session_summary_printed: bool = False
+        # Tally of *why* entries were blocked, for the "why no trade" rationale.
+        self._block_reasons: dict = {}
         # Restore today's trade ledger from disk so a same-day RESTART shows the
         # FULL day (trades, W/L, trade count) — not just trades since this run
         # started. The end-of-day report/summary then always covers the whole day.
@@ -2426,6 +2428,69 @@ class TradingBotOrchestrator:
             return False
         return True
 
+    # Human-readable rationale for each entry-blocking reason.
+    _BLOCK_LABELS: dict = {
+        "no_signal":       "strategy returned HOLD — waiting for its entry pattern",
+        "choppy":          "day classified CHOPPY — too many direction changes, no trend to ride",
+        "range":           "day classified RANGE / no scalp setup — price boxed in",
+        "momentum_low":    "ATR momentum too low — market too slow for options buying",
+        "vix_high":        "VIX above the max — too volatile/risky to enter",
+        "pcr":             "PCR option-flow contradicted the signal direction",
+        "trap":            "false-breakout trap detected — stop-hunt pattern",
+        "confirm_15m":     "15-min higher-timeframe didn't confirm the signal",
+        "no_trade_window": "outside the entry window (pre-open / lunch / past cutoff)",
+        "max_trades":      "daily max-trades already reached",
+        "cooldown":        "active strategy cooled (0 signals last window) — rotating",
+    }
+
+    def _note_block(self, reason: str) -> None:
+        """Tally an entry-blocking reason for the 'why no trade' diagnosis."""
+        self._block_reasons[reason] = self._block_reasons.get(reason, 0) + 1
+
+    def _plain_verdict(self, top_key: str) -> str:
+        dq = getattr(self, '_day_quality', 'UNKNOWN')
+        if top_key == "choppy" or dq == "CHOPPY":
+            return ("market is CHOPPY (whipsawing, no clean trend) — sitting out is the "
+                    "correct call; forcing trades here just bleeds theta + costs.")
+        if top_key == "range" or dq == "RANGE":
+            return ("market is RANGE-BOUND (no breakout) — no edge for options buying; "
+                    "staying flat.")
+        if top_key == "vix_high":
+            return "market too volatile (VIX above the limit) — risk too high to enter."
+        if top_key == "momentum_low":
+            return "market too slow (low ATR) — moves can't cover premium decay + costs."
+        if top_key in ("confirm_15m", "pcr", "trap"):
+            return ("signals kept failing confirmation/quality gates — the setups that "
+                    "appeared were low-quality, so the bot passed.")
+        if top_key == "no_signal":
+            return ("the selected strategy never found its entry pattern in today's price "
+                    "action — no valid signal to act on.")
+        if top_key == "no_trade_window":
+            return "still outside the allowed entry window."
+        if top_key == "max_trades":
+            return "daily trade cap reached — no more entries by design."
+        return "entry conditions never aligned across the gate checks."
+
+    def _no_trade_diagnosis(self) -> list:
+        """
+        Human-readable explanation of WHY no trade has fired, ranked by how often
+        each gate blocked an entry. Surfaced live at each reassessment and in the
+        end-of-day session summary.
+        """
+        lines = []
+        if self.no_trade_reason:
+            lines.append(f"Setup verdict: {self.no_trade_reason}")
+        if not self._block_reasons:
+            if not lines:
+                lines.append("No entry evaluated yet (warming up / outside entry window).")
+            return lines
+        ranked = sorted(self._block_reasons.items(), key=lambda kv: kv[1], reverse=True)
+        lines.append("Why no trade so far (most frequent blockers):")
+        for key, n in ranked[:5]:
+            lines.append(f"   • {self._BLOCK_LABELS.get(key, key)}  ×{n}")
+        lines.append(f"Verdict: {self._plain_verdict(ranked[0][0])}")
+        return lines
+
     def _ledger_path(self) -> str:
         return state_path(f"trade_ledger_{self._today_str}.json")
 
@@ -2533,6 +2598,9 @@ class TradingBotOrchestrator:
                 )
         else:
             lines.append("  No trades were taken this session.")
+            # Explain WHY — the dominant blockers + a plain-English verdict.
+            for dl in self._no_trade_diagnosis():
+                lines.append(f"  {dl}")
         self._print_event(lines, level="info")
 
     def _record_realized_pnl(self, delta_pnl: float) -> None:
@@ -2769,7 +2837,13 @@ class TradingBotOrchestrator:
                                 f"signals in {reassessment_period} min."
                             )
                             self._cool_strategy(self.active_strategy_name)
+                            self._note_block("cooldown")
                         logging.warning(f"No trade signal for over {reassessment_period} minutes. Re-assessing strategy...")
+                        # Surface the live "why no trade yet" rationale so the
+                        # operator can see WHAT is blocking entries, not just that
+                        # nothing fired.
+                        if self.trades_today_count == 0:
+                            self._print_event(self._no_trade_diagnosis(), level="info")
                         if not await self.setup():
                             self.bot_state = "STOPPED"; continue
 
@@ -2794,6 +2868,7 @@ class TradingBotOrchestrator:
                     # Soft gate: in a no-trade window we just sleep and try again later.
                     no_trade = self._no_trade_window_reason()
                     if no_trade:
+                        self._note_block("no_trade_window")
                         logging.debug(f"In no-trade window ({no_trade}); waiting.")
                         await asyncio.sleep(30)
                         continue
@@ -2831,6 +2906,7 @@ class TradingBotOrchestrator:
                         self._last_reported_day_quality = self._day_quality
 
                     if self._day_quality == 'CHOPPY':
+                        self._note_block("choppy")
                         self._exit_range_scalp_mode()
                         logging.debug("[DayQuality] CHOPPY — skipping entry, sleeping 60 s.")
                         await asyncio.sleep(60)
@@ -2838,6 +2914,7 @@ class TradingBotOrchestrator:
                     elif self._day_quality == 'RANGE':
                         scalp_ok = self._enter_range_scalp_mode(day_df_for_signal)
                         if not scalp_ok:
+                            self._note_block("range")
                             await asyncio.sleep(60)
                             continue
                         # Fall through — scalp strategy + tight params are now set.
@@ -2845,6 +2922,8 @@ class TradingBotOrchestrator:
                         # TRENDING or UNKNOWN — ensure scalp overrides are cleared.
                         self._exit_range_scalp_mode()
 
+                    if signal == 'HOLD':
+                        self._note_block("no_signal")
                     if signal != 'HOLD':
                         # The strategy fired *something* — bumps the per-strategy
                         # signal counter so reassessment doesn't cool it down.
@@ -2898,12 +2977,14 @@ class TradingBotOrchestrator:
 
                         # ATR momentum gate — bypassed in force mode.
                         if not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
-                            pass  # already logged inside helper
+                            self._note_block("momentum_low")  # already logged inside helper
                         # VIX gate — bypassed in force mode.
                         elif not force_mode_now and await self._is_vix_too_high():
+                            self._note_block("vix_high")
                             logging.warning("Skipping entry due to VIX gate.")
                         # PCR gate — bypassed in force mode.
                         elif not force_mode_now and not self._is_pcr_aligned(signal):
+                            self._note_block("pcr")
                             pcr_tag = (self._pcr_data or {}).get("tag", "?")
                             pcr_val = (self._pcr_data or {}).get("pcr")
                             logging.warning(
@@ -2913,7 +2994,7 @@ class TradingBotOrchestrator:
                             )
                         # Trap detection — skip false breakout/breakdown entries.
                         elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
-                            pass  # already logged inside helper
+                            self._note_block("trap")  # already logged inside helper
                         else:
                             # Inject professional size multiplier so the order
                             # agent applies progressive loss sizing + time-of-day
@@ -2970,6 +3051,7 @@ class TradingBotOrchestrator:
                                 )
 
                             if not _15m_ok:
+                                self._note_block("confirm_15m")
                                 logging.warning(
                                     f"15-min confirmation gate: {signal} blocked. "
                                     f"{_15m_reason}"
