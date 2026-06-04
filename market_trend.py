@@ -31,8 +31,10 @@ import pandas as pd
 try:
     import yfinance as yf
     _YF_AVAILABLE = True
-except Exception:  # pragma: no cover - yfinance optional
+    _YF_IMPORT_ERR = None
+except Exception as _e:  # pragma: no cover - yfinance optional
     _YF_AVAILABLE = False
+    _YF_IMPORT_ERR = _e  # surfaced in logs so the real cause is visible
 
 
 # Default config — every value overridable under config['market_trend'].
@@ -114,7 +116,11 @@ class MarketTrendAnalyzer:
             self._add_basket(components, "us_indices", self.cfg["us_index_tickers"])
             self._add_basket(components, "asia",       self.cfg["asia_tickers"])
         else:
-            logging.warning("[MarketTrend] yfinance unavailable — global cues skipped.")
+            logging.warning(
+                f"[MarketTrend] yfinance unavailable ({_YF_IMPORT_ERR!r}) — global "
+                f"cues skipped. Fix: `pip install -U yfinance` in the SAME "
+                f"environment that runs the bot."
+            )
 
         # — GIFT Nifty (best-effort) —
         gift_pct = self._gift_nifty_gap_pct()

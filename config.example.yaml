@@ -50,7 +50,11 @@ youtube_sentiment:
     - interaction
   llm_strip_fallback: true        # if no SponsorBlock data, ask Gemini to ignore promo
   overall_weight_vs_news: 2.0     # YouTube block weight relative to news block
+  # Gemini model for transcript analysis. Persistent 429s mean free-tier quota
+  # is exhausted (not a code bug) — try "gemini-2.0-flash-lite" or enable billing.
   gemini_model: gemini-2.0-flash
+  # Short backoff on 429 (daily-quota 429 won't clear in a minute). [] = no retries.
+  rate_limit_backoff_secs: [5, 10]
   channels:
     - handle: "@AkshatZayn"
       display_name: "Akshat Zayn"
@@ -278,6 +282,14 @@ trailing_stop_loss:
   use_indicator_exit: true
   psar_step: 0.02
   psar_max: 0.2
+  # Prevent the indicator exit from chopping trades out on micro-noise:
+  #  indicator_exit_min_hold_minutes : suppress the indicator exit for the first
+  #    N minutes after entry (hard SL + trailing stop still protect downside).
+  #  indicator_exit_atr_buffer_mult  : require the underlying to be beyond the
+  #    PSAR/EMA by ≥ this × ATR before exiting — a volatility-aware buffer.
+  # Set either to 0 to disable that guard (reverts to the old twitchy behaviour).
+  indicator_exit_min_hold_minutes: 10
+  indicator_exit_atr_buffer_mult: 0.25
 # Automatic position-size mode switching.
 # AGGRESSIVE: activated when recent performance warrants larger bets.
 # MODERATE:   default; forced on consecutive losses, high drawdown, or elevated VIX.

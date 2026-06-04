@@ -540,14 +540,14 @@ Transcript:
             },
         }
 
-        # Retry with exponential backoff on 429 (rate-limit).
-        # Free-tier Gemini resets every 60s (15 RPM). Strategy:
-        #   attempt 1 → wait 20s (let the RPM window partially reset)
-        #   attempt 2 → wait 45s (more headroom)
-        #   attempt 3 → skip and return None so setup isn't blocked
+        # Retry with short backoff on 429 (rate-limit). A 429 from the free-tier
+        # DAILY quota won't clear within a minute, so long waits just stall
+        # startup for nothing — keep retries brief and skip fast. Configurable
+        # via youtube_sentiment.rate_limit_backoff_secs (list).
         # Other HTTP errors (4xx != 429, 5xx) abort immediately.
-        _MAX_RETRIES   = 3
-        _BACKOFF_SECS  = [20, 45]   # waits before attempt 2 and 3; attempt 3 failing = skip
+        _yt_cfg = (self.config.get("youtube_sentiment") or {})
+        _BACKOFF_SECS = list(_yt_cfg.get("rate_limit_backoff_secs", [5, 10]))
+        _MAX_RETRIES  = len(_BACKOFF_SECS) + 1   # one final attempt after the last wait
         video_title = video.get("title", "?")
         verdict_data = None
 

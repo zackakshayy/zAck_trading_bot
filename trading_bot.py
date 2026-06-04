@@ -1160,7 +1160,13 @@ class TradingBotOrchestrator:
             # Cached for the day after the first call, so reassessment runs are
             # cheap (single cache read, no LLM calls). Best-effort: failures here
             # don't block setup — sentiment will just fall back to news-only.
-            if self.youtube_agent and not self.youtube_agent.is_ready():
+            # When the price-action trend module drives direction (market_trend.
+            # enable: true), news/YouTube sentiment is NOT used for the verdict —
+            # so skip the slow, Gemini-dependent YouTube fetch entirely. This
+            # avoids burning Gemini free-tier quota and the long 429 retry waits
+            # that were stalling startup ~75s with no benefit.
+            _trend_drives = bool((self.config.get('market_trend') or {}).get('enable', False))
+            if (not _trend_drives) and self.youtube_agent and not self.youtube_agent.is_ready():
                 try:
                     await self.youtube_agent.fetch_today()
                 except Exception as e:
@@ -1601,6 +1607,34 @@ class TradingBotOrchestrator:
             self._clear_status_line()
             raise
 
+    @staticmethod
+    def _drain_stdin() -> None:
+        """
+        Discard any buffered/pending stdin BEFORE showing a timed prompt.
+
+        Without this, a stray keystroke the operator typed while the bot was busy
+        (e.g. pressing Enter during the long YouTube/Gemini wait at startup) sits
+        in the terminal buffer and is instantly consumed by the next prompt —
+        making it look like the operator "accepted" with no chance to respond.
+        Flushes the OS input queue on Unix (termios), with a non-blocking
+        select() drain as a fallback.
+        """
+        try:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+            return
+        except Exception:
+            pass
+        try:
+            while True:
+                ready, _, _ = select.select([sys.stdin], [], [], 0)
+                if not ready:
+                    break
+                if not sys.stdin.readline():
+                    break
+        except Exception:
+            pass
+
     async def _input_with_timeout(self, prompt: str, timeout: float = 20.0):
         """
         Reads a line from stdin with a timeout. Returns the stripped input
@@ -1615,6 +1649,9 @@ class TradingBotOrchestrator:
 
         self._ticker_paused = True
         self._clear_status_line()
+        # Drop any stale buffered input so a keystroke typed during a prior wait
+        # doesn't auto-dismiss this prompt before the operator can respond.
+        self._drain_stdin()
         print(prompt, end='', flush=True)
 
         def _wait_for_line():
