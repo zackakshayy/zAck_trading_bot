@@ -58,6 +58,21 @@ warnings.filterwarnings(
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Also persist logs to a rotating file so the dashboard can tail them. This is a
+# FileHandler, so run()'s status-line handler swap leaves it in place.
+try:
+    import logging.handlers as _logging_handlers
+    os.makedirs("output", exist_ok=True)
+    _file_handler = _logging_handlers.RotatingFileHandler(
+        "output/bot.log", maxBytes=5_000_000, backupCount=3
+    )
+    _file_handler.setFormatter(
+        logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    )
+    logging.getLogger().addHandler(_file_handler)
+except Exception as _log_exc:  # never let logging setup kill startup
+    logging.warning(f"Could not attach rotating log file: {_log_exc}")
+
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
 
@@ -1604,10 +1619,61 @@ class TradingBotOrchestrator:
             while True:
                 if not self._ticker_paused:
                     self._print_status_line()
+                # Write the machine-readable status snapshot for the dashboard
+                # every tick (works headless too — no TTY required).
+                self._write_status_snapshot()
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             self._clear_status_line()
             raise
+
+    def _write_status_snapshot(self) -> None:
+        """
+        Persist a compact, machine-readable status snapshot to
+        state/bot_status.json so the FastAPI dashboard (dashboard.py) can show
+        live status, P&L, the active trade and the 'why no trade' rationale —
+        without touching the trading process. Best-effort; never raises.
+        """
+        try:
+            active = (getattr(self, 'position_agent', None)
+                      and self.position_agent.active_trade) or {}
+            bal, bal_lbl = self._current_balance()
+            tf = self.config.get('trading_flags', {}) or {}
+            snap = {
+                "ts":                 datetime.datetime.now().isoformat(),
+                "state":              self.bot_state,
+                "strategy":           self.active_strategy_name,
+                "manual_mode":        bool(getattr(self, '_manual_mode', False)),
+                "mode":               getattr(self, '_trading_mode', 'MODERATE'),
+                "sentiment":          self.day_sentiment,
+                "day_quality":        getattr(self, '_day_quality', 'UNKNOWN'),
+                "conditions":         sorted(getattr(self, 'todays_conditions', set()) or []),
+                "is_expiry_day":      bool(getattr(self, 'is_expiry_day', False)),
+                "paper":              bool(tf.get('paper_trading', True)),
+                "realized_pnl_today": round(float(self.realized_pnl_today or 0), 2),
+                "wins":               self.wins_today,
+                "losses":             self.losses_today,
+                "scratch":            self.scratch_today,
+                "trades_today_count": self.trades_today_count,
+                "max_trades":         int(tf.get('max_trades_per_day', 3)),
+                "balance":            round(float(bal or 0), 2),
+                "balance_label":      bal_lbl,
+                "active_trade": ({
+                    "symbol": active.get("symbol"),
+                    "type":   active.get("type"),
+                    "entry":  active.get("entry_price"),
+                    "trail":  active.get("trailing_stop_loss"),
+                    "sl":     active.get("initial_stop_loss"),
+                    "qty":    active.get("quantity"),
+                } if active else None),
+                "completed_trades":   self.completed_trades,
+                "why_no_trade":       (self._no_trade_diagnosis()
+                                       if self.trades_today_count == 0 else []),
+                "no_trade_reason":    self.no_trade_reason,
+            }
+            atomic_write_json(state_path("bot_status.json"), snap)
+        except Exception as e:
+            logging.debug(f"status snapshot failed: {e}")
 
     @staticmethod
     def _drain_stdin() -> None:
