@@ -2720,13 +2720,57 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.warning(f"Could not persist P&L: {e}")
 
+    async def _run_monitor(self):
+        """
+        Status-only mode (--monitor): publish a live status snapshot to the
+        dashboard every 2 seconds without trading or needing a Zerodha session.
+        Used to verify the bot→dashboard pipeline off-hours. Ctrl+C to stop.
+        """
+        self.bot_state = "MONITOR"
+        self.no_trade_reason = (
+            "Monitor mode — publishing live status to the dashboard; not trading."
+        )
+        self._report_sent = True  # never email a report from monitor mode
+        print("\n" + "=" * 70)
+        print("  MONITOR MODE — publishing live status to the dashboard.")
+        print("  The bot will NOT trade and needs no Zerodha login. Ctrl+C to stop.")
+        print("=" * 70 + "\n")
+        logging.info("MONITOR MODE active — dashboard will show live bot status.")
+        try:
+            while True:
+                self._write_status_snapshot()
+                await asyncio.sleep(2)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            self.bot_state = "STOPPED"
+            self._write_status_snapshot()
+            print("\nMonitor stopped.")
+
     async def run(self):
         """The main event loop for the trading bot."""
+        # Publish an initial status snapshot immediately so the dashboard shows
+        # the REAL bot state from the first moment (not 'offline'), even before
+        # the market-hours check and on any early exit below.
+        self._write_status_snapshot()
+        # --monitor: a pure status publisher. Keeps the REAL bot process alive,
+        # writing live status to the dashboard every 2s, but NEVER trades and
+        # needs no Zerodha session. Lets you verify the bot→dashboard pipeline
+        # any time (off-hours, weekends) before a real session.
+        if getattr(self, "_monitor_mode", False):
+            await self._run_monitor()
+            return
         # Accept startup during market hours OR the pre-market warm-up window
         # (default 08:50 -> 09:15 IST). Anything else -> closed-info banner.
         if not (self.is_market_open() or self.is_pre_market_window()):
             # Safety net for edge case: bot started just after 15:30 close.
             # Holiday / weekend exits are caught in __main__ before auth runs.
+            # Record the real reason so the dashboard explains the idle state.
+            self.bot_state = "STOPPED"
+            self.no_trade_reason = (
+                "Market is closed — outside 09:15–15:30 IST (or weekend/holiday). "
+                "Start the bot during market/pre-market hours for live updates, "
+                "or run with --monitor to publish live status without trading."
+            )
+            self._write_status_snapshot()
             await self.display_market_closed_info()
             return  # No report — bot never attempted trading.
 
@@ -3263,6 +3307,14 @@ if __name__ == "__main__":
             "mid-session. All other logic (SL, targets, risk) is unchanged."
         ),
     )
+    _ap.add_argument(
+        "--monitor", action="store_true",
+        help=(
+            "Status-only mode: publish live status to the dashboard without "
+            "trading and without a Zerodha login. Runs any time (off-hours/"
+            "weekends) so you can verify the bot→dashboard pipeline. Ctrl+C to stop."
+        ),
+    )
     _args = _ap.parse_args()
 
     # ── Zero-cost holiday / weekend guard ────────────────────────────────
@@ -3279,7 +3331,9 @@ if __name__ == "__main__":
         "Holiday mode ON 🏖️  No charts, no stress — SEBI approved.",
     ]
 
-    if _today.weekday() >= 5:
+    # Monitor mode bypasses the weekend/holiday exit — it never trades, it only
+    # publishes status, so it's useful to run any day for dashboard testing.
+    if _today.weekday() >= 5 and not _args.monitor:
         _day = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"][_today.weekday()]
         print("\n" + "📅 " * 19)
         print(f"  Today is {_day} — markets are closed on weekends.")
@@ -3287,7 +3341,7 @@ if __name__ == "__main__":
         print("📅 " * 19 + "\n")
         sys.exit(0)
 
-    if is_nse_holiday(_today):
+    if is_nse_holiday(_today) and not _args.monitor:
         _holiday_name = NSE_HOLIDAY_NAMES.get(_today_str, "Market Holiday")
         print("\n" + "🎊 " * 19)
         print(f"  🏦  {_holiday_name.upper()}  —  NSE is closed today.")
@@ -3298,5 +3352,9 @@ if __name__ == "__main__":
     # ── Normal trading day — full startup ────────────────────────────────
     multiprocessing.freeze_support()
     bot = TradingBotOrchestrator(load_config(), manual_mode=_args.manual)
-    if bot.authenticate():
+    bot._monitor_mode = _args.monitor
+    if _args.monitor:
+        # Status-only: no Zerodha login required.
+        asyncio.run(bot.run())
+    elif bot.authenticate():
         asyncio.run(bot.run())
