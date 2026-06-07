@@ -101,6 +101,11 @@ regime:
   require_clean_regime: true
   max_trading_days_per_week: 5
   vix_no_trade_below: 12
+  # 5-regime classifier (TRENDING/RANGE/PRE_EVENT/POST_EVENT/EXPIRY/UNCLEAR):
+  pre_event_days: 3                 # known event within N days → PRE_EVENT
+  sit_out_pre_event: true           # buy-only has no straddle → sit out pre-event
+  expiry_dte_threshold: 1           # DTE ≤ this → EXPIRY (gamma scalp)
+  post_event_wait_until: "10:30"    # POST_EVENT: no entries before this (avoid open chaos)
 # ---------------------------------------------------------------------------
 # Reporting — daily + weekly emails, each showing capital start → end.
 reporting:

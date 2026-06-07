@@ -200,7 +200,7 @@ _PAGE = r"""<!doctype html>
         <div class="k" style="margin-top:8px">W / L · Trades</div><div class="v sm" id="wl">—</div></div>
 
     <div class="card"><div class="k">Sentiment / Bias</div><div class="v sm" id="sentiment">—</div>
-        <div class="k" style="margin-top:8px">Day quality</div><div class="v sm" id="dayq">—</div></div>
+        <div class="k" style="margin-top:8px">Regime · Day quality</div><div class="v sm" id="dayq">—</div></div>
     <div class="card"><div class="k">Balance</div><div class="v sm" id="bal">—</div>
         <div class="k" style="margin-top:8px">Mode · VIX/IV</div><div class="v sm" id="mode">—</div></div>
 
@@ -253,7 +253,7 @@ async function loadStatus(){
     const pe=document.getElementById('pnl'); pe.textContent=sgn(pnl); pe.className='v '+cls(pnl);
     document.getElementById('wl').textContent='W '+(s.wins??0)+' · L '+(s.losses??0)+'  ·  '+(s.trades_today_count??0)+'/'+(s.max_trades??'—')+'T';
     document.getElementById('sentiment').textContent=s.sentiment||'—';
-    document.getElementById('dayq').textContent=s.day_quality||'—';
+    document.getElementById('dayq').textContent=(s.regime||'—')+(s.day_quality?(' · '+s.day_quality):'');
     document.getElementById('bal').textContent=f(s.balance)+(s.balance_label?(' ('+s.balance_label+')'):'');
     document.getElementById('mode').textContent=(s.mode||'—')+(s.conditions&&s.conditions.length?(' · '+s.conditions.join(', ')):'');
 

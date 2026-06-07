@@ -15,6 +15,7 @@ from sentiment_agent import SentimentAgent
 from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
 from market_trend import MarketTrendAnalyzer
+from regime import RegimeClassifier
 from strategy_factory import get_strategy
 from backtester import run_backtest
 from reporting import (
@@ -171,6 +172,14 @@ class TradingBotOrchestrator:
         # Pre-market price-action / global-cues trend analyzer (CE/PE verdict).
         # Uses self.kite for NIFTY gap + price action; yfinance for global feeds.
         self.market_trend_analyzer = MarketTrendAnalyzer(self.kite, config)
+        # Market-regime classifier (playbook Part 3) + per-session regime state.
+        self.regime_classifier = RegimeClassifier(config)
+        self.day_regime: str = "PENDING"
+        self._regime_reason: str = ""
+        self._regime_excluded: set = set()          # strategies excluded by regime
+        self._regime_allowed: tuple = ()            # regime-preferred strategies
+        self._regime_entry_not_before = None        # post-event entry-wait gate
+        self._first_setup: bool = True              # day-level sit-out only on first setup
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -442,6 +451,29 @@ class TradingBotOrchestrator:
             self._persist_ledger()
         except Exception as e:
             logging.debug(f"Could not snapshot ending capital: {e}")
+
+    async def _current_vix(self) -> float:
+        """Best-effort live India VIX (0.0 on failure)."""
+        try:
+            tok = self.market_condition_identifier.vix_token
+            data = await asyncio.to_thread(self.kite.ltp, str(tok))
+            return float((data or {}).get(str(tok), {}).get('last_price', 0) or 0)
+        except Exception:
+            return 0.0
+
+    def _days_to_next_event(self):
+        """Days until the next known macro event (FED/RBI/…) within the horizon,
+        or None. Uses the EconomicCalendar already loaded by the condition agent."""
+        try:
+            cal = self.market_condition_identifier.calendar
+            today = datetime.date.today()
+            horizon = int((self.config.get('regime') or {}).get('pre_event_days', 3))
+            for d in range(1, horizon + 1):
+                if cal.get_event_for_date(today + datetime.timedelta(days=d)):
+                    return d
+        except Exception:
+            pass
+        return None
 
     async def _regime_governor(self) -> tuple:
         """
@@ -1062,6 +1094,11 @@ class TradingBotOrchestrator:
         lunch_end = self._parse_hhmm(flags.get('lunch_pause_end'))
         if lunch_start and lunch_end and lunch_start <= now < lunch_end:
             return f"lunch pause {lunch_start.strftime('%H:%M')}-{lunch_end.strftime('%H:%M')}"
+
+        # POST_EVENT regime: wait out the opening chaos / IV crush before entering.
+        rnb = getattr(self, "_regime_entry_not_before", None)
+        if rnb and now < rnb:
+            return f"post-event wait until {rnb.strftime('%H:%M')} ({self.day_regime})"
         return None
 
     async def _compute_effective_entry_start(self):
@@ -1370,6 +1407,49 @@ class TradingBotOrchestrator:
             except Exception as e:
                 logging.debug(f"Bars-for-selector fetch failed (non-fatal): {e}")
 
+            # ── Regime classification (playbook Part 3 — the mandatory first step) ──
+            # Assign one of the 5 regimes + the buy-only strategy family that fits
+            # it. A clean regime CONSTRAINS the selector to its family; an UNCLEAR
+            # (or pre-event, under buy-only) regime stands the bot down for the day
+            # on the FIRST setup. Intraday reassessments only relax/constrain the
+            # family — the loop's CHOPPY-skip handles going unclear mid-session.
+            _is_first_setup = self._first_setup
+            self._first_setup = False
+            self._regime_excluded = set()
+            self._regime_allowed = ()
+            self._regime_entry_not_before = None
+            if (self.config.get('regime') or {}).get('enable', True) \
+                    and bars_for_selector is not None and not bars_for_selector.empty:
+                try:
+                    _dq = self._classify_day_quality(bars_for_selector)
+                    _vix = await self._current_vix()
+                    _evt_today = next(
+                        (str(c) for c in todays_conditions if str(c).startswith('EVENT_')), None
+                    )
+                    _rgm = self.regime_classifier.classify(
+                        day_quality=_dq, vix=_vix,
+                        is_expiry_day=is_expiry_day_now, dte=None,
+                        event_today=_evt_today,
+                        days_to_next_event=self._days_to_next_event(),
+                        direction_hint=self.day_sentiment, gap_pct=self.open_gap_pct,
+                    )
+                    self.day_regime = _rgm.regime
+                    self._regime_reason = _rgm.reason
+                    logging.info(f"[Regime] {_rgm.regime} — {_rgm.reason}")
+                    if _rgm.sit_out:
+                        if _is_first_setup:
+                            self.no_trade_reason = f"Regime {_rgm.regime}: {_rgm.reason}"
+                            return False
+                        # Intraday: don't kill the session; leave the cascade free
+                        # and let the loop's day-quality skip manage it.
+                    else:
+                        self._regime_excluded = _rgm.excluded()
+                        self._regime_allowed = _rgm.allowed_strategies
+                        if _rgm.entry_not_before:
+                            self._regime_entry_not_before = self._parse_hhmm(_rgm.entry_not_before)
+                except Exception as _rgm_exc:
+                    logging.debug(f"Regime classification skipped (non-fatal): {_rgm_exc}")
+
             # ── Strategy selection ──────────────────────────────────────────
             # Manual mode: operator picks from a numbered menu. The choice is
             # cached in _manual_strategy_name and reused on every reassessment
@@ -1403,7 +1483,7 @@ class TradingBotOrchestrator:
                     is_expiry_day=is_expiry_day_now,
                     open_gap_pct=self.open_gap_pct,
                     underlying_bars=bars_for_selector,
-                    exclude_strategies=self._currently_cooled(),
+                    exclude_strategies=self._currently_cooled() | self._regime_excluded,
                     user_prompt=user_prompt,
                     rag_context=rag_context,
                 )
@@ -1421,10 +1501,16 @@ class TradingBotOrchestrator:
                         is_expiry_day=is_expiry_day_now,
                         open_gap_pct=self.open_gap_pct,
                         underlying_bars=bars_for_selector,
-                        exclude_strategies=set(),
+                        exclude_strategies=set(self._regime_excluded),  # keep regime, drop cooldowns
                         user_prompt=user_prompt,
                         rag_context=rag_context,
                     )
+                # If the selector came back empty inside a constrained regime,
+                # fall back to the regime's first preferred strategy so we never
+                # trade out-of-regime.
+                if not best_strategy_name and self._regime_allowed:
+                    best_strategy_name = self._regime_allowed[0]
+                    logging.info(f"[Regime] Selector empty — using regime default {best_strategy_name}.")
 
             if not best_strategy_name:
                 self.no_trade_reason = "Selector returned no strategy."
@@ -1718,6 +1804,8 @@ class TradingBotOrchestrator:
                 "mode":               getattr(self, '_trading_mode', 'MODERATE'),
                 "sentiment":          self.day_sentiment,
                 "day_quality":        getattr(self, '_day_quality', 'UNKNOWN'),
+                "regime":             getattr(self, 'day_regime', 'PENDING'),
+                "regime_reason":      getattr(self, '_regime_reason', ''),
                 "conditions":         sorted(getattr(self, 'todays_conditions', set()) or []),
                 "is_expiry_day":      bool(getattr(self, 'is_expiry_day', False)),
                 "paper":              bool(tf.get('paper_trading', True)),
@@ -3337,6 +3425,7 @@ class TradingBotOrchestrator:
                             'costs':    float(status.get('Costs', 0) or 0),
                             'net':      float(status.get('ProfitLoss', 0) or 0),
                             'strategy': status.get('Strategy', '?'),
+                            'regime':   getattr(self, 'day_regime', 'PENDING'),
                         })
                         self._persist_ledger()   # survive same-day restarts
                         # On a losing trade, build a detailed post-mortem,
