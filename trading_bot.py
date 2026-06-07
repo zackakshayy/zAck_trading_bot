@@ -16,6 +16,7 @@ from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
 from market_trend import MarketTrendAnalyzer
 from regime import RegimeClassifier
+from fii import fetch_fii_bias
 from strategy_factory import get_strategy
 from backtester import run_backtest
 from reporting import (
@@ -180,6 +181,8 @@ class TradingBotOrchestrator:
         self._regime_allowed: tuple = ()            # regime-preferred strategies
         self._regime_entry_not_before = None        # post-event entry-wait gate
         self._first_setup: bool = True              # day-level sit-out only on first setup
+        self._fii_bias = None                       # best-effort FII positioning (informational)
+        self._today_vix: float = 0.0                # cached for journaling
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -1423,6 +1426,18 @@ class TradingBotOrchestrator:
                 try:
                     _dq = self._classify_day_quality(bars_for_selector)
                     _vix = await self._current_vix()
+                    self._today_vix = _vix
+                    # Best-effort FII positioning (informational; never gates).
+                    try:
+                        self._fii_bias = await asyncio.to_thread(fetch_fii_bias, self.config)
+                        if self._fii_bias:
+                            logging.info(
+                                f"[FII] {self._fii_bias.get('bias')} "
+                                f"(net={self._fii_bias.get('net_index_futures')}, "
+                                f"src={self._fii_bias.get('source')})"
+                            )
+                    except Exception:
+                        self._fii_bias = None
                     _evt_today = next(
                         (str(c) for c in todays_conditions if str(c).startswith('EVENT_')), None
                     )
@@ -1806,6 +1821,13 @@ class TradingBotOrchestrator:
                 "day_quality":        getattr(self, '_day_quality', 'UNKNOWN'),
                 "regime":             getattr(self, 'day_regime', 'PENDING'),
                 "regime_reason":      getattr(self, '_regime_reason', ''),
+                "vix":                round(float(getattr(self, '_today_vix', 0) or 0), 2),
+                "pcr":                (self._pcr_data or {}).get("pcr"),
+                "max_pain":           (self._pcr_data or {}).get("max_pain"),
+                "call_walls":         (self._pcr_data or {}).get("call_walls"),
+                "put_walls":          (self._pcr_data or {}).get("put_walls"),
+                "iv_percentile":      getattr(getattr(self, 'order_agent', None), '_last_iv_percentile', None),
+                "fii_bias":           (self._fii_bias or {}).get("bias") if self._fii_bias else None,
                 "conditions":         sorted(getattr(self, 'todays_conditions', set()) or []),
                 "is_expiry_day":      bool(getattr(self, 'is_expiry_day', False)),
                 "paper":              bool(tf.get('paper_trading', True)),
@@ -2664,6 +2686,33 @@ class TradingBotOrchestrator:
             return False
         return True
 
+    def _is_oi_wall_blocked(self, signal: str) -> bool:
+        """
+        Playbook OI-wall gate: don't buy CALLS into a heavy call-OI wall (where
+        institutions are writing calls = resistance). For a BUY (long CE), if spot
+        (ATM) has already reached/passed the nearest heavy call-OI strike, the
+        upside is being defended — skip. PE buys are the intended break-down
+        direction, so they're not gated here. Bypassed when data/feature absent.
+        """
+        cfg = (self.config.get('oi_analytics') or {})
+        if not cfg.get('enable', True):
+            return False
+        pcr = self._pcr_data or {}
+        atm = pcr.get('atm')
+        walls = pcr.get('call_walls') or []   # sorted by OI desc → [0] is dominant
+        if signal == 'BUY' and atm and walls:
+            dominant = walls[0]
+            # Block only when spot is sitting ON the single heaviest call-OI strike
+            # (a clear resistance test). Below it = room to run (OK); above it =
+            # already broke out (OK). This avoids over-blocking on minor walls.
+            if abs(float(atm) - float(dominant)) < 1e-6:
+                logging.warning(
+                    f"OI-wall gate: ATM {atm:.0f} sits ON the heaviest call-OI wall "
+                    f"({dominant:.0f}) — buying calls into institutional resistance. Skipping."
+                )
+                return True
+        return False
+
     # Human-readable rationale for each entry-blocking reason.
     _BLOCK_LABELS: dict = {
         "no_signal":       "strategy returned HOLD — waiting for its entry pattern",
@@ -2672,6 +2721,7 @@ class TradingBotOrchestrator:
         "momentum_low":    "ATR momentum too low — market too slow for options buying",
         "vix_high":        "VIX above the max — too volatile/risky to enter",
         "pcr":             "PCR option-flow contradicted the signal direction",
+        "oi_wall":         "spot at/above a heavy call-OI wall — buying calls into resistance",
         "trap":            "false-breakout trap detected — stop-hunt pattern",
         "confirm_15m":     "15-min higher-timeframe didn't confirm the signal",
         "no_trade_window": "outside the entry window (pre-open / lunch / past cutoff)",
@@ -3279,6 +3329,9 @@ class TradingBotOrchestrator:
                                 f"(PCR={f'{pcr_val:.3f}' if pcr_val else 'N/A'}). "
                                 f"PCR contradicts trade direction — skipping entry."
                             )
+                        # OI-wall gate — don't buy calls into institutional resistance.
+                        elif not force_mode_now and self._is_oi_wall_blocked(signal):
+                            self._note_block("oi_wall")  # already logged inside helper
                         # Trap detection — skip false breakout/breakdown entries.
                         elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
                             self._note_block("trap")  # already logged inside helper
@@ -3426,6 +3479,9 @@ class TradingBotOrchestrator:
                             'net':      float(status.get('ProfitLoss', 0) or 0),
                             'strategy': status.get('Strategy', '?'),
                             'regime':   getattr(self, 'day_regime', 'PENDING'),
+                            'vix':      round(float(getattr(self, '_today_vix', 0) or 0), 2),
+                            'iv_percentile': getattr(getattr(self, 'order_agent', None), '_last_iv_percentile', None),
+                            'fii_bias': (self._fii_bias or {}).get('bias') if self._fii_bias else None,
                         })
                         self._persist_ledger()   # survive same-day restarts
                         # On a losing trade, build a detailed post-mortem,

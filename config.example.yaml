@@ -112,6 +112,25 @@ reporting:
   weekly_report: true
   weekly_report_day: "Friday"
 # ---------------------------------------------------------------------------
+# IV-percentile gate (playbook: buy cheap IV, avoid expensive). Uses the same
+# rolling IV history as IV-Rank. buy_below is a soft caution; avoid_above is a
+# hard skip on long-option entries.
+iv_percentile:
+  buy_below: 40
+  avoid_above: 70
+# Open-interest analytics: max-pain + heavy call/put OI walls. The OI-wall gate
+# refuses to buy CALLS when spot has reached a heavy call-OI strike (resistance).
+oi_analytics:
+  enable: true
+# FII derivative positioning (best-effort, informational — NEVER gates trades).
+# Reliable path: drop a state/fii_bias.json from your own source, e.g.
+#   {"bias": "BEARISH", "net_index_futures": -12000, "note": "FII net short"}
+# Optionally enable the fragile direct NSE fetch (often blocked).
+fii:
+  enable: true
+  try_nse_fetch: false
+  # local_file: state/fii_bias.json
+# ---------------------------------------------------------------------------
 # Transaction costs (brokerage, STT, exchange/SEBI charges, stamp duty, GST).
 # A small gross profit on an options scalp is often a NET LOSS once these are
 # deducted. With enable: true the bot:

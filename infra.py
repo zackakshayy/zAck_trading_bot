@@ -384,6 +384,26 @@ def compute_ivr(underlying: str, current_iv: float,
     return max(0.0, min(100.0, ivr)), len(ivs)
 
 
+def compute_iv_percentile(underlying: str, current_iv: float,
+                          lookback_days: int = 60, min_samples: int = 10):
+    """
+    IV PERCENTILE (playbook): the % of the last `lookback_days` IV samples that
+    are at or below `current_iv` (0-100). Unlike IV-Rank (min/max), this reflects
+    the full distribution. Returns (percentile, samples) or (None, n) when below
+    `min_samples`. Doc rule: buy below ~40, avoid above ~70.
+    """
+    history = load_iv_history(underlying)
+    if not history:
+        return None, 0
+    sample = history[-lookback_days:]
+    ivs = [float(h["iv"]) for h in sample if isinstance(h, dict) and "iv" in h]
+    if len(ivs) < min_samples:
+        return None, len(ivs)
+    below = sum(1 for v in ivs if v <= current_iv)
+    pct = below / len(ivs) * 100.0
+    return max(0.0, min(100.0, pct)), len(ivs)
+
+
 # ---------------------------------------------------------------------------
 # Tiered per-trade risk by live capital (playbook alignment, Phase A)
 # ---------------------------------------------------------------------------

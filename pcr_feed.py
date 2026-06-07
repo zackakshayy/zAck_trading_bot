@@ -181,16 +181,21 @@ class PCRFeed:
                 except Exception as exc:
                     logging.warning(f"[PCRFeed] Quote batch [{i}:{i+400}] failed: {exc}")
 
-            # ---- sum OI by option type ----
+            # ---- sum OI by option type, and keep per-strike OI for max-pain/walls ----
             total_put_oi  = 0
             total_call_oi = 0
+            call_oi_by_strike: dict = {}
+            put_oi_by_strike: dict = {}
             for _, row in range_opts.iterrows():
                 token_str = str(int(row["instrument_token"]))
                 oi = int((quotes.get(token_str) or {}).get("oi") or 0)
+                strike = float(row["strike"])
                 if row["instrument_type"] == "PE":
                     total_put_oi  += oi
+                    put_oi_by_strike[strike] = put_oi_by_strike.get(strike, 0) + oi
                 else:
                     total_call_oi += oi
+                    call_oi_by_strike[strike] = call_oi_by_strike.get(strike, 0) + oi
 
             if total_call_oi == 0:
                 return {"pcr": None, "tag": "PCR_ERROR", "error": "zero call OI"}
@@ -204,6 +209,25 @@ class PCRFeed:
             else:
                 tag = "PCR_NEUTRAL"
 
+            # ---- max pain + OI walls (institutional fingerprint) ----
+            all_strikes = sorted(set(list(call_oi_by_strike) + list(put_oi_by_strike)))
+
+            def _pain(K):
+                p = 0.0
+                for s, oi in call_oi_by_strike.items():
+                    if K > s:
+                        p += (K - s) * oi
+                for s, oi in put_oi_by_strike.items():
+                    if s > K:
+                        p += (s - K) * oi
+                return p
+
+            max_pain = min(all_strikes, key=_pain) if all_strikes else None
+            call_walls = [s for s, _ in sorted(call_oi_by_strike.items(),
+                                               key=lambda kv: -kv[1])[:3]]
+            put_walls = [s for s, _ in sorted(put_oi_by_strike.items(),
+                                              key=lambda kv: -kv[1])[:3]]
+
             result = {
                 "pcr":     pcr,
                 "tag":     tag,
@@ -212,6 +236,9 @@ class PCRFeed:
                 "strikes": len(range_opts["strike"].unique()),
                 "expiry":  nearest_expiry.strftime("%Y-%m-%d"),
                 "atm":     atm,
+                "max_pain":   max_pain,
+                "call_walls": call_walls,   # heavy call-writing strikes = resistance
+                "put_walls":  put_walls,    # heavy put-writing strikes = support
             }
             logging.debug(
                 f"[PCRFeed] PCR={pcr:.3f} ({tag})  "

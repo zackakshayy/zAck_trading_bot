@@ -204,6 +204,14 @@ _PAGE = r"""<!doctype html>
     <div class="card"><div class="k">Balance</div><div class="v sm" id="bal">—</div>
         <div class="k" style="margin-top:8px">Mode · VIX/IV</div><div class="v sm" id="mode">—</div></div>
 
+    <div class="card full">
+      <div class="k">Market flow (institutional footprint)</div>
+      <table><tr><th>VIX</th><th>IV %ile</th><th>PCR</th><th>Max-pain</th><th>FII</th></tr>
+        <tr><td id="mfVix">—</td><td id="mfIvp">—</td><td id="mfPcr">—</td><td id="mfMp">—</td><td id="mfFii">—</td></tr></table>
+      <div class="k" style="margin-top:6px">Call walls (resistance) · Put walls (support)</div>
+      <div class="v sm" id="mfWalls">—</div>
+    </div>
+
     <div class="card full" id="activeCard" style="display:none">
       <div class="row"><div class="k">Open position</div><span class="pill" id="atType"></span></div>
       <div class="v sm" id="atSym">—</div>
@@ -256,6 +264,16 @@ async function loadStatus(){
     document.getElementById('dayq').textContent=(s.regime||'—')+(s.day_quality?(' · '+s.day_quality):'');
     document.getElementById('bal').textContent=f(s.balance)+(s.balance_label?(' ('+s.balance_label+')'):'');
     document.getElementById('mode').textContent=(s.mode||'—')+(s.conditions&&s.conditions.length?(' · '+s.conditions.join(', ')):'');
+
+    // market flow
+    const fx=(id,v)=>document.getElementById(id).textContent=(v==null||v===''?'—':v);
+    fx('mfVix', s.vix? s.vix.toFixed? s.vix.toFixed(1): s.vix : null);
+    fx('mfIvp', s.iv_percentile!=null? Math.round(s.iv_percentile)+'%': null);
+    fx('mfPcr', s.pcr!=null? Number(s.pcr).toFixed(2): null);
+    fx('mfMp',  s.max_pain!=null? Number(s.max_pain).toLocaleString('en-IN'): null);
+    fx('mfFii', s.fii_bias||null);
+    const cw=(s.call_walls||[]).join(', '), pw=(s.put_walls||[]).join(', ');
+    document.getElementById('mfWalls').textContent=(cw||pw)?('CE: '+(cw||'—')+'   ·   PE: '+(pw||'—')):'—';
 
     // active trade
     const a=s.active_trade, ac=document.getElementById('activeCard');

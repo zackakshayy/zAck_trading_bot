@@ -28,6 +28,7 @@ from infra import (
     append_iv_snapshot,
     atomic_write_json,
     compute_ivr,
+    compute_iv_percentile,
     estimate_options_cost,
     get_instruments,
     read_json,
@@ -959,6 +960,40 @@ class OrderExecutionAgent:
                     logging.info(f"IVR check: {ivr:.1f} <= {ivr_max:.0f} (samples={samples}). OK.")
             else:
                 logging.info(f"IVR gate bypassed: insufficient history ({samples} samples).")
+
+            # ---------- IV-percentile gate (playbook: don't buy expensive IV) ----------
+            self._last_iv_percentile = None
+            ivp_cfg = (self.config.get("iv_percentile") or {})
+            avoid_above = float(ivp_cfg.get("avoid_above", 0) or 0)
+            buy_below   = float(ivp_cfg.get("buy_below", 0) or 0)
+            if avoid_above > 0:
+                ivp, ivp_n = compute_iv_percentile(
+                    self.flags["underlying_instrument"], atm_iv, lookback, min_samples
+                )
+                if ivp is not None:
+                    self._last_iv_percentile = round(ivp, 1)
+                    if ivp > avoid_above:
+                        if force_mode:
+                            logging.warning(
+                                f"FORCE-MODE: IV-percentile gate BYPASSED "
+                                f"({ivp:.0f} > {avoid_above:.0f})."
+                            )
+                        else:
+                            logging.warning(
+                                f"IV-percentile gate: {ivp:.0f} > {avoid_above:.0f} — options "
+                                f"historically EXPENSIVE; skipping buy (samples={ivp_n})."
+                            )
+                            return None
+                    elif buy_below > 0 and ivp > buy_below:
+                        logging.info(
+                            f"IV-percentile {ivp:.0f}: above preferred buy zone "
+                            f"(<{buy_below:.0f}) but under the {avoid_above:.0f} avoid line — "
+                            f"proceeding with caution."
+                        )
+                    else:
+                        logging.info(f"IV-percentile check: {ivp:.0f} (buy zone). OK.")
+                else:
+                    logging.info(f"IV-percentile gate bypassed: insufficient history ({ivp_n}).")
 
             # ---------- IV/RV gate ----------
             iv_rv_max = float(flt.get("iv_rv_max_ratio", 0))
