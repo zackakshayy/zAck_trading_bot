@@ -19,7 +19,7 @@ from strategy_factory import get_strategy
 from backtester import run_backtest
 from reporting import (
     send_daily_report, initialize_trade_log, log_trade, send_monthly_report,
-    send_loss_analysis_email, send_token_expiry_alert,
+    send_loss_analysis_email, send_token_expiry_alert, send_weekly_report,
 )
 from loss_analyzer import build_loss_report
 from indicators import calculate_cpr, is_trend_overextended, check_momentum_divergence
@@ -38,6 +38,8 @@ from infra import (
     state_path,
     atomic_write_json,
     read_json,
+    load_week_trade_days,
+    add_week_trade_day,
 )
 import multiprocessing
 import warnings
@@ -216,6 +218,7 @@ class TradingBotOrchestrator:
         # started. The end-of-day report/summary then always covers the whole day.
         self._load_ledger()
         self.starting_capital = None
+        self.ending_capital = None   # captured at end-of-day for the reports
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
         self.effective_entry_start_time = None
         # Professional risk controls
@@ -424,6 +427,63 @@ class TradingBotOrchestrator:
         except Exception as e:
             logging.warning(f"Could not snapshot starting capital: {e}")
             self.starting_capital = 0.0
+
+    async def _capture_ending_capital(self):
+        """
+        Snapshot capital at end-of-day for the daily/weekly reports. Best-effort:
+        on early exits or monitor mode (no live session) it stays None.
+        """
+        try:
+            margins = await asyncio.to_thread(self.kite.margins)
+            equity = (margins or {}).get('equity', {}).get('available', {})
+            cap = equity.get('live_balance') or equity.get('cash') or equity.get('net') or 0
+            self.ending_capital = float(cap or 0)
+            logging.debug(f"Ending capital snapshot: {self.ending_capital:,.2f}")
+            self._persist_ledger()
+        except Exception as e:
+            logging.debug(f"Could not snapshot ending capital: {e}")
+
+    async def _regime_governor(self) -> tuple:
+        """
+        Returns (sit_out: bool, reason: str). Implements the playbook's
+        selectivity/survival governors (Phase A):
+          • Weekly frequency cap — once `regime.max_trading_days_per_week`
+            distinct trading days are used this ISO week, sit out new days.
+          • VIX floor — below `regime.vix_no_trade_below`, the market is too
+            calm for option buyers to overcome theta, so stand down.
+        Disabled wholesale when regime.enable is false.
+        """
+        rcfg = (self.config.get('regime') or {})
+        if not rcfg.get('enable', True):
+            return False, ""
+
+        # (a) Weekly trading-day allotment.
+        max_days = int(rcfg.get('max_trading_days_per_week', 5))
+        today_str = datetime.date.today().isoformat()
+        week_str = datetime.date.today().strftime("%G-W%V")
+        days = load_week_trade_days(week_str)
+        if today_str not in days and len(days) >= max_days:
+            return True, (
+                f"Weekly trading-day cap reached ({len(days)}/{max_days} days traded "
+                f"this week). Cash is a position — sitting out until next week."
+            )
+
+        # (b) VIX floor.
+        floor = float(rcfg.get('vix_no_trade_below', 0) or 0)
+        if floor > 0:
+            try:
+                vix_tok = self.market_condition_identifier.vix_token
+                data = await asyncio.to_thread(self.kite.ltp, str(vix_tok))
+                vix = float((data or {}).get(str(vix_tok), {}).get('last_price', 0))
+                if 0 < vix < floor:
+                    return True, (
+                        f"India VIX {vix:.2f} is below the {floor:.0f} floor — market too "
+                        f"calm for option buyers to beat theta. Standing down today."
+                    )
+            except Exception as e:
+                logging.debug(f"VIX-floor check skipped (non-fatal): {e}")
+
+        return False, ""
 
     # ----- Strategy cooldown bookkeeping ----------------------------------
 
@@ -1173,6 +1233,17 @@ class TradingBotOrchestrator:
             # Stash for the loss-analyzer (needs the regime context at exit time).
             self.todays_conditions = todays_conditions
 
+            # ── Regime governor (playbook: selectivity + survival) ───────────
+            # Sit out the whole day when (a) the weekly trading-day allotment is
+            # used up, or (b) VIX is below the floor (too calm for option buyers
+            # to overcome theta). Runs early so we don't burn API calls on a day
+            # we won't trade. Returning False makes the bot stand down for today.
+            _sit_out, _sit_reason = await self._regime_governor()
+            if _sit_out:
+                self.no_trade_reason = _sit_reason
+                logging.warning(f"Regime governor: standing down today — {_sit_reason}")
+                return False
+
             # 1b. Trigger the YouTube sentiment fetch BEFORE we look at sentiment.
             # Cached for the day after the first call, so reassessment runs are
             # cheap (single cache read, no LLM calls). Best-effort: failures here
@@ -1879,6 +1950,17 @@ class TradingBotOrchestrator:
             logging.info("Daily report sent.")
         except Exception as e:
             logging.error(f"Failed to send shutdown report: {e}", exc_info=True)
+        # Weekly report on the configured day (default Friday).
+        try:
+            rep_cfg = (self.config.get('reporting') or {})
+            if rep_cfg.get('weekly_report', True):
+                want_day = str(rep_cfg.get('weekly_report_day', 'Friday')).strip().lower()
+                today_day = datetime.date.today().strftime('%A').lower()
+                if today_day == want_day:
+                    send_weekly_report(self.config, datetime.date.today().strftime("%G-W%V"))
+                    logging.info("Weekly report sent.")
+        except Exception as e:
+            logging.error(f"Failed to send weekly report: {e}", exc_info=True)
 
     def _handle_losing_trade(self, completed_trade: dict, underlying_df):
         """
@@ -2575,6 +2657,8 @@ class TradingBotOrchestrator:
                 "losses": int(self.losses_today),
                 "scratch": int(self.scratch_today),
                 "completed_trades": self.completed_trades,
+                "starting_capital": self.starting_capital,
+                "ending_capital": self.ending_capital,
             })
         except Exception as e:
             logging.debug(f"Could not persist trade ledger: {e}")
@@ -2815,7 +2899,12 @@ class TradingBotOrchestrator:
             _root_logger.removeHandler(_status_handler)
             for h in _orig_handlers:
                 _root_logger.addHandler(h)
-            # Print the end-of-session trade summary, then send the daily report.
+            # Capture end-of-day capital (best-effort), print the session
+            # summary, then send the daily (and, on the configured day, weekly) report.
+            try:
+                await self._capture_ending_capital()
+            except Exception:
+                pass
             self._print_session_summary()
             self._send_shutdown_report_once()
 
@@ -3180,6 +3269,16 @@ class TradingBotOrchestrator:
                                     if not is_paper:
                                         await self.position_agent.attach_broker_stop_loss(self.order_agent)
                                     self.trades_today_count += 1
+                                    # Record today as a TRADED day for the weekly
+                                    # frequency governor (on the first fill only).
+                                    if self.trades_today_count == 1:
+                                        try:
+                                            add_week_trade_day(
+                                                datetime.date.today().strftime("%G-W%V"),
+                                                datetime.date.today().isoformat(),
+                                            )
+                                        except Exception as _wd_exc:
+                                            logging.debug(f"weekly trade-day record failed: {_wd_exc}")
                                     self._persist_ledger()   # daily-max cap survives restarts
                                     # Clear the \r status line before trade logs print.
                                     if self._is_interactive_tty():

@@ -80,6 +80,33 @@ risk_management:
   enable_weekly_loss_limit: false
   max_weekly_loss_percent: 5.0
 # ---------------------------------------------------------------------------
+# Tiered per-trade risk by LIVE capital (playbook alignment). The first tier
+# whose capital < max_capital wins; a null max_capital is the top catch-all tier.
+# When present, this overrides the static risk_per_trade_percent and the
+# AGGRESSIVE/MODERATE risk override for the per-trade risk figure.
+risk_tiers:
+  - { max_capital: 100000, risk_pct: 10 }   # under ₹1,00,000     → 10%
+  - { max_capital: 300000, risk_pct: 5 }    # ₹1,00,000–₹3,00,000 → 5%
+  - { max_capital: null,   risk_pct: 2 }    # above ₹3,00,000     → 2%
+# ---------------------------------------------------------------------------
+# Regime governor — selectivity + survival ("cash is a position").
+#   max_trading_days_per_week : sit out new days once this many distinct days
+#                               have already been traded this ISO week.
+#   vix_no_trade_below        : when India VIX is below this, the market is too
+#                               calm for option buyers to overcome theta → sit out.
+#   require_clean_regime      : (Phase B) when no clear regime can be assigned,
+#                               stand down for the day.
+regime:
+  enable: true
+  require_clean_regime: true
+  max_trading_days_per_week: 5
+  vix_no_trade_below: 12
+# ---------------------------------------------------------------------------
+# Reporting — daily + weekly emails, each showing capital start → end.
+reporting:
+  weekly_report: true
+  weekly_report_day: "Friday"
+# ---------------------------------------------------------------------------
 # Transaction costs (brokerage, STT, exchange/SEBI charges, stamp duty, GST).
 # A small gross profit on an options scalp is often a NET LOSS once these are
 # deducted. With enable: true the bot:

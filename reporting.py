@@ -7,7 +7,49 @@ import pandas as pd
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+from infra import read_json, state_path
+
 LOG_FILE = 'output/trade_log.xlsx'
+
+
+# --------------------------------------------------------------------------- #
+# Capital (start → end) helpers — read the per-day trade ledger
+# --------------------------------------------------------------------------- #
+def _ledger_for_date(date_obj) -> dict:
+    """Read state/trade_ledger_<date>.json for a given date (or {})."""
+    ds = date_obj.strftime("%Y-%m-%d")
+    return read_json(state_path(f"trade_ledger_{ds}.json"), default={}) or {}
+
+
+def _fmt_capital(v):
+    return f"₹{float(v):,.0f}" if v not in (None, "") else "—"
+
+
+def _capital_html(start, end) -> str:
+    """A small HTML block showing capital start → end and the day/period change."""
+    chg = ""
+    try:
+        if start not in (None, "") and end not in (None, ""):
+            d = float(end) - float(start)
+            sign = "+" if d >= 0 else "−"
+            color = "#1a7f37" if d >= 0 else "#cf222e"
+            chg = f' <span style="color:{color}">({sign}₹{abs(d):,.0f})</span>'
+    except Exception:
+        chg = ""
+    return (
+        f"<p style='font-size:1.05em'><strong>Capital:</strong> "
+        f"{_fmt_capital(start)} → {_fmt_capital(end)}{chg}</p>"
+    )
+
+
+def _iso_week_dates(week_str: str):
+    """Return the Mon–Sun date objects for an ISO week string like '2026-W23'."""
+    try:
+        year, wk = week_str.split("-W")
+        monday = datetime.date.fromisocalendar(int(year), int(wk), 1)
+        return [monday + datetime.timedelta(days=i) for i in range(7)]
+    except Exception:
+        return []
 os.makedirs('output', exist_ok=True)
 
 _SORRY_BANNER = """
@@ -233,8 +275,11 @@ def generate_daily_summary(df, date_obj, reason):
     """Generates the HTML summary for a single day, segregating live and paper trades."""
     html_style = "<style>body{font-family:Arial,sans-serif;margin:20px;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:8px;text-align:left;} th{background-color:#f2f2f2;}</style>"
     
-    header = f"<h2>Daily Summary: {date_obj.strftime('%d %b, %Y')}</h2>"
-    
+    # Capital start → end, read from the day's persisted ledger.
+    _led = _ledger_for_date(date_obj)
+    _cap_html = _capital_html(_led.get("starting_capital"), _led.get("ending_capital"))
+    header = f"<h2>Daily Summary: {date_obj.strftime('%d %b, %Y')}</h2>{_cap_html}"
+
     if reason:
         body = f"{header}<p><strong>No trades were placed today. Reason:</strong> {reason}</p>"
         return f"<html><head>{html_style}</head><body>{body}</body></html>", None, None
@@ -264,6 +309,86 @@ def generate_daily_summary(df, date_obj, reason):
     full_html_body = f"{header}{live_html}<hr>{paper_html}"
     
     return f"<html><head>{html_style}</head><body>{full_html_body}</body></html>", live_pnl, paper_pnl
+
+def send_weekly_report(config, week_str):
+    """
+    Build and email a weekly performance summary for the ISO week `week_str`
+    (e.g. '2026-W23'): trades, win rate, avg win/loss, net P&L, biggest loss,
+    days traded, and capital start → end (from the week's daily ledgers).
+    """
+    email_conf = config.get('email_settings', {}) or {}
+    if not email_conf.get('send_daily_report', False):
+        logging.info("Email reporting disabled; skipping weekly report.")
+        return
+    try:
+        dates = _iso_week_dates(week_str)
+        if not dates:
+            logging.warning(f"send_weekly_report: bad week string {week_str!r}.")
+            return
+        week_set = set(dates)
+
+        # Trades for the week from the persisted log.
+        df = pd.read_excel(LOG_FILE) if (os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 0) else pd.DataFrame()
+        if not df.empty and 'Timestamp' in df.columns:
+            df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+            wk = df[df['Timestamp'].dt.date.isin(week_set)].copy()
+        else:
+            wk = pd.DataFrame()
+
+        # Capital start → end across the week's daily ledgers.
+        start_cap = end_cap = None
+        traded_days = set()
+        for d in dates:
+            led = _ledger_for_date(d)
+            if led.get("starting_capital") not in (None, "") and start_cap is None:
+                start_cap = led.get("starting_capital")
+            if led.get("ending_capital") not in (None, ""):
+                end_cap = led.get("ending_capital")
+            if int(led.get("trades_today_count", 0) or 0) > 0:
+                traded_days.add(d.isoformat())
+
+        html_style = "<style>body{font-family:Arial,sans-serif;margin:20px;} table{border-collapse:collapse;width:520px;} th,td{border:1px solid #ddd;padding:8px;text-align:left;} th{background:#f2f2f2;}</style>"
+        mon, sun = dates[0], dates[6]
+        header = (f"<h2>Weekly Summary: {week_str} "
+                  f"({mon.strftime('%d %b')} – {sun.strftime('%d %b, %Y')})</h2>"
+                  + _capital_html(start_cap, end_cap))
+
+        if wk.empty or 'ProfitLoss' not in wk.columns:
+            body = f"{header}<p>No trades were placed this week.</p>"
+            _send_email(config, f"Weekly Trading Report — {week_str}",
+                        f"<html><head>{html_style}</head><body>{body}</body></html>")
+            return
+
+        pnl = wk['ProfitLoss'].astype(float)
+        n = len(wk)
+        wins = wk[pnl > 0]; losses = wk[pnl < 0]
+        win_rate = (len(wins) / n * 100) if n else 0.0
+        avg_win = wins['ProfitLoss'].astype(float).mean() if len(wins) else 0.0
+        avg_loss = losses['ProfitLoss'].astype(float).mean() if len(losses) else 0.0
+        net = pnl.sum()
+        biggest_loss = pnl.min() if n else 0.0
+
+        net_color = "#1a7f37" if net >= 0 else "#cf222e"
+        summary = f"""
+        <table>
+          <tr><td>Trading days</td><td>{len(traded_days)}</td></tr>
+          <tr><td>Trades</td><td>{n}</td></tr>
+          <tr><td>Winning / Losing</td><td>{len(wins)} / {len(losses)}</td></tr>
+          <tr><td>Win rate</td><td>{win_rate:.1f}%</td></tr>
+          <tr><td>Average win</td><td>₹{avg_win:,.2f}</td></tr>
+          <tr><td>Average loss</td><td>₹{avg_loss:,.2f}</td></tr>
+          <tr><td>Biggest single loss</td><td>₹{biggest_loss:,.2f}</td></tr>
+          <tr><td><strong>Net P&amp;L (after costs)</strong></td>
+              <td><strong style="color:{net_color}">₹{net:,.2f}</strong></td></tr>
+        </table>"""
+
+        body = f"{header}{summary}"
+        _send_email(config, f"Weekly Trading Report — {week_str} | Net ₹{net:,.0f}",
+                    f"<html><head>{html_style}</head><body>{body}</body></html>")
+        logging.info(f"Weekly report emailed for {week_str}.")
+    except Exception as e:
+        logging.error(f"send_weekly_report failed: {e}", exc_info=True)
+
 
 def send_monthly_report(config, date_str):
     """Generates and sends a summary report for the entire month's performance."""

@@ -32,6 +32,7 @@ from infra import (
     get_instruments,
     read_json,
     retry_call,
+    risk_pct_for_capital,
     safe_ltp,
     state_path,
     tick_round,
@@ -650,6 +651,10 @@ class OrderExecutionAgent:
             "product":          self.flags["product_type"],
             # price and order_type set by _place_entry_with_retry
         }
+        # BUY-ONLY hard guarantee: an entry must NEVER sell-to-open an option.
+        # This assertion makes the invariant impossible to break via future edits.
+        assert base_long_params["transaction_type"] == self.kite.TRANSACTION_TYPE_BUY, \
+            "buy_only invariant violated: entry transaction_type must be BUY"
         long_status, long_fill, long_filled_qty, long_id = await _place_entry_with_retry(
             api_key, access_tok,
             base_params=base_long_params,
@@ -1151,13 +1156,20 @@ class OrderExecutionAgent:
                 logging.error(f"Could not determine available capital from margins: {equity}")
                 return None, 0, 0
 
-            # Base risk percentage: honour a runtime override injected into
-            # trading_flags by setup() each session (AGGRESSIVE / MODERATE mode
-            # switching, manual override). Falls back to the static config value.
-            risk_pct = float(
-                self.flags.get("_effective_risk_pct")
-                or self.flags["risk_per_trade_percent"]
-            )
+            # Base risk percentage: TIERED by live capital (playbook alignment).
+            #   <₹1L → 10% | ₹1L–₹3L → 5% | >₹3L → 2%  (configurable: risk_tiers)
+            # This supersedes the static risk_per_trade_percent and the
+            # AGGRESSIVE/MODERATE mode override for the per-trade risk figure.
+            if (self.config.get("risk_tiers")):
+                risk_pct = risk_pct_for_capital(capital, self.config)
+                logging.info(
+                    f"[RiskTier] capital ₹{float(capital):,.0f} → risk {risk_pct:.1f}% per trade."
+                )
+            else:
+                risk_pct = float(
+                    self.flags.get("_effective_risk_pct")
+                    or self.flags["risk_per_trade_percent"]
+                )
             # Continuous DTE scaling supersedes the old binary expiry_risk_factor.
             dte_factor = self.dte_risk_factor(expiry_date)
             if dte_factor < 1.0:

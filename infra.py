@@ -382,3 +382,76 @@ def compute_ivr(underlying: str, current_iv: float,
         return None, len(ivs)
     ivr = (current_iv - iv_min) / (iv_max - iv_min) * 100.0
     return max(0.0, min(100.0, ivr)), len(ivs)
+
+
+# ---------------------------------------------------------------------------
+# Tiered per-trade risk by live capital (playbook alignment, Phase A)
+# ---------------------------------------------------------------------------
+# The professional playbook sizes risk to capital. This maps the LIVE account
+# balance to a per-trade risk %. Defaults match the operator's spec:
+#   capital < ₹1,00,000          → 10%
+#   ₹1,00,000 ≤ capital ≤ ₹3,00,000 → 5%
+#   capital > ₹3,00,000          → 2%
+# Override under config['risk_tiers'] as a list of {max_capital, risk_pct};
+# a null/absent max_capital is the catch-all top tier.
+_DEFAULT_RISK_TIERS = [
+    {"max_capital": 100000, "risk_pct": 10.0},
+    {"max_capital": 300000, "risk_pct": 5.0},
+    {"max_capital": None,   "risk_pct": 2.0},
+]
+
+
+def risk_pct_for_capital(capital, config=None) -> float:
+    """Return the per-trade risk % for the given live capital, from config tiers."""
+    tiers = ((config or {}).get("risk_tiers")) or _DEFAULT_RISK_TIERS
+    cap = float(capital or 0)
+    for t in tiers:
+        try:
+            mx = t.get("max_capital")
+            # Strict "<" so "under ₹1,00,000" → 10% and exactly ₹1,00,000 → 5%.
+            # At the upper boundary this errs toward the lower (safer) risk tier.
+            if mx is None or cap < float(mx):
+                return float(t.get("risk_pct", 2.0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        return float(tiers[-1].get("risk_pct", 2.0))
+    except Exception:
+        return 2.0
+
+
+# ---------------------------------------------------------------------------
+# Weekly trading-day governor (max distinct trading days per ISO week)
+# ---------------------------------------------------------------------------
+# "Cash is a position." Tracks which calendar dates the bot actually TRADED in
+# each ISO week so a frequency cap can force the bot to sit out once it has
+# used its allotment of trading days that week.
+WEEKLY_TRADE_DAYS_FILE = state_path("weekly_trade_days.json")
+
+
+def load_week_trade_days(week_str: str) -> list:
+    """Returns the list of date strings (YYYY-MM-DD) traded in `week_str`."""
+    data = read_json(WEEKLY_TRADE_DAYS_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        return []
+    raw = data.get(week_str, [])
+    return list(raw) if isinstance(raw, list) else []
+
+
+def add_week_trade_day(week_str: str, date_str: str) -> None:
+    """Record `date_str` as a traded day in `week_str` (idempotent)."""
+    data = read_json(WEEKLY_TRADE_DAYS_FILE, default={}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    days = data.get(week_str, [])
+    if not isinstance(days, list):
+        days = []
+    if date_str not in days:
+        days.append(date_str)
+        days.sort()
+        data[week_str] = days
+        # Keep the file small — retain only the most recent 12 weeks.
+        if len(data) > 12:
+            for old in sorted(data.keys())[:-12]:
+                data.pop(old, None)
+        atomic_write_json(WEEKLY_TRADE_DAYS_FILE, data)
