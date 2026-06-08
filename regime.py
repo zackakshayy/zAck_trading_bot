@@ -31,8 +31,15 @@ ALL_STRATEGIES = (
 )
 
 # Regime-appropriate, BUY-ONLY strategy families.
+# Trend-following set for normal/high vol (VIX ≥ low_vix_threshold).
 _DIRECTIONAL = ("EMA_Cross_RSI", "Supertrend_MACD", "Momentum_VWAP_RSI",
                 "Breakout_Prev_Day_HL", "Gemini_Default")
+# Low-vol "grind" trending: VWAP-anchored momentum / mean-reversion fire more
+# readily than CPR breakouts when the market isn't moving much. This keeps the
+# cascade's natural VIX_LOW pick (VWAP_Reversion) INSIDE the regime family
+# instead of falling through to the last-resort Gemini_Default.
+_DIRECTIONAL_LOWVOL = ("Momentum_VWAP_RSI", "VWAP_Reversion", "EMA_Cross_RSI",
+                       "Gemini_Default")
 _POST_EVENT  = ("EMA_Cross_RSI", "Supertrend_MACD", "Momentum_VWAP_RSI",
                 "Breakout_Prev_Day_HL")
 _BREAKOUT    = ("Breakout_Prev_Day_HL", "Opening_Range_Breakout",
@@ -113,12 +120,18 @@ class RegimeClassifier:
                            else f"Directional only, {vix_s}.")),
             )
 
-        # 4) TRENDING — directional momentum buying.
+        # 4) TRENDING — directional momentum buying. The family is VIX-aware:
+        #    low-vol grinds favour VWAP-anchored plays over CPR/trend breakouts.
         if day_quality == "TRENDING":
+            low_vix = float(self.cfg.get("low_vix_threshold", 16))
+            if vix and 0 < vix < low_vix:
+                fam, tag = _DIRECTIONAL_LOWVOL, "low-vol grind: VWAP-anchored"
+            else:
+                fam, tag = _DIRECTIONAL, "directional ATM buys"
             return RegimeResult(
                 regime="TRENDING", direction=direction, clean=True, sit_out=False,
-                allowed_strategies=_DIRECTIONAL,
-                reason=f"Trending market ({direction.title()}, {vix_s}) — directional ATM buys.",
+                allowed_strategies=fam,
+                reason=f"Trending market ({direction.title()}, {vix_s}) — {tag}.",
             )
 
         # 5) RANGE — wait for a breakout; no naked buys inside the range.

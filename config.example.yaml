@@ -106,6 +106,7 @@ regime:
   sit_out_pre_event: true           # buy-only has no straddle → sit out pre-event
   expiry_dte_threshold: 1           # DTE ≤ this → EXPIRY (gamma scalp)
   post_event_wait_until: "10:30"    # POST_EVENT: no entries before this (avoid open chaos)
+  low_vix_threshold: 16             # TRENDING below this VIX → VWAP-anchored family
 # ---------------------------------------------------------------------------
 # Reporting — daily + weekly emails, each showing capital start → end.
 reporting:
