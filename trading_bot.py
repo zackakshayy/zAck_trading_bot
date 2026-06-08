@@ -183,6 +183,9 @@ class TradingBotOrchestrator:
         self._first_setup: bool = True              # day-level sit-out only on first setup
         self._fii_bias = None                       # best-effort FII positioning (informational)
         self._today_vix: float = 0.0                # cached for journaling
+        self._trend_composite: float = 0.0          # market_trend directional score (-1..1)
+        self.day_conviction: float = 0.0            # 0..1 conviction score
+        self.day_conviction_level: str = "LOW"      # LOW / MEDIUM / HIGH
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -459,6 +462,60 @@ class TradingBotOrchestrator:
             self._persist_ledger()
         except Exception as e:
             logging.debug(f"Could not snapshot ending capital: {e}")
+
+    @staticmethod
+    def _dir_of(sentiment: str) -> str:
+        s = (sentiment or "").lower()
+        if s in ("bullish", "very bullish"):
+            return "BULLISH"
+        if s in ("bearish", "very bearish"):
+            return "BEARISH"
+        return "NEUTRAL"
+
+    def _compute_conviction(self) -> tuple:
+        """
+        Combine regime + sentiment strength + global-cue alignment into a 0..1
+        conviction score and a LOW/MEDIUM/HIGH level. High conviction = bigger
+        size + hold-the-winner; weak = smaller / cut early. Pure scoring.
+        """
+        if not (self.config.get('conviction') or {}).get('enable', True):
+            return 0.0, "LOW"
+        score = 0.0
+        # Regime quality.
+        rgm = getattr(self, 'day_regime', 'PENDING')
+        score += {'TRENDING': 0.35, 'POST_EVENT': 0.25, 'EXPIRY': 0.20,
+                  'RANGE': 0.10}.get(rgm, 0.0)
+        # Sentiment strength.
+        sent = (self.day_sentiment or '')
+        score += 0.30 if sent in ('Very Bullish', 'Very Bearish') else \
+                 (0.15 if sent in ('Bullish', 'Bearish') else 0.0)
+        # Global-cue magnitude (market_trend composite, |.| up to 0.25).
+        score += min(0.25, abs(float(self._trend_composite or 0.0)) * 0.5)
+        # Directional alignment: regime/trend direction == sentiment direction.
+        sent_dir = self._dir_of(sent)
+        trend_dir = "BULLISH" if self._trend_composite > 0 else ("BEARISH" if self._trend_composite < 0 else "NEUTRAL")
+        fii_dir = (self._fii_bias or {}).get('bias') if self._fii_bias else None
+        if sent_dir != "NEUTRAL" and sent_dir == trend_dir:
+            score += 0.10
+        if fii_dir and fii_dir == sent_dir:
+            score += 0.05
+        score = max(0.0, min(1.0, score))
+        cfg = (self.config.get('conviction') or {})
+        hi = float(cfg.get('high_threshold', 0.70))
+        med = float(cfg.get('medium_threshold', 0.45))
+        level = "HIGH" if score >= hi else ("MEDIUM" if score >= med else "LOW")
+        return round(score, 3), level
+
+    def _is_hold_to_close(self, signal: str) -> bool:
+        """A trade qualifies to ride to ~15:15 (hold-the-winner) when conviction is
+        HIGH, the regime is TRENDING, and the trade direction aligns with the day's
+        sentiment direction (so we only let *aligned, high-conviction* trades run)."""
+        if not (self.config.get('hold_to_close') or {}).get('enable', True):
+            return False
+        if self.day_conviction_level != "HIGH" or getattr(self, 'day_regime', '') != "TRENDING":
+            return False
+        sig_dir = "BULLISH" if signal == "BUY" else ("BEARISH" if signal == "SELL" else "NEUTRAL")
+        return sig_dir != "NEUTRAL" and sig_dir == self._dir_of(self.day_sentiment)
 
     async def _current_vix(self) -> float:
         """Best-effort live India VIX (0.0 on failure)."""
@@ -1470,6 +1527,16 @@ class TradingBotOrchestrator:
                 except Exception as _rgm_exc:
                     logging.debug(f"Regime classification skipped (non-fatal): {_rgm_exc}")
 
+            # ── Conviction score (regime + sentiment + global cues) ──────────
+            # Drives position size and the hold-the-winner exit: HIGH conviction
+            # trending trades size up and ride to ~15:15; weak ones size down.
+            self.day_conviction, self.day_conviction_level = self._compute_conviction()
+            logging.info(
+                f"[Conviction] {self.day_conviction_level} ({self.day_conviction:.2f}) "
+                f"— regime={getattr(self,'day_regime','?')}, sentiment={self.day_sentiment}, "
+                f"trend_score={self._trend_composite:+.2f}"
+            )
+
             # ── Strategy selection ──────────────────────────────────────────
             # Manual mode: operator picks from a numbered menu. The choice is
             # cached in _manual_strategy_name and reused on every reassessment
@@ -1826,6 +1893,8 @@ class TradingBotOrchestrator:
                 "day_quality":        getattr(self, '_day_quality', 'UNKNOWN'),
                 "regime":             getattr(self, 'day_regime', 'PENDING'),
                 "regime_reason":      getattr(self, '_regime_reason', ''),
+                "conviction":         getattr(self, 'day_conviction_level', 'LOW'),
+                "conviction_score":   getattr(self, 'day_conviction', 0.0),
                 "vix":                round(float(getattr(self, '_today_vix', 0) or 0), 2),
                 "pcr":                (self._pcr_data or {}).get("pcr"),
                 "max_pain":           (self._pcr_data or {}).get("max_pain"),
@@ -2142,6 +2211,7 @@ class TradingBotOrchestrator:
                      "composite": 0.0, "components": {},
                      "summary": "analysis failed — Neutral"}
         automated = trend.get("sentiment", "Neutral")
+        self._trend_composite = float(trend.get("composite", 0.0) or 0.0)
         logging.info(
             f"[MarketTrend] Verdict: {trend.get('verdict')} "
             f"(score {trend.get('composite'):+.2f}) → {automated}"
@@ -3380,6 +3450,19 @@ class TradingBotOrchestrator:
                                     (self.config.get('trading_flags', {}) or {})
                                     .get('counter_sentiment_size_factor', 0.5)
                                 )
+                            # Conviction sizing: HIGH = full, MEDIUM/LOW = reduced.
+                            _conv_cfg = (self.config.get('conviction') or {})
+                            if _conv_cfg.get('enable', True):
+                                _conv_factor = float(
+                                    (_conv_cfg.get('size_factors') or {})
+                                    .get(self.day_conviction_level, 1.0)
+                                )
+                                if _conv_factor != 1.0:
+                                    logging.info(
+                                        f"[Conviction] {self.day_conviction_level} → size "
+                                        f"×{_conv_factor:.2f}"
+                                    )
+                                effective_multiplier *= _conv_factor
                             self.config['_effective_risk_pct_multiplier'] = effective_multiplier
                             if effective_multiplier < 1.0:
                                 logging.info(
@@ -3438,6 +3521,15 @@ class TradingBotOrchestrator:
                                 )
                                 if trade_details:
                                     trade_details['Strategy'] = self.active_strategy_name
+                                    # Hold-the-winner: tag high-conviction trending
+                                    # aligned trades so manage() rides them to ~15:15.
+                                    trade_details['hold_to_close'] = self._is_hold_to_close(signal)
+                                    trade_details['conviction'] = self.day_conviction_level
+                                    if trade_details['hold_to_close']:
+                                        logging.info(
+                                            f"[HoldToClose] {signal} tagged to ride the trend "
+                                            f"to near-close (HIGH conviction, TRENDING, aligned)."
+                                        )
                                     self.position_agent.start_trade(trade_details)
                                     if not is_paper:
                                         await self.position_agent.attach_broker_stop_loss(self.order_agent)

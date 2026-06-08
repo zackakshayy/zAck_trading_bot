@@ -1532,13 +1532,26 @@ class PositionManagementAgent:
                 current_price = max(0.0, float(current_price) - float(short_price))
             # If short LTP is unavailable, fall back to long LTP only (conservative).
 
-        # 3. Hard time exit — never hold options past 14:00 IST.
-        #    Theta and bid-ask spread widen sharply in the last 75 min.
+        # 3. Hard time exit — normally 14:00 (theta + spread widen in the last
+        #    75 min). EXCEPTION (hold-the-winner): a high-conviction trending
+        #    WINNER tagged hold_to_close at entry is allowed to ride to ~15:15 to
+        #    capture the afternoon trend continuation, instead of being cut early.
+        hold_to_close = bool(self.active_trade.get('hold_to_close'))
+        in_profit = float(current_price) > float(self.active_trade.get('entry_price', 0) or 0)
         _hard_close_time = datetime.time(14, 0)
+        if hold_to_close and in_profit:
+            try:
+                _hc = str((self.config.get('hold_to_close') or {}).get('exit_time', '15:15'))
+                hh, mm = [int(x) for x in _hc.split(':')]
+                _hard_close_time = datetime.time(hh, mm)
+            except Exception:
+                _hard_close_time = datetime.time(15, 15)
         if datetime.datetime.now().time() >= _hard_close_time:
             logging.info(
-                f"Hard time exit: {datetime.datetime.now().strftime('%H:%M')} >= 14:00 — "
-                f"closing {symbol} to avoid theta/spread damage."
+                f"Hard time exit: {datetime.datetime.now().strftime('%H:%M')} >= "
+                f"{_hard_close_time.strftime('%H:%M')} — closing {symbol}"
+                + (" (held the conviction winner to near-close)." if hold_to_close and in_profit
+                   else " to avoid theta/spread damage.")
             )
             return await self.exit_trade(
                 is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
@@ -1580,8 +1593,12 @@ class PositionManagementAgent:
                         )
 
         # 6. Tighten trail after 13:30 to protect intraday gains from theta drain.
+        #    EXCEPTION (hold-the-winner): a high-conviction trending WINNER keeps
+        #    its WIDE trail so it can ride the trend to near-close; the profit-
+        #    protector indicator exit still locks the gain on a structure break.
         _late_tighten_time = datetime.time(13, 30)
-        if datetime.datetime.now().time() >= _late_tighten_time:
+        if (datetime.datetime.now().time() >= _late_tighten_time
+                and not (hold_to_close and in_profit)):
             current_trail_pct = float(self.tsl_config.get("percentage", 15.0))
             if current_trail_pct > 5.0:
                 self.tsl_config = dict(self.tsl_config)

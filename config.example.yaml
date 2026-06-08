@@ -113,6 +113,22 @@ reporting:
   weekly_report: true
   weekly_report_day: "Friday"
 # ---------------------------------------------------------------------------
+# Conviction scoring: regime + sentiment strength + global-cue (market_trend)
+# alignment → a 0..1 score and a LOW/MEDIUM/HIGH level. HIGH = full size + lets
+# the trade ride to near-close (hold-the-winner); MEDIUM/LOW = reduced size.
+conviction:
+  enable: true
+  high_threshold: 0.70
+  medium_threshold: 0.45
+  size_factors: { HIGH: 1.0, MEDIUM: 0.75, LOW: 0.5 }
+# Hold-the-winner: a HIGH-conviction, TRENDING, aligned, in-profit trade is
+# allowed to ride to exit_time (vs the default 14:00 hard exit) and keeps its
+# wide trail past 13:30 — so winners run the afternoon trend instead of being
+# cut early. The profit-protector indicator exit still locks gains on a reversal.
+hold_to_close:
+  enable: true
+  exit_time: "15:15"
+# ---------------------------------------------------------------------------
 # IV-percentile gate (playbook: buy cheap IV, avoid expensive). Uses the same
 # rolling IV history as IV-Rank. buy_below is a soft caution; avoid_above is a
 # hard skip on long-option entries.
