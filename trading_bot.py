@@ -186,6 +186,7 @@ class TradingBotOrchestrator:
         self._trend_composite: float = 0.0          # market_trend directional score (-1..1)
         self.day_conviction: float = 0.0            # 0..1 conviction score
         self.day_conviction_level: str = "LOW"      # LOW / MEDIUM / HIGH
+        self._expiry_gamma_active: bool = False      # 0-DTE expiry gamma-scalp mode
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -1526,6 +1527,22 @@ class TradingBotOrchestrator:
                             self._regime_entry_not_before = self._parse_hhmm(_rgm.entry_not_before)
                 except Exception as _rgm_exc:
                     logging.debug(f"Regime classification skipped (non-fatal): {_rgm_exc}")
+
+            # ── Expiry 0-DTE gamma scalp (advanced) ──────────────────────────
+            # On expiry day, when enabled, trade the expiring contract's gamma:
+            # no entries before start_after (avoid the chaotic open), half size,
+            # flat by hard_exit_time. _get_trade_details picks the 0-DTE option.
+            self._expiry_gamma_active = False
+            if getattr(self, 'day_regime', '') == "EXPIRY":
+                egs = (self.config.get("expiry_gamma_scalp") or {})
+                if egs.get("enable", False):
+                    self._expiry_gamma_active = True
+                    self._regime_entry_not_before = self._parse_hhmm(str(egs.get("start_after", "11:00")))
+                    logging.info(
+                        f"[ExpiryGamma] ACTIVE — 0-DTE scalp; entries from "
+                        f"{egs.get('start_after','11:00')}, half size, flat by "
+                        f"{egs.get('hard_exit_time','14:30')}."
+                    )
 
             # ── Conviction score (regime + sentiment + global cues) ──────────
             # Drives position size and the hold-the-winner exit: HIGH conviction
@@ -3463,6 +3480,11 @@ class TradingBotOrchestrator:
                                         f"×{_conv_factor:.2f}"
                                     )
                                 effective_multiplier *= _conv_factor
+                            # Expiry gamma scalp: extra half-size haircut (high leverage).
+                            if getattr(self, '_expiry_gamma_active', False):
+                                _egf = float((self.config.get('expiry_gamma_scalp') or {}).get('size_factor', 0.5))
+                                effective_multiplier *= _egf
+                                logging.info(f"[ExpiryGamma] 0-DTE scalp size ×{_egf:.2f}")
                             self.config['_effective_risk_pct_multiplier'] = effective_multiplier
                             if effective_multiplier < 1.0:
                                 logging.info(
@@ -3525,6 +3547,7 @@ class TradingBotOrchestrator:
                                     # aligned trades so manage() rides them to ~15:15.
                                     trade_details['hold_to_close'] = self._is_hold_to_close(signal)
                                     trade_details['conviction'] = self.day_conviction_level
+                                    trade_details['expiry_gamma'] = getattr(self, '_expiry_gamma_active', False)
                                     if trade_details['hold_to_close']:
                                         logging.info(
                                             f"[HoldToClose] {signal} tagged to ride the trend "

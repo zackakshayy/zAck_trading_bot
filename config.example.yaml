@@ -425,6 +425,16 @@ expiry_day_overrides:
   risk_reduction_factor: 0.5      # halve risk per trade
   max_trades: 1                   # at most one trade on expiry day
   entry_cutoff_time: "13:00"      # tighter than the regular 14:30 cutoff
+# 0-DTE EXPIRY GAMMA SCALP (advanced, high-variance — playbook Strategy 6).
+# When enable:true, on expiry day the bot trades the EXPIRING contract's gamma
+# (not the 5-10 DTE option): no entries before start_after, HALF size, flat by
+# hard_exit_time. Default OFF — the doc says paper-trade ~20 expiries first.
+expiry_gamma_scalp:
+  enable: false
+  dte: 0
+  start_after: "11:00"
+  hard_exit_time: "14:30"
+  size_factor: 0.5
 # Sentiment-refresh policy: capture sentiment + NL-prompt ONCE at startup,
 # reuse on every strategy reassessment unless the market has materially shifted.
 sentiment_refresh:

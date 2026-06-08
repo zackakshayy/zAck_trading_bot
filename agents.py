@@ -1104,7 +1104,12 @@ class OrderExecutionAgent:
             option_type = "CE" if direction == "BUY" else "PE"
 
             today = datetime.date.today()
-            min_dte = int(self.flags.get("min_days_to_expiry", 0))
+            # EXPIRY GAMMA SCALP: on expiry day, optionally trade the 0-DTE
+            # expiring contract (max gamma) instead of the 5-10 DTE positional
+            # option. This is the doc's advanced Strategy 6 — high variance.
+            egs = (self.config.get("expiry_gamma_scalp") or {})
+            gamma_mode = bool(egs.get("enable", False)) and self.is_weekly_expiry_today()
+            min_dte = int(egs.get("dte", 0)) if gamma_mode else int(self.flags.get("min_days_to_expiry", 0))
             valid_expiries = sorted({
                 d for d in self.nfo_instruments["expiry_date"].unique()
                 if (d - today).days >= min_dte
@@ -1113,12 +1118,21 @@ class OrderExecutionAgent:
                 logging.warning(f"No expiries with DTE >= {min_dte}. Aborting sizing.")
                 return None, 0, 0
 
-            # Professional DTE sweet spot: 5-10 calendar days.
-            # Enough time value to survive one adverse bar; enough gamma to
-            # profit from a 0.5% underlying move. Fall back to nearest valid
-            # expiry if no contract falls in the window (e.g. on expiry week).
-            preferred_dte = [d for d in valid_expiries if 5 <= (d - today).days <= 10]
-            expiry_date = preferred_dte[0] if preferred_dte else valid_expiries[0]
+            if gamma_mode:
+                # Force the NEAREST (0-DTE) expiry for the gamma scalp — do NOT
+                # apply the 5-10 DTE preference.
+                expiry_date = valid_expiries[0]
+                preferred_dte = []
+                logging.info(
+                    f"[ExpiryGamma] Trading 0-DTE expiring contract "
+                    f"({(expiry_date - today).days} DTE) for the gamma scalp."
+                )
+            else:
+                # Professional DTE sweet spot: 5-10 calendar days. Enough time
+                # value to survive one adverse bar; enough gamma to profit from a
+                # 0.5% move. Fall back to nearest valid expiry if none in window.
+                preferred_dte = [d for d in valid_expiries if 5 <= (d - today).days <= 10]
+                expiry_date = preferred_dte[0] if preferred_dte else valid_expiries[0]
             logging.info(
                 f"Expiry selected: {expiry_date} "
                 f"({(expiry_date - today).days} DTE"
@@ -1539,7 +1553,15 @@ class PositionManagementAgent:
         hold_to_close = bool(self.active_trade.get('hold_to_close'))
         in_profit = float(current_price) > float(self.active_trade.get('entry_price', 0) or 0)
         _hard_close_time = datetime.time(14, 0)
-        if hold_to_close and in_profit:
+        if self.active_trade.get('expiry_gamma'):
+            # 0-DTE gamma scalp: flat by hard_exit_time (last-hour gamma is violent).
+            try:
+                _eg = str((self.config.get('expiry_gamma_scalp') or {}).get('hard_exit_time', '14:30'))
+                hh, mm = [int(x) for x in _eg.split(':')]
+                _hard_close_time = datetime.time(hh, mm)
+            except Exception:
+                _hard_close_time = datetime.time(14, 30)
+        elif hold_to_close and in_profit:
             try:
                 _hc = str((self.config.get('hold_to_close') or {}).get('exit_time', '15:15'))
                 hh, mm = [int(x) for x in _hc.split(':')]
