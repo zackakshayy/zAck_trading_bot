@@ -1530,18 +1530,16 @@ class TradingBotOrchestrator:
 
             # ── Expiry 0-DTE gamma scalp (advanced) ──────────────────────────
             # On expiry day, when enabled, trade the expiring contract's gamma:
-            # no entries before start_after (avoid the chaotic open), half size,
-            # flat by hard_exit_time. _get_trade_details picks the 0-DTE option.
+            # half size, flat by hard_exit_time. _get_trade_details picks the
+            # 0-DTE option. (Entry window decided below, after conviction.)
             self._expiry_gamma_active = False
             if getattr(self, 'day_regime', '') == "EXPIRY":
                 egs = (self.config.get("expiry_gamma_scalp") or {})
                 if egs.get("enable", False):
                     self._expiry_gamma_active = True
-                    self._regime_entry_not_before = self._parse_hhmm(str(egs.get("start_after", "11:00")))
                     logging.info(
-                        f"[ExpiryGamma] ACTIVE — 0-DTE scalp; entries from "
-                        f"{egs.get('start_after','11:00')}, half size, flat by "
-                        f"{egs.get('hard_exit_time','14:30')}."
+                        f"[ExpiryGamma] ACTIVE — 0-DTE scalp, half size, "
+                        f"flat by {egs.get('hard_exit_time','14:30')}."
                     )
 
             # ── Conviction score (regime + sentiment + global cues) ──────────
@@ -1553,6 +1551,30 @@ class TradingBotOrchestrator:
                 f"— regime={getattr(self,'day_regime','?')}, sentiment={self.day_sentiment}, "
                 f"trend_score={self._trend_composite:+.2f}"
             )
+
+            # ── Expiry-gamma entry window (conviction-gated) ─────────────────
+            # A HIGH-conviction gap-and-go may enter EARLY (from start_after,
+            # ≥09:45 — never the chaotic first 15 min) to catch the morning trend.
+            # A murky open waits for confirmed_after (11:00) to let the fakeout/
+            # stop-hunt phase resolve. Early entries still pass every confirmation
+            # gate (ORB close + volume, 15m, trap, momentum), so a fake move
+            # won't trigger one.
+            if self._expiry_gamma_active:
+                egs = (self.config.get("expiry_gamma_scalp") or {})
+                _early = self._parse_hhmm(str(egs.get("start_after", "09:45")))
+                _confirmed = self._parse_hhmm(str(egs.get("confirmed_after", "11:00")))
+                if self.day_conviction_level == "HIGH":
+                    self._regime_entry_not_before = _early
+                    logging.info(
+                        f"[ExpiryGamma] HIGH conviction gap-and-go → EARLY entries "
+                        f"from {egs.get('start_after','09:45')} to catch the morning trend."
+                    )
+                else:
+                    self._regime_entry_not_before = _confirmed
+                    logging.info(
+                        f"[ExpiryGamma] Conviction {self.day_conviction_level} → wait until "
+                        f"{egs.get('confirmed_after','11:00')} (let the open settle)."
+                    )
 
             # ── Strategy selection ──────────────────────────────────────────
             # Manual mode: operator picks from a numbered menu. The choice is

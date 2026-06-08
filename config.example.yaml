@@ -432,7 +432,8 @@ expiry_day_overrides:
 expiry_gamma_scalp:
   enable: false
   dte: 0
-  start_after: "11:00"
+  start_after: "09:45"            # earliest entry on a HIGH-conviction gap-and-go (never first 15 min)
+  confirmed_after: "11:00"        # murky / medium-low conviction days wait until here
   hard_exit_time: "14:30"
   size_factor: 0.5
 # Sentiment-refresh policy: capture sentiment + NL-prompt ONCE at startup,
