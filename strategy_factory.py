@@ -109,15 +109,23 @@ class Gemini_Default_Strategy(BaseStrategy):
         primary_signal_met = False
         confirmation_signals_met = 0
 
+        # Normalize the 5-point sentiment to a 2-way direction. check_cpr_breakout
+        # only returns "Bullish"/"Bearish"/"None", so comparing it directly with
+        # "Very Bullish"/"Very Bearish" would NEVER match → permanent HOLD. Map
+        # Very Bullish→Bullish and Very Bearish→Bearish before comparing.
+        is_bull = sentiment in ('Bullish', 'Very Bullish')
+        is_bear = sentiment in ('Bearish', 'Very Bearish')
+        direction = 'Bullish' if is_bull else ('Bearish' if is_bear else None)
+
         cpr_breakout_signal = check_cpr_breakout(current_candle, cpr_pivots, day_df.iloc[index-1])
-        if cpr_breakout_signal == sentiment:
+        if direction is not None and cpr_breakout_signal == direction:
             primary_signal_met = True
 
         if primary_signal_met:
-            if sentiment == 'Bullish':
+            if is_bull:
                 if current_candle['close'] > current_candle['ema_50']: confirmation_signals_met += 1
                 if current_candle['rsi'] > 55: confirmation_signals_met += 1
-            elif sentiment == 'Bearish':
+            elif is_bear:
                 if current_candle['close'] < current_candle['ema_50']: confirmation_signals_met += 1
                 if current_candle['rsi'] < 45: confirmation_signals_met += 1
 
@@ -125,7 +133,7 @@ class Gemini_Default_Strategy(BaseStrategy):
 
         if primary_signal_met and confirmation_signals_met >= 1:
             self._log_signal(f"[{self.name}] Signal confirmed: Primary condition and {confirmation_signals_met} confirmation(s) met.")
-            return 'BUY' if sentiment == 'Bullish' else 'SELL'
+            return 'BUY' if is_bull else 'SELL'
 
         if not primary_signal_met:
             self._log_hold(
