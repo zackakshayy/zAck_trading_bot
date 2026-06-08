@@ -239,6 +239,11 @@ class TradingBotOrchestrator:
         self._last_reported_day_quality: str | None = None  # suppresses repeat DayQuality logs
         self._last_reported_scalp_state: bool = False       # suppresses repeat RangeScalp logs
         self._last_counter_signal: tuple | None = None       # suppresses repeat COUNTER-SIGNAL logs
+        # Re-entry guard state: after an exit, block re-buying the same direction
+        # for a cooldown so the bot doesn't get chopped in/out of the same setup.
+        self._last_exit_direction: str | None = None
+        self._last_exit_symbol: str | None = None
+        self._last_exit_time = None
         self._ticker_paused: bool = False                   # paused while operator types input
         # Today's market-condition tags — stashed by setup() for the loss analyzer.
         self.todays_conditions = set()
@@ -2686,6 +2691,29 @@ class TradingBotOrchestrator:
             return False
         return True
 
+    def _is_reentry_blocked(self, signal: str) -> bool:
+        """
+        Re-entry guard: after a trade exits, refuse to re-enter the SAME direction
+        for `reentry_cooldown_minutes`. Stops the chop loop where the indicator
+        exit cuts a position at a small loss and the still-valid signal instantly
+        re-buys the same option — paying costs twice and bleeding on every wobble.
+        Set reentry_cooldown_minutes: 0 to disable.
+        """
+        mins = float((self.config.get('trading_flags') or {}).get('reentry_cooldown_minutes', 0) or 0)
+        if mins <= 0 or not self._last_exit_time or not self._last_exit_direction:
+            return False
+        if signal != self._last_exit_direction:
+            return False
+        elapsed_min = (datetime.datetime.now() - self._last_exit_time).total_seconds() / 60.0
+        if elapsed_min < mins:
+            logging.warning(
+                f"Re-entry guard: blocking '{signal}' — same direction was exited "
+                f"{elapsed_min:.1f} min ago (cooldown {mins:.0f} min). "
+                f"Avoiding a chop in/out of the same setup."
+            )
+            return True
+        return False
+
     def _is_oi_wall_blocked(self, signal: str) -> bool:
         """
         Playbook OI-wall gate: don't buy CALLS into a heavy call-OI wall (where
@@ -2722,6 +2750,7 @@ class TradingBotOrchestrator:
         "vix_high":        "VIX above the max — too volatile/risky to enter",
         "pcr":             "PCR option-flow contradicted the signal direction",
         "oi_wall":         "spot at/above a heavy call-OI wall — buying calls into resistance",
+        "reentry_cooldown":"re-entry guard — same direction was just exited (cooldown active)",
         "trap":            "false-breakout trap detected — stop-hunt pattern",
         "confirm_15m":     "15-min higher-timeframe didn't confirm the signal",
         "no_trade_window": "outside the entry window (pre-open / lunch / past cutoff)",
@@ -3312,8 +3341,11 @@ class TradingBotOrchestrator:
                                 )
                                 self._last_counter_signal = _counter_key
 
+                        # Re-entry guard — don't chop in/out of the same setup.
+                        if not force_mode_now and self._is_reentry_blocked(signal):
+                            self._note_block("reentry_cooldown")  # already logged inside helper
                         # ATR momentum gate — bypassed in force mode.
-                        if not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
+                        elif not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
                             self._note_block("momentum_low")  # already logged inside helper
                         # VIX gate — bypassed in force mode.
                         elif not force_mode_now and await self._is_vix_too_high():
@@ -3484,6 +3516,12 @@ class TradingBotOrchestrator:
                             'fii_bias': (self._fii_bias or {}).get('bias') if self._fii_bias else None,
                         })
                         self._persist_ledger()   # survive same-day restarts
+                        # Record the exit so the re-entry guard can stop the bot
+                        # from instantly re-buying the same direction it just got
+                        # chopped out of (death-by-cuts loop).
+                        self._last_exit_direction = status.get('TradeType')
+                        self._last_exit_symbol = status.get('Symbol')
+                        self._last_exit_time = datetime.datetime.now()
                         # On a losing trade, build a detailed post-mortem,
                         # print it to the terminal, and email it.
                         if float(status.get('ProfitLoss', 0) or 0) < 0:

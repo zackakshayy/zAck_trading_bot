@@ -224,6 +224,9 @@ trading_flags:
   enable_gemini_loss_analysis: true
   manual_sentiment_override: true
   max_trades_per_day: 3
+  # Re-entry guard: after an exit, block re-buying the SAME direction for this
+  # many minutes (stops chop in/out of the same setup). 0 = disabled.
+  reentry_cooldown_minutes: 15
   max_vix_level: 25.0
   order_variety: regular
   # Entry fill confirmation: if a LIMIT entry doesn't fill within
@@ -342,6 +345,10 @@ trailing_stop_loss:
   # Set either to 0 to disable that guard (reverts to the old twitchy behaviour).
   indicator_exit_min_hold_minutes: 10
   indicator_exit_atr_buffer_mult: 0.25
+  # Profit-protector mode: indicator exit only LOCKS A PROFIT on a reversal; it
+  # won't cut a small loss on a wobble (death-by-cuts). Losers are handled by the
+  # hard SL / trailing stop / give-up rule / 14:00 exit. false = legacy behaviour.
+  indicator_exit_profit_only: true
 # Automatic position-size mode switching.
 # AGGRESSIVE: activated when recent performance warrants larger bets.
 # MODERATE:   default; forced on consecutive losses, high drawdown, or elevated VIX.

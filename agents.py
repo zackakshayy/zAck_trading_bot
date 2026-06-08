@@ -1620,36 +1620,45 @@ class PositionManagementAgent:
                     )
                 else:
                     logging.info(
-                        f"[NetGuard] Indicator exit suppressed for {symbol} @ "
-                        f"{current_price:.2f}: net gain wouldn't clear costs+margin. "
-                        f"Holding — trailing stop still protects downside."
+                        f"[ExitGuard] Indicator exit held for {symbol} @ "
+                        f"{current_price:.2f} — profit-protector mode: it won't cut a "
+                        f"loss on a wobble. The hard SL / trailing stop / give-up "
+                        f"rule / 14:00 exit handle losers."
                     )
 
         return "ACTIVE"
 
     def _exit_clears_costs(self, current_price: float) -> bool:
         """
-        Decide whether a *profit-taking* exit at `current_price` is worth booking
-        once transaction costs are deducted.
+        Gate for the INDICATOR exit. Returns True to allow the exit, False to hold.
 
-        Returns True (allow the exit) when:
-          • the cost guard is disabled in config, OR
-          • we're not in profit (gross ≤ 0) — never block a loss-cut/protective exit, OR
-          • the NET gain (gross − round-trip costs) ≥ min_net_profit_inr.
-
-        Returns False only when we're in a small profit that wouldn't survive costs.
+        Two protections:
+          • Profit-protector mode (trailing_stop_loss.indicator_exit_profit_only,
+            default True): the indicator exit must NOT cut a LOSS on an underlying
+            wobble — that is the death-by-cuts trap (premium moves 2-3 pts, costs
+            ~₹100, net loss). When the position is NOT in profit, suppress the
+            indicator exit and let the hard SL / trailing stop / give-up rule /
+            14:00 time exit handle the loser. Set false for the legacy behaviour
+            (indicator cuts losers too).
+          • Sub-cost guard (transaction_costs.guard_profit_exits): when in profit,
+            only book the exit if the NET gain (after costs) ≥ min_net_profit_inr.
         """
-        tc_cfg = (self.config.get("transaction_costs") or {})
-        if not tc_cfg.get("enable", True) or not tc_cfg.get("guard_profit_exits", True):
-            return True
         trade = self.active_trade or {}
         entry = float(trade.get("entry_price", 0) or 0)
         qty   = int(trade.get("quantity", 0) or 0)
         if entry <= 0 or qty <= 0 or current_price is None:
             return True
         gross = (float(current_price) - entry) * qty
+
+        # ── Loss / breakeven: suppress the indicator exit (profit-protector mode) ──
         if gross <= 0:
-            return True  # protective exit — always allow cutting a loser
+            profit_only = bool((self.tsl_config or {}).get("indicator_exit_profit_only", True))
+            return not profit_only   # profit_only → hold (False); legacy → cut (True)
+
+        # ── In profit: only book it if the NET clears the floor ──
+        tc_cfg = (self.config.get("transaction_costs") or {})
+        if not tc_cfg.get("enable", True) or not tc_cfg.get("guard_profit_exits", True):
+            return True
         est = estimate_options_cost(entry * qty, float(current_price) * qty, 2, self.config)
         net = gross - est["total"]
         min_net = float(tc_cfg.get("min_net_profit_inr", 0) or 0)
