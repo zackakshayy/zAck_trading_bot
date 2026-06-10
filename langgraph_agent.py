@@ -211,8 +211,10 @@ def pick_strategy_deterministic(
                      f"{sorted(market_conditions)} + {sentiment}")
         if pick: return pick
 
-    # ----- Layer 5: last resort -----
-    pick = _take("Gemini_Default", "Last-resort default (no other layer matched)")
+    # ----- Layer 5: last resort (configurable — the old hardcoded Gemini_Default
+    # was a chronic loser; default to a VWAP-anchored momentum play instead) -----
+    default_name = str(cfg.get("default_strategy", "Momentum_VWAP_RSI"))
+    pick = _take(default_name, f"Last-resort default ({default_name})")
     if pick: return pick
 
     # All layers exhausted by cooldown.

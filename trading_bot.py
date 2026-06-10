@@ -15,7 +15,7 @@ from sentiment_agent import SentimentAgent
 from youtube_sentiment import YouTubeSentimentAgent
 from langgraph_agent import LangGraphAgent
 from market_trend import MarketTrendAnalyzer
-from regime import RegimeClassifier
+from regime import RegimeClassifier, ALL_STRATEGIES
 from fii import fetch_fii_bias
 from strategy_factory import get_strategy
 from backtester import run_backtest
@@ -187,6 +187,18 @@ class TradingBotOrchestrator:
         self.day_conviction: float = 0.0            # 0..1 conviction score
         self.day_conviction_level: str = "LOW"      # LOW / MEDIUM / HIGH
         self._expiry_gamma_active: bool = False      # 0-DTE expiry gamma-scalp mode
+        # Setup-score funnel (gate-attribution): how many signals were scored,
+        # how many passed, and the best score seen — turns "the bot sat idle"
+        # into "the best setup scored 61 vs threshold 65 because PCR+15m failed".
+        self._scored_today: int = 0
+        self._score_passed_today: int = 0
+        self._best_score_today: float = 0.0
+        self._best_score_info: str = ""
+        self._last_score_size: float = 1.0
+        self._last_score = None
+        self._last_score_block_key = None
+        # Strategy whitelist (the cull) — populated each setup() from config.
+        self._whitelist_excluded: set = set()
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
@@ -233,6 +245,8 @@ class TradingBotOrchestrator:
         # FULL day (trades, W/L, trade count) — not just trades since this run
         # started. The end-of-day report/summary then always covers the whole day.
         self._load_ledger()
+        # Warn loudly at startup if the risk numbers can't coexist (risk > daily/2).
+        self._validate_risk_coherence()
         self.starting_capital = None
         self.ending_capital = None   # captured at end-of-day for the reports
         # Effective entry-start time for today (None until _compute_effective_entry_start runs).
@@ -1035,7 +1049,8 @@ class TradingBotOrchestrator:
         )
         if needs_rotation:
             allowed = [s for s in self._RANGE_SCALP_STRATEGIES
-                       if s not in self._currently_cooled()]
+                       if s not in self._currently_cooled()
+                       and s not in getattr(self, '_whitelist_excluded', set())]
             if not allowed:
                 logging.warning(
                     "[RangeScalp] All range strategies are cooled — skipping scalp tick."
@@ -1528,6 +1543,17 @@ class TradingBotOrchestrator:
                 except Exception as _rgm_exc:
                     logging.debug(f"Regime classification skipped (non-fatal): {_rgm_exc}")
 
+            # ── Strategy whitelist (the cull) ─────────────────────────────────
+            # Only strategies with demonstrated (or being-evaluated) edge may
+            # trade. Everything else — including chronic losers like the old
+            # Gemini_Default fallback — is excluded from the selector entirely.
+            _wl = list((self.config.get('strategy_selector') or {}).get('whitelist') or [])
+            self._whitelist_excluded = (set(ALL_STRATEGIES) - set(_wl)) if _wl else set()
+            if self._whitelist_excluded:
+                logging.debug(
+                    f"[Whitelist] Active universe: {sorted(set(ALL_STRATEGIES) - self._whitelist_excluded)}"
+                )
+
             # ── Expiry 0-DTE gamma scalp (advanced) ──────────────────────────
             # On expiry day, when enabled, trade the expiring contract's gamma:
             # half size, flat by hard_exit_time. _get_trade_details picks the
@@ -1609,7 +1635,7 @@ class TradingBotOrchestrator:
                     is_expiry_day=is_expiry_day_now,
                     open_gap_pct=self.open_gap_pct,
                     underlying_bars=bars_for_selector,
-                    exclude_strategies=self._currently_cooled() | self._regime_excluded,
+                    exclude_strategies=self._currently_cooled() | self._regime_excluded | self._whitelist_excluded,
                     user_prompt=user_prompt,
                     rag_context=rag_context,
                 )
@@ -1627,16 +1653,26 @@ class TradingBotOrchestrator:
                         is_expiry_day=is_expiry_day_now,
                         open_gap_pct=self.open_gap_pct,
                         underlying_bars=bars_for_selector,
-                        exclude_strategies=set(self._regime_excluded),  # keep regime, drop cooldowns
+                        exclude_strategies=set(self._regime_excluded) | self._whitelist_excluded,  # keep regime+whitelist, drop cooldowns
                         user_prompt=user_prompt,
                         rag_context=rag_context,
                     )
-                # If the selector came back empty inside a constrained regime,
-                # fall back to the regime's first preferred strategy so we never
-                # trade out-of-regime.
-                if not best_strategy_name and self._regime_allowed:
-                    best_strategy_name = self._regime_allowed[0]
-                    logging.info(f"[Regime] Selector empty — using regime default {best_strategy_name}.")
+                # Default-to-trade fallback: if the selector came back empty,
+                # use the first regime-preferred strategy that's also on the
+                # whitelist; failing that, the first whitelisted strategy. The
+                # bot should produce an attempt on a clean day, not sit idle
+                # because every layer excluded everything.
+                if not best_strategy_name:
+                    _fallback = (
+                        [s for s in (self._regime_allowed or ()) if s not in self._whitelist_excluded]
+                        or [s for s in ALL_STRATEGIES if s not in self._whitelist_excluded]
+                    )
+                    if _fallback:
+                        best_strategy_name = _fallback[0]
+                        logging.info(
+                            f"[Selector] Empty after exclusions — defaulting to "
+                            f"{best_strategy_name} (regime/whitelist fallback)."
+                        )
 
             if not best_strategy_name:
                 self.no_trade_reason = "Selector returned no strategy."
@@ -1934,6 +1970,9 @@ class TradingBotOrchestrator:
                 "regime_reason":      getattr(self, '_regime_reason', ''),
                 "conviction":         getattr(self, 'day_conviction_level', 'LOW'),
                 "conviction_score":   getattr(self, 'day_conviction', 0.0),
+                "setups_scored":      getattr(self, '_scored_today', 0),
+                "setups_passed":      getattr(self, '_score_passed_today', 0),
+                "best_setup_score":   getattr(self, '_best_score_today', 0.0),
                 "vix":                round(float(getattr(self, '_today_vix', 0) or 0), 2),
                 "pcr":                (self._pcr_data or {}).get("pcr"),
                 "max_pain":           (self._pcr_data or {}).get("max_pain"),
@@ -2823,6 +2862,140 @@ class TradingBotOrchestrator:
             return True
         return False
 
+    # Default confluence weights for the setup score (overridable in config).
+    _SCORE_WEIGHTS_DEFAULT = {
+        "direction": 20,   # signal agrees with the day's directional bias
+        "htf_15m":   25,   # 15-min higher-timeframe confirmation
+        "pcr":       15,   # option-flow (PCR) alignment
+        "oi_wall":   15,   # not buying into the dominant call-OI wall
+        "momentum":  15,   # ATR momentum sufficient for options buying
+        "day_quality": 10, # TRENDING > RANGE > UNKNOWN
+    }
+
+    async def _setup_score(self, signal: str, df, is_counter_sentiment: bool) -> tuple:
+        """
+        Weighted confluence score (0-100) replacing the old AND-gate stack.
+        Each factor contributes 0..1 × weight; factors with NO data are EXCLUDED
+        (score normalized over available weights) instead of counting against
+        the setup. Returns (score, size_factor, breakdown).
+        """
+        cfg = (self.config.get('setup_score') or {})
+        weights = dict(self._SCORE_WEIGHTS_DEFAULT)
+        weights.update(cfg.get('weights') or {})
+        factors: dict = {}   # name -> (value 0..1, weight)
+
+        # 1. Direction alignment (counter-trades get partial credit, not a veto).
+        w = float(weights.get('direction', 20))
+        if w > 0:
+            factors['direction'] = (
+                float(cfg.get('counter_direction_value', 0.4)) if is_counter_sentiment else 1.0, w)
+
+        # 2. 15-min higher-timeframe confirm (excluded for mean-reversion + no-data).
+        w = float(weights.get('htf_15m', 25))
+        _is_mr = (getattr(self.active_strategy, 'is_reversal_trade', False)
+                  or self.active_strategy_name in self._MEAN_REVERSION_STRATEGIES)
+        if (w > 0 and not _is_mr
+                and (self.config.get('trading_flags') or {}).get('enable_15m_confirmation', True)):
+            try:
+                df_15m = await self._get_15min_bars()
+                _ok, _reason = self._check_15min_confirmation(signal, df_15m)
+                if 'bypassed' not in _reason:
+                    factors['htf_15m'] = (1.0 if _ok else 0.0, w)
+            except Exception:
+                pass
+
+        # 3. PCR option-flow alignment (excluded when neutral / unavailable).
+        w = float(weights.get('pcr', 15))
+        if w > 0 and (self._pcr_data or {}).get('tag') in ('PCR_BULLISH', 'PCR_BEARISH'):
+            factors['pcr'] = (1.0 if self._is_pcr_aligned(signal) else 0.0, w)
+
+        # 4. OI wall (excluded when wall data unavailable).
+        w = float(weights.get('oi_wall', 15))
+        if w > 0 and (self._pcr_data or {}).get('call_walls'):
+            factors['oi_wall'] = (0.0 if self._is_oi_wall_blocked(signal) else 1.0, w)
+
+        # 5. ATR momentum (excluded when the gate is disabled in config).
+        w = float(weights.get('momentum', 15))
+        if w > 0 and float((self.config.get('trading_flags') or {}).get('min_atr_per_bar', 0) or 0) > 0:
+            factors['momentum'] = (0.0 if self._is_momentum_too_low(df) else 1.0, w)
+
+        # 6. Day quality.
+        w = float(weights.get('day_quality', 10))
+        if w > 0:
+            dq = getattr(self, '_day_quality', 'UNKNOWN')
+            factors['day_quality'] = ({'TRENDING': 1.0, 'RANGE': 0.6}.get(dq, 0.5), w)
+
+        total_w = sum(wt for _, wt in factors.values())
+        score = (100.0 * sum(v * wt for v, wt in factors.values()) / total_w) if total_w else 100.0
+        full_above = float(cfg.get('size_full_above', 85))
+        min_factor = float(cfg.get('size_min_factor', 0.75))
+        size_factor = 1.0 if score >= full_above else max(min_factor, round(score / full_above, 2))
+        breakdown = {k: round(v, 2) for k, (v, _) in factors.items()}
+
+        # Funnel bookkeeping (the gate-attribution metric).
+        self._scored_today += 1
+        if score > self._best_score_today:
+            self._best_score_today = round(score, 1)
+            self._best_score_info = f"{signal} via {self.active_strategy_name} {breakdown}"
+        return round(score, 1), size_factor, breakdown
+
+    async def _score_gate(self, signal: str, df, is_counter_sentiment: bool,
+                          force_mode: bool) -> bool:
+        """Entry decision from the setup score. Stashes the score-based size
+        factor for the sizing path. Returns True = proceed to entry."""
+        self._last_score_size = 1.0
+        self._last_score = None
+        cfg = (self.config.get('setup_score') or {})
+        if force_mode or not cfg.get('enable', True):
+            return True
+        score, size_factor, breakdown = await self._setup_score(signal, df, is_counter_sentiment)
+        threshold = float(cfg.get('entry_threshold', 65))
+        self._last_score = score
+        if score >= threshold:
+            self._last_score_size = size_factor
+            logging.info(
+                f"[SetupScore] {signal} PASS — {score:.0f} ≥ {threshold:.0f} "
+                f"(size ×{size_factor:.2f})  factors={breakdown}"
+            )
+            return True
+        self._log_score_block(signal, score, threshold, breakdown)
+        return False
+
+    def _log_score_block(self, signal, score, threshold, breakdown) -> None:
+        """Deduped log for score-blocked entries (avoids per-tick spam)."""
+        key = (signal, round(score))
+        if key != getattr(self, '_last_score_block_key', None):
+            logging.warning(
+                f"[SetupScore] {signal} blocked — {score:.0f} < {threshold:.0f}. "
+                f"Factors: {breakdown}"
+            )
+            self._last_score_block_key = key
+
+    def _validate_risk_coherence(self) -> None:
+        """
+        Startup sanity check on the risk triangle: per-trade risk must be ≤ half
+        the daily loss cap, or the daily breaker halts the day after ONE stop-out
+        and every multi-trade frequency setting is unreachable. Warns loudly —
+        does not silently change the operator's numbers.
+        """
+        try:
+            rm = self.config.get('risk_management', {}) or {}
+            daily = float(rm.get('max_daily_loss_percent', 2.5))
+            tiers = self.config.get('risk_tiers') or []
+            worst = max(
+                (float(t.get('risk_pct', 0) or 0) for t in tiers),
+                default=float((self.config.get('trading_flags') or {}).get('risk_per_trade_percent', 1.0)),
+            )
+            if worst > daily / 2.0:
+                logging.warning(
+                    f"[RiskCoherence] INCOHERENT: max per-trade risk {worst:.1f}% > "
+                    f"half the daily-loss cap ({daily:.1f}%). One stop-out can end the "
+                    f"day; max_trades_per_day is effectively unreachable on red days. "
+                    f"Coherent rule: per-trade risk ≤ daily_cap/2."
+                )
+        except Exception:
+            pass
+
     def _is_oi_wall_blocked(self, signal: str) -> bool:
         """
         Playbook OI-wall gate: don't buy CALLS into a heavy call-OI wall (where
@@ -2860,6 +3033,7 @@ class TradingBotOrchestrator:
         "pcr":             "PCR option-flow contradicted the signal direction",
         "oi_wall":         "spot at/above a heavy call-OI wall — buying calls into resistance",
         "reentry_cooldown":"re-entry guard — same direction was just exited (cooldown active)",
+        "score_below_threshold": "setup score below entry threshold — confluence too weak",
         "trap":            "false-breakout trap detected — stop-hunt pattern",
         "confirm_15m":     "15-min higher-timeframe didn't confirm the signal",
         "no_trade_window": "outside the entry window (pre-open / lunch / past cutoff)",
@@ -2912,6 +3086,24 @@ class TradingBotOrchestrator:
         lines.append("Why no trade so far (most frequent blockers):")
         for key, n in ranked[:5]:
             lines.append(f"   • {self._BLOCK_LABELS.get(key, key)}  ×{n}")
+        # Setup-score funnel: makes idleness falsifiable instead of mysterious.
+        if self._scored_today:
+            _thr = float((self.config.get('setup_score') or {}).get('entry_threshold', 65))
+            lines.append(
+                f"Funnel: {self._scored_today} setup(s) scored │ best "
+                f"{self._best_score_today:.0f} vs threshold {_thr:.0f} │ "
+                f"passed {self._score_passed_today}"
+            )
+            if self._best_score_info:
+                lines.append(f"   best setup: {self._best_score_info}")
+        # KPI floor: a TRENDING day with zero attempts is a system failure to
+        # investigate, not prudence to be proud of.
+        if (getattr(self, 'day_regime', '') == 'TRENDING'
+                and self.trades_today_count == 0 and self._scored_today):
+            lines.append(
+                "⚠ SYSTEM CHECK: TRENDING day with 0 trades — review the funnel "
+                "line above; the top blocker is the calibration to fix."
+            )
         lines.append(f"Verdict: {self._plain_verdict(ranked[0][0])}")
         return lines
 
@@ -3450,32 +3642,25 @@ class TradingBotOrchestrator:
                                 )
                                 self._last_counter_signal = _counter_key
 
-                        # Re-entry guard — don't chop in/out of the same setup.
+                        # ── HARD VETOES — capital protection only ─────────────
+                        # PCR / OI-wall / 15m / momentum / day-quality / direction
+                        # are no longer individual vetoes: they are CONFLUENCE
+                        # factors in a weighted setup score (gate below). One
+                        # mediocre factor can't kill a strong setup anymore —
+                        # that AND-stack was why the bot sat idle.
                         if not force_mode_now and self._is_reentry_blocked(signal):
                             self._note_block("reentry_cooldown")  # already logged inside helper
-                        # ATR momentum gate — bypassed in force mode.
-                        elif not force_mode_now and self._is_momentum_too_low(day_df_for_signal):
-                            self._note_block("momentum_low")  # already logged inside helper
-                        # VIX gate — bypassed in force mode.
+                        # VIX ceiling — extreme volatility stays a hard no.
                         elif not force_mode_now and await self._is_vix_too_high():
                             self._note_block("vix_high")
                             logging.warning("Skipping entry due to VIX gate.")
-                        # PCR gate — bypassed in force mode.
-                        elif not force_mode_now and not self._is_pcr_aligned(signal):
-                            self._note_block("pcr")
-                            pcr_tag = (self._pcr_data or {}).get("tag", "?")
-                            pcr_val = (self._pcr_data or {}).get("pcr")
-                            logging.warning(
-                                f"PCR gate: {signal} blocked by {pcr_tag} "
-                                f"(PCR={f'{pcr_val:.3f}' if pcr_val else 'N/A'}). "
-                                f"PCR contradicts trade direction — skipping entry."
-                            )
-                        # OI-wall gate — don't buy calls into institutional resistance.
-                        elif not force_mode_now and self._is_oi_wall_blocked(signal):
-                            self._note_block("oi_wall")  # already logged inside helper
-                        # Trap detection — skip false breakout/breakdown entries.
+                        # Trap detection — manipulative fake-breakout: hard no.
                         elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
                             self._note_block("trap")  # already logged inside helper
+                        # ── WEIGHTED SETUP SCORE gate (replaces the AND-stack) ──
+                        elif not (await self._score_gate(signal, day_df_for_signal,
+                                                          is_counter_sentiment, force_mode_now)):
+                            self._note_block("score_below_threshold")  # logged inside helper
                         else:
                             # Inject professional size multiplier so the order
                             # agent applies progressive loss sizing + time-of-day
@@ -3507,102 +3692,69 @@ class TradingBotOrchestrator:
                                 _egf = float((self.config.get('expiry_gamma_scalp') or {}).get('size_factor', 0.5))
                                 effective_multiplier *= _egf
                                 logging.info(f"[ExpiryGamma] 0-DTE scalp size ×{_egf:.2f}")
+                            # Setup-score sizing: marginal setups trade smaller,
+                            # strong confluence trades full (set by _score_gate).
+                            effective_multiplier *= float(getattr(self, '_last_score_size', 1.0))
                             self.config['_effective_risk_pct_multiplier'] = effective_multiplier
                             if effective_multiplier < 1.0:
                                 logging.info(
                                     f"[ProSize] Effective size multiplier: "
                                     f"{effective_multiplier:.2f} "
                                     f"(loss_factor={self._trade_size_multiplier:.2f} × "
-                                    f"time_factor={tod_factor:.2f}"
+                                    f"time_factor={tod_factor:.2f} × "
+                                    f"score_factor={getattr(self, '_last_score_size', 1.0):.2f}"
                                     + (" × counter_sentiment)" if is_counter_sentiment else ")")
                                 )
 
-                            # 15-min confirmation gate — bypassed in force mode AND
-                            # for mean-reversion / reversal strategies. Those trade
-                            # AGAINST the short-term move by design, so a higher-
-                            # timeframe trend-confirm filter would reject every one
-                            # of their entries (the core structural contradiction).
-                            _is_mean_reversion = (
-                                getattr(self.active_strategy, 'is_reversal_trade', False)
-                                or self.active_strategy_name in self._MEAN_REVERSION_STRATEGIES
+                            # (15m confirmation is now a weighted factor inside the
+                            # setup score — it no longer hard-blocks entries.)
+                            trade_details = (
+                                await self.order_agent.place_trade(signal, force_mode=force_mode_now)
+                                if not is_paper
+                                else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
                             )
-                            _15m_ok = True
-                            _15m_reason = ""
-                            if (not force_mode_now
-                                    and not _is_mean_reversion
-                                    and (self.config.get("trading_flags", {}) or {})
-                                        .get("enable_15m_confirmation", True)):
-                                try:
-                                    df_15m = await self._get_15min_bars()
-                                    _15m_ok, _15m_reason = self._check_15min_confirmation(
-                                        signal, df_15m
+                            if trade_details:
+                                trade_details['Strategy'] = self.active_strategy_name
+                                # Hold-the-winner: tag high-conviction trending
+                                # aligned trades so manage() rides them to ~15:15.
+                                trade_details['hold_to_close'] = self._is_hold_to_close(signal)
+                                trade_details['conviction'] = self.day_conviction_level
+                                trade_details['setup_score'] = getattr(self, '_last_score', None)
+                                trade_details['expiry_gamma'] = getattr(self, '_expiry_gamma_active', False)
+                                if trade_details['hold_to_close']:
+                                    logging.info(
+                                        f"[HoldToClose] {signal} tagged to ride the trend "
+                                        f"to near-close (HIGH conviction, TRENDING, aligned)."
                                     )
-                                except Exception as _15m_exc:
-                                    logging.debug(
-                                        f"15m confirmation check failed (bypassed): "
-                                        f"{_15m_exc}"
+                                self.position_agent.start_trade(trade_details)
+                                if not is_paper:
+                                    await self.position_agent.attach_broker_stop_loss(self.order_agent)
+                                self.trades_today_count += 1
+                                self._score_passed_today += 1
+                                # Record today as a TRADED day for the weekly
+                                # frequency governor (on the first fill only).
+                                if self.trades_today_count == 1:
+                                    try:
+                                        add_week_trade_day(
+                                            datetime.date.today().strftime("%G-W%V"),
+                                            datetime.date.today().isoformat(),
+                                        )
+                                    except Exception as _wd_exc:
+                                        logging.debug(f"weekly trade-day record failed: {_wd_exc}")
+                                self._persist_ledger()   # daily-max cap survives restarts
+                                # Clear the \r status line before trade logs print.
+                                if self._is_interactive_tty():
+                                    print(flush=True)
+                                self.bot_state = "IN_POSITION"
+                                self.awaiting_signal_since = None
+                                # Auto-disarm force mode after the first trade.
+                                if self._force_mode_armed:
+                                    self._force_mode_armed = False
+                                    logging.warning(
+                                        "FORCE-TRADE MODE disarmed: first diagnostic "
+                                        "trade fired. Normal gating resumes for any "
+                                        "subsequent entries this session."
                                     )
-                                    _15m_ok, _15m_reason = True, "error — bypassed"
-                            elif _is_mean_reversion:
-                                _15m_reason = (
-                                    "15m trend-confirm skipped — mean-reversion/"
-                                    "reversal strategy trades against the move by design"
-                                )
-
-                            if not _15m_ok:
-                                self._note_block("confirm_15m")
-                                logging.warning(
-                                    f"15-min confirmation gate: {signal} blocked. "
-                                    f"{_15m_reason}"
-                                )
-                            else:
-                                if _15m_reason:
-                                    logging.info(f"15-min gate: {_15m_reason}")
-                                trade_details = (
-                                    await self.order_agent.place_trade(signal, force_mode=force_mode_now)
-                                    if not is_paper
-                                    else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
-                                )
-                                if trade_details:
-                                    trade_details['Strategy'] = self.active_strategy_name
-                                    # Hold-the-winner: tag high-conviction trending
-                                    # aligned trades so manage() rides them to ~15:15.
-                                    trade_details['hold_to_close'] = self._is_hold_to_close(signal)
-                                    trade_details['conviction'] = self.day_conviction_level
-                                    trade_details['expiry_gamma'] = getattr(self, '_expiry_gamma_active', False)
-                                    if trade_details['hold_to_close']:
-                                        logging.info(
-                                            f"[HoldToClose] {signal} tagged to ride the trend "
-                                            f"to near-close (HIGH conviction, TRENDING, aligned)."
-                                        )
-                                    self.position_agent.start_trade(trade_details)
-                                    if not is_paper:
-                                        await self.position_agent.attach_broker_stop_loss(self.order_agent)
-                                    self.trades_today_count += 1
-                                    # Record today as a TRADED day for the weekly
-                                    # frequency governor (on the first fill only).
-                                    if self.trades_today_count == 1:
-                                        try:
-                                            add_week_trade_day(
-                                                datetime.date.today().strftime("%G-W%V"),
-                                                datetime.date.today().isoformat(),
-                                            )
-                                        except Exception as _wd_exc:
-                                            logging.debug(f"weekly trade-day record failed: {_wd_exc}")
-                                    self._persist_ledger()   # daily-max cap survives restarts
-                                    # Clear the \r status line before trade logs print.
-                                    if self._is_interactive_tty():
-                                        print(flush=True)
-                                    self.bot_state = "IN_POSITION"
-                                    self.awaiting_signal_since = None
-                                    # Auto-disarm force mode after the first trade.
-                                    if self._force_mode_armed:
-                                        self._force_mode_armed = False
-                                        logging.warning(
-                                            "FORCE-TRADE MODE disarmed: first diagnostic "
-                                            "trade fired. Normal gating resumes for any "
-                                            "subsequent entries this session."
-                                        )
 
                 elif self.bot_state == "IN_POSITION":
                     underlying_df_hist = await self._get_underlying_bars()

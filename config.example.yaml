@@ -84,9 +84,12 @@ risk_management:
 # whose capital < max_capital wins; a null max_capital is the top catch-all tier.
 # When present, this overrides the static risk_per_trade_percent and the
 # AGGRESSIVE/MODERATE risk override for the per-trade risk figure.
+# COHERENCE RULE: keep each tier's risk_pct ≤ max_daily_loss_percent / 2, or a
+# single stop-out halts the day and multi-trade settings become unreachable.
+# The bot warns at startup ([RiskCoherence]) when this rule is violated.
 risk_tiers:
-  - { max_capital: 100000, risk_pct: 10 }   # under ₹1,00,000     → 10%
-  - { max_capital: 300000, risk_pct: 5 }    # ₹1,00,000–₹3,00,000 → 5%
+  - { max_capital: 100000, risk_pct: 5 }    # under ₹1,00,000     → 5%
+  - { max_capital: 300000, risk_pct: 3 }    # ₹1,00,000–₹3,00,000 → 3%
   - { max_capital: null,   risk_pct: 2 }    # above ₹3,00,000     → 2%
 # ---------------------------------------------------------------------------
 # Regime governor — selectivity + survival ("cash is a position").
@@ -112,6 +115,26 @@ regime:
 reporting:
   weekly_report: true
   weekly_report_day: "Friday"
+# ---------------------------------------------------------------------------
+# WEIGHTED SETUP SCORE — replaces the old AND-gate stack. Soft confluence
+# factors (15m confirm, PCR, OI-wall, ATR momentum, day-quality, direction
+# alignment) each contribute 0..1 × weight; an entry needs score ≥
+# entry_threshold (factors with no data are excluded, not counted against).
+# Marginal passes trade at reduced size. Hard vetoes that remain: buy-only,
+# loss breakers, costs/net-edge, VIX ceiling, trap detection, re-entry cooldown.
+setup_score:
+  enable: true
+  entry_threshold: 65
+  size_full_above: 85
+  size_min_factor: 0.75
+  counter_direction_value: 0.4
+  weights:
+    direction: 20
+    htf_15m: 25
+    pcr: 15
+    oi_wall: 15
+    momentum: 15
+    day_quality: 10
 # ---------------------------------------------------------------------------
 # Conviction scoring: regime + sentiment strength + global-cue (market_trend)
 # alignment → a 0..1 score and a LOW/MEDIUM/HIGH level. HIGH = full size + lets
@@ -417,6 +440,16 @@ rag:
 strategy_selector:
   use_llm: false            # if true, consult Gemini first; cascade is fallback
   gap_override_pct: 0.8     # |open gap %| threshold for Layer-2 override
+  # STRATEGY CULL — only whitelisted strategies may trade (selector, regime
+  # families, range-scalp rotation and fallback all respect it). default_strategy
+  # replaces the old hardcoded Gemini_Default last resort (a chronic loser).
+  default_strategy: Momentum_VWAP_RSI
+  whitelist:
+    - EMA_Cross_RSI
+    - Momentum_VWAP_RSI
+    - VWAP_Reversion
+    - Breakout_Prev_Day_HL
+    - Expiry_Momentum_Scalp
 # Expiry-day overrides — auto-applied on any day where a contract of the
 # configured underlying expires (detected from the live instrument list).
 # Reduces risk on the day the broader market is being whipsawed by gamma trades.
