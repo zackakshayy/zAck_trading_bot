@@ -23,6 +23,7 @@ import aiohttp
 import pandas as pd
 import pandas_ta_classic as ta
 from kiteconnect import KiteConnect, exceptions
+from indicators import check_momentum_divergence
 
 from infra import (
     append_iv_snapshot,
@@ -1576,7 +1577,9 @@ class PositionManagementAgent:
                    else " to avoid theta/spread damage.")
             )
             return await self.exit_trade(
-                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_reason=("EXPIRY_GAMMA_TIME_EXIT" if self.active_trade.get('expiry_gamma')
+                             else "TIME_EXIT"),
             )
 
         # 4. Partial exits (T1 / T2 premium targets) — before the SL check so that
@@ -1611,8 +1614,24 @@ class PositionManagementAgent:
                             f"IV crush in progress — exiting."
                         )
                         return await self.exit_trade(
-                            is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                            is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                            exit_reason="GIVE_UP_IV_CRUSH",
                         )
+
+        # 5b. CONFIRMED-REVERSAL exit (divergence + structure break) — fires even
+        #     at a loss. The carve-out from profit-protector suppression: this is
+        #     a real reversal, not a wobble. (Answers "the bot couldn't see the
+        #     RSI divergence reversal I saw on the chart.")
+        if self._check_reversal_exit(underlying_hist_df):
+            logging.warning(
+                f"[ReversalExit] {symbol}: adverse RSI divergence CONFIRMED by a "
+                f"structure break (close crossed VWAP/EMA-9 against the position) "
+                f"— exiting before it runs."
+            )
+            return await self.exit_trade(
+                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_reason="DIVERGENCE_REVERSAL",
+            )
 
         # 6. Tighten trail after 13:30 to protect intraday gains from theta drain.
         #    EXCEPTION (hold-the-winner): a high-conviction trending WINNER keeps
@@ -1636,12 +1655,20 @@ class PositionManagementAgent:
             await self._maybe_modify_broker_sl(new_trail)
 
         # 8. Software backstop: if no broker SL or it's stale, enforce in code.
+        #    Distinguish the HARD stop from the TRAILING stop in the report.
         trail = self.active_trade.get("trailing_stop_loss")
         hard = self.active_trade["initial_stop_loss"]
-        if current_price <= hard or (trail and current_price <= trail):
-            logging.info(f"Software SL hit for {symbol} @ {current_price:.2f}.")
+        if current_price <= hard:
+            logging.info(f"Hard SL hit for {symbol} @ {current_price:.2f}.")
             return await self.exit_trade(
-                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_reason="HARD_SL",
+            )
+        if trail and current_price <= trail:
+            logging.info(f"Trailing stop hit for {symbol} @ {current_price:.2f} (trail {trail:.2f}).")
+            return await self.exit_trade(
+                is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_reason="TRAILING_STOP",
             )
 
         # 9. Indicator-based exit (PSAR / MA on the underlying).
@@ -1655,7 +1682,8 @@ class PositionManagementAgent:
                 if self._exit_clears_costs(current_price):
                     logging.info(f"Indicator exit triggered for {symbol}.")
                     return await self.exit_trade(
-                        is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key
+                        is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
+                        exit_reason="INDICATOR_EXIT",
                     )
                 else:
                     logging.info(
@@ -1666,6 +1694,59 @@ class PositionManagementAgent:
                     )
 
         return "ACTIVE"
+
+    def _check_reversal_exit(self, df) -> bool:
+        """
+        Confirmed-reversal exit: an ADVERSE momentum divergence (price making a
+        new extreme while RSI doesn't) CONFIRMED by a structure break against the
+        held option. This is the principled carve-out from the profit-protector
+        suppression — a PSAR wobble is noise, but divergence + structure break is
+        a real top/bottom, so we exit EVEN AT A LOSS.
+
+          Long CALL (type BUY): bearish divergence + close below VWAP/EMA-9 → exit.
+          Long PUT  (type SELL): bullish divergence + close above VWAP/EMA-9 → exit.
+
+        Config: reversal_exit.{enable, lookback, min_hold_minutes}.
+        """
+        cfg = (self.config.get("reversal_exit") or {})
+        if not cfg.get("enable", True):
+            return False
+        if df is None or df.empty or 'rsi' not in df.columns:
+            return False
+        trade = self.active_trade or {}
+        # Minimum hold so we don't react to entry-bar noise.
+        min_hold = float(cfg.get("min_hold_minutes", 5) or 0)
+        et = trade.get("entry_time")
+        if min_hold > 0 and et:
+            try:
+                held = (datetime.datetime.now()
+                        - datetime.datetime.fromisoformat(et)).total_seconds() / 60.0
+                if held < min_hold:
+                    return False
+            except Exception:
+                pass
+        try:
+            div = check_momentum_divergence(df['close'], df['rsi'], int(cfg.get("lookback", 45)))
+        except Exception as e:
+            logging.debug(f"[ReversalExit] divergence calc failed (non-fatal): {e}")
+            return False
+        if div == "None":
+            return False
+        last = df.iloc[-1]
+        close = float(last['close'])
+        ref = None
+        if 'vwap' in df.columns and not pd.isna(last.get('vwap')):
+            ref = float(last['vwap'])
+        elif 'ema_9' in df.columns and not pd.isna(last.get('ema_9')):
+            ref = float(last['ema_9'])
+        if ref is None:
+            return False
+        side = trade.get('type')
+        if side == 'BUY' and div == 'Bearish' and close < ref:   # long CE topping
+            return True
+        if side == 'SELL' and div == 'Bullish' and close > ref:  # long PE bottoming
+            return True
+        return False
 
     def _exit_clears_costs(self, current_price: float) -> bool:
         """
@@ -2126,7 +2207,7 @@ class PositionManagementAgent:
         return current_ltp, order_id  # best-effort fallback
 
     async def exit_trade(self, is_paper_trade=False, underlying_df=None,
-                         sentiment_agent=None, gemini_api_key=None):
+                         sentiment_agent=None, gemini_api_key=None, exit_reason=None):
         if not self.active_trade:
             return None
         trade      = self.active_trade
@@ -2134,7 +2215,9 @@ class PositionManagementAgent:
         is_spread  = trade.get("is_spread", False)
         qty        = trade["quantity"]
         timeout    = int(self.flags.get("order_fill_timeout_seconds", 30))
-        exit_reason = "PAPER" if is_paper_trade else "INDICATOR_OR_SOFTWARE_SL"
+        # Use the SPECIFIC trigger when the caller knows it; fall back otherwise.
+        if not exit_reason:
+            exit_reason = "PAPER_EXIT" if is_paper_trade else "INDICATOR_OR_SOFTWARE_SL"
 
         long_ltp = safe_ltp(self.kite, f"NFO:{symbol}") or trade.get("entry_price", 0)
         exit_price = long_ltp

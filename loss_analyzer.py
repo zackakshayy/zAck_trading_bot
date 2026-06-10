@@ -187,6 +187,15 @@ def _decode_exit_reason(reason: str) -> str:
     return {
         "SL_M_TRIGGERED": "Broker SL-M order triggered",
         "INDICATOR_OR_SOFTWARE_SL": "Software stop-loss / indicator exit",
+        "HARD_SL": "Hard stop-loss hit",
+        "TRAILING_STOP": "Trailing stop hit (gave back profit from the high)",
+        "INDICATOR_EXIT": "Indicator (PSAR/MA) reversal exit",
+        "DIVERGENCE_REVERSAL": "Confirmed RSI-divergence reversal + structure break",
+        "GIVE_UP_IV_CRUSH": "Give-up rule (underlying moved, premium didn't — IV crush)",
+        "TIME_EXIT": "Hard time exit (14:00)",
+        "EXPIRY_GAMMA_TIME_EXIT": "Expiry gamma scalp time exit (14:30)",
+        "PARTIAL_EXITS_COMPLETE": "Partial targets fully exited",
+        "PAPER_EXIT": "Paper-mode exit (specific trigger not recorded)",
         "PAPER": "Paper-mode exit",
         "UNKNOWN": "Unknown",
     }.get(reason, reason or "Unknown")

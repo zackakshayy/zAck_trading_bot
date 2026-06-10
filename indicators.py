@@ -77,17 +77,27 @@ def lex_algo_supply_demand(df):
     return "None"
 
 def _find_extrema(series: pd.Series, window: int = 5):
-    """A simplified helper to find local peaks and troughs."""
+    """
+    Find SIGNIFICANT local peaks and troughs.
+
+    Uses STRICT inequality: a bar is a peak only if it is the UNIQUE maximum of
+    its ±window neighbourhood (every other bar strictly lower), and a trough only
+    if the unique minimum. The old version used `max() == value`, which on flat
+    or quiet bars marked EVERY point as both a peak and a trough — so the
+    divergence check ended up comparing spurious flat-region points instead of
+    the real swing highs, silently missing on-screen divergences.
+    """
     extrema = []
-    # Ensure there's enough data to form a window
-    if len(series) < (2 * window + 1):
+    n = len(series)
+    if n < (2 * window + 1):
         return extrema
-    for i in range(window, len(series) - window):
-        is_peak = series.iloc[i-window:i+window+1].max() == series.iloc[i]
-        is_trough = series.iloc[i-window:i+window+1].min() == series.iloc[i]
-        if is_peak:
+    vals = series.values
+    for i in range(window, n - window):
+        seg = vals[i - window:i + window + 1]
+        c = vals[i]
+        if c == seg.max() and int((seg < c).sum()) == len(seg) - 1:
             extrema.append((i, 'peak'))
-        if is_trough:
+        elif c == seg.min() and int((seg > c).sum()) == len(seg) - 1:
             extrema.append((i, 'trough'))
     return extrema
 

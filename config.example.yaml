@@ -135,6 +135,14 @@ setup_score:
     oi_wall: 15
     momentum: 15
     day_quality: 10
+    exhaustion: 18           # penalise buying into an RSI divergence (momentum top/bottom)
+# In-trade CONFIRMED-REVERSAL exit: while holding, if an adverse RSI divergence is
+# confirmed by a structure break (close crosses VWAP/EMA-9 against the option), exit
+# EVEN AT A LOSS — the principled carve-out from indicator_exit_profit_only.
+reversal_exit:
+  enable: true
+  lookback: 45
+  min_hold_minutes: 5
 # ---------------------------------------------------------------------------
 # Conviction scoring: regime + sentiment strength + global-cue (market_trend)
 # alignment → a 0..1 score and a LOW/MEDIUM/HIGH level. HIGH = full size + lets

@@ -2870,6 +2870,7 @@ class TradingBotOrchestrator:
         "oi_wall":   15,   # not buying into the dominant call-OI wall
         "momentum":  15,   # ATR momentum sufficient for options buying
         "day_quality": 10, # TRENDING > RANGE > UNKNOWN
+        "exhaustion": 18,  # NOT buying into an RSI divergence (momentum exhaustion)
     }
 
     async def _setup_score(self, signal: str, df, is_counter_sentiment: bool) -> tuple:
@@ -2924,6 +2925,23 @@ class TradingBotOrchestrator:
         if w > 0:
             dq = getattr(self, '_day_quality', 'UNKNOWN')
             factors['day_quality'] = ({'TRENDING': 1.0, 'RANGE': 0.6}.get(dq, 0.5), w)
+
+        # 7. Exhaustion / momentum divergence: buying a CE into a BEARISH RSI
+        #    divergence (or a PE into a BULLISH one) is buying a top/bottom — the
+        #    exact mistake that lost the Momentum_VWAP_RSI trade. Adverse → 0,
+        #    aligned → 1, none → excluded (no penalty on a clean tape).
+        w = float(weights.get('exhaustion', 18))
+        if w > 0 and df is not None and 'rsi' in getattr(df, 'columns', []):
+            try:
+                div = check_momentum_divergence(df['close'], df['rsi'])
+                if div != 'None':
+                    adverse = (signal == 'BUY' and div == 'Bearish') or \
+                              (signal == 'SELL' and div == 'Bullish')
+                    aligned = (signal == 'BUY' and div == 'Bullish') or \
+                              (signal == 'SELL' and div == 'Bearish')
+                    factors['exhaustion'] = (0.0 if adverse else (1.0 if aligned else 0.5), w)
+            except Exception:
+                pass
 
         total_w = sum(wt for _, wt in factors.values())
         score = (100.0 * sum(v * wt for v, wt in factors.values()) / total_w) if total_w else 100.0
