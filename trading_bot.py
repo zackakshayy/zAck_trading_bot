@@ -30,6 +30,7 @@ from market_context import MarketConditionIdentifier
 from rag_service import RAGService
 from pcr_feed import PCRFeed
 from premarket import PreMarketBriefing
+import structure
 from infra import (
     is_nse_holiday,
     NSE_HOLIDAY_NAMES,
@@ -183,6 +184,15 @@ class TradingBotOrchestrator:
         self._regime_entry_not_before = None        # post-event entry-wait gate
         self._first_setup: bool = True              # day-level sit-out only on first setup
         self._fii_bias = None                       # best-effort FII positioning (informational)
+        # Structure terrain (support/resistance map) — prev-day extremes stored
+        # each setup(); CPR lives on position_agent.cpr_pivots; walls in _pcr_data.
+        self._prev_day_high: float | None = None
+        self._prev_day_low: float | None = None
+        # PCR slope tracking — a short rolling history of (timestamp, pcr) so the
+        # bot can tell a RISING PCR (put writers adding = support building) from a
+        # FALLING one (puts unwinding = support evaporating), not just the level.
+        from collections import deque
+        self._pcr_history = deque(maxlen=12)
         self._today_vix: float = 0.0                # cached for journaling
         self._trend_composite: float = 0.0          # market_trend directional score (-1..1)
         self.day_conviction: float = 0.0            # 0..1 conviction score
@@ -1767,6 +1777,12 @@ class TradingBotOrchestrator:
                     prior = day_df[day_df["date_only"] < today].tail(1)
                     if not prior.empty:
                         self.position_agent.cpr_pivots = calculate_cpr(prior)
+                        # Stash prev-day extremes for the structure map (PDH/PDL).
+                        try:
+                            self._prev_day_high = float(prior.iloc[-1]["high"])
+                            self._prev_day_low = float(prior.iloc[-1]["low"])
+                        except Exception:
+                            self._prev_day_high = self._prev_day_low = None
                         logging.debug("CPR pivots calculated for the day.")
                     else:
                         logging.debug(
@@ -2910,11 +2926,13 @@ class TradingBotOrchestrator:
     _SCORE_WEIGHTS_DEFAULT = {
         "direction": 20,   # signal agrees with the day's directional bias
         "htf_15m":   25,   # 15-min higher-timeframe confirmation
-        "pcr":       15,   # option-flow (PCR) alignment
-        "oi_wall":   15,   # not buying into the dominant call-OI wall
+        "pcr":       15,   # option-flow (PCR) level alignment
+        "structure": 15,   # graded room to the nearest adverse S/R level (was oi_wall)
         "momentum":  15,   # ATR momentum sufficient for options buying
         "day_quality": 10, # TRENDING > RANGE > UNKNOWN
         "exhaustion": 18,  # NOT buying into an RSI divergence (momentum exhaustion)
+        "pcr_slope": 10,   # PCR rising/falling confirms the trade direction
+        "flow_bias":  6,   # FII+DII T-1 institutional bias (tie-breaker)
     }
 
     async def _setup_score(self, signal: str, df, is_counter_sentiment: bool) -> tuple:
@@ -2954,10 +2972,24 @@ class TradingBotOrchestrator:
         if w > 0 and (self._pcr_data or {}).get('tag') in ('PCR_BULLISH', 'PCR_BEARISH'):
             factors['pcr'] = (1.0 if self._is_pcr_aligned(signal) else 0.0, w)
 
-        # 4. OI wall (excluded when wall data unavailable).
-        w = float(weights.get('oi_wall', 15))
-        if w > 0 and (self._pcr_data or {}).get('call_walls'):
-            factors['oi_wall'] = (0.0 if self._is_oi_wall_blocked(signal) else 1.0, w)
+        # 4. STRUCTURE ROOM — graded distance from spot to the nearest adverse
+        #    level (call wall / R1 / prev-day high for a CE; put wall / S1 /
+        #    prev-day low for a PE). Replaces the old binary OI-wall veto:
+        #    buying two points under a massive call wall now scores ~0 (no room
+        #    to a target), while plenty of headroom scores 1.0. This is the
+        #    market's own crowd-sourced S/R, finally used as more than one bit.
+        w = float(weights.get('structure', weights.get('oi_wall', 15)))
+        if w > 0:
+            room = self._structure_room_points(signal, df)
+            if room is not None:
+                target_room = float(cfg.get('structure_target_room_points', 25.0))
+                try:
+                    atr = float(df['atr'].iloc[-1]) if 'atr' in getattr(df, 'columns', []) else 0.0
+                    if atr > 0:
+                        target_room = max(target_room, atr * float(cfg.get('structure_room_atr_mult', 2.0)))
+                except Exception:
+                    pass
+                factors['structure'] = (max(0.0, min(1.0, room / target_room)), w)
 
         # 5. ATR momentum (excluded when the gate is disabled in config).
         w = float(weights.get('momentum', 15))
@@ -2986,6 +3018,27 @@ class TradingBotOrchestrator:
                     factors['exhaustion'] = (0.0 if adverse else (1.0 if aligned else 0.5), w)
             except Exception:
                 pass
+
+        # 8. PCR SLOPE — direction of option flow, not just the level. A rising
+        #    PCR confirms longs (put writers confidently adding = support
+        #    building); a falling PCR confirms shorts. Flat / too-short history
+        #    is EXCLUDED (no penalty). Catches the case the static PCR tag misses.
+        w = float(weights.get('pcr_slope', 10))
+        if w > 0:
+            slope = self._pcr_slope()
+            min_slope = float(cfg.get('pcr_slope_min', 0.01))
+            if slope is not None and abs(slope) >= min_slope:
+                confirming = (signal == 'BUY' and slope > 0) or (signal == 'SELL' and slope < 0)
+                factors['pcr_slope'] = (1.0 if confirming else 0.0, w)
+
+        # 9. FII+DII flow bias (T-1) — institutional footprint as a tie-breaker.
+        #    Aligned → 1, opposed → 0, unavailable/neutral → EXCLUDED. Small
+        #    weight by design: this data is end-of-day (yesterday's), never a gate.
+        w = float(weights.get('flow_bias', 6))
+        if w > 0:
+            fb_dir = self._flow_bias_dir()
+            if fb_dir is not None:
+                factors['flow_bias'] = (1.0 if fb_dir == signal else 0.0, w)
 
         total_w = sum(wt for _, wt in factors.values())
         score = (100.0 * sum(v * wt for v, wt in factors.values()) / total_w) if total_w else 100.0
@@ -3057,6 +3110,57 @@ class TradingBotOrchestrator:
                 )
         except Exception:
             pass
+
+    def _structure_kwargs(self) -> dict:
+        """Common args for the structure map from the data already in hand."""
+        pcr = self._pcr_data or {}
+        return {
+            "cpr": getattr(self.position_agent, "cpr_pivots", {}) or {},
+            "prev_high": self._prev_day_high,
+            "prev_low": self._prev_day_low,
+            "call_walls": pcr.get("call_walls"),
+            "put_walls": pcr.get("put_walls"),
+        }
+
+    def _structure_room_points(self, signal: str, df) -> float | None:
+        """NIFTY-point room from spot to the nearest favourable level for this
+        signal. None when no level is known (factor excluded, not penalised)."""
+        try:
+            spot = float(df["close"].iloc[-1])
+        except Exception:
+            return None
+        return structure.room_to_target(spot, signal, **self._structure_kwargs())
+
+    def _structure_target_for(self, signal: str, spot: float):
+        """(level, label) of the nearest favourable structure target, or None."""
+        try:
+            return structure.nearest_target(float(spot), signal, **self._structure_kwargs())
+        except Exception:
+            return None
+
+    def _pcr_slope(self) -> float | None:
+        """Per-minute slope of PCR over the recorded history. Positive = PCR
+        rising (put writers adding → support building, bullish-confirming);
+        negative = falling. None when history is too short to be meaningful."""
+        hist = list(self._pcr_history)
+        if len(hist) < 3:
+            return None
+        t0, _ = hist[0]
+        first_v = hist[0][1]
+        last_t, last_v = hist[-1]
+        minutes = max((last_t - t0).total_seconds() / 60.0, 1e-6)
+        return (last_v - first_v) / minutes
+
+    def _flow_bias_dir(self) -> str | None:
+        """Combined FII+DII T-1 institutional bias direction ('BUY'/'SELL'),
+        or None when unavailable/neutral. Informational — never a gate."""
+        fb = self._fii_bias or {}
+        bias = str(fb.get("combined_bias") or fb.get("bias") or "").upper()
+        if bias in ("BULLISH", "LONG"):
+            return "BUY"
+        if bias in ("BEARISH", "SHORT"):
+            return "SELL"
+        return None
 
     def _is_oi_wall_blocked(self, signal: str) -> bool:
         """
@@ -3618,28 +3722,16 @@ class TradingBotOrchestrator:
                         await self._aligned_sleep()
                         continue
 
-                    # Refresh PCR (cached for one bar; non-fatal on failure).
-                    if self.pcr_feed is not None:
-                        try:
-                            spot = float(day_df_for_signal["close"].iloc[-1])
-                            self._pcr_data = await self.pcr_feed.get_pcr(spot_price=spot)
-                        except Exception as _pcr_exc:
-                            logging.debug(f"PCR refresh skipped: {_pcr_exc}")
-
-                    signal = self.active_strategy.generate_signals(
-                        day_df_for_signal, self.day_sentiment,
-                        cpr_pivots=self.position_agent.cpr_pivots,
-                        vix_conditions=self.todays_conditions,
-                        is_expiry_day=getattr(self, "is_expiry_day", False),
-                    )
-
-                    # Day quality filter.
+                    # ── CONTEXT-FIRST: classify the tape BEFORE asking a strategy
+                    #    for a signal (cheap gates first). This skips signal/PCR
+                    #    work on CHOPPY days, and — critically — sets RANGE scalp
+                    #    mode BEFORE generate_signals so the signal comes from the
+                    #    RIGHT strategy (previously the scalp swap happened after
+                    #    the signal was already produced by the wrong strategy).
                     #   TRENDING → normal flow, clear any leftover scalp flags.
                     #   RANGE    → scalp mode (VWAP/RSI-extreme, half-size, tight targets).
                     #   CHOPPY   → fully blocked; too many direction changes for any edge.
                     self._day_quality = self._classify_day_quality(day_df_for_signal)
-                    # Log day quality only when it changes — avoid repeating the
-                    # same line every 60 s while conditions are stable.
                     if self._day_quality != self._last_reported_day_quality:
                         logging.info(f"[DayQuality] → {self._day_quality}")
                         self._last_reported_day_quality = self._day_quality
@@ -3660,6 +3752,28 @@ class TradingBotOrchestrator:
                     else:
                         # TRENDING or UNKNOWN — ensure scalp overrides are cleared.
                         self._exit_range_scalp_mode()
+
+                    # Refresh PCR (cached for one bar; non-fatal on failure).
+                    if self.pcr_feed is not None:
+                        try:
+                            spot = float(day_df_for_signal["close"].iloc[-1])
+                            self._pcr_data = await self.pcr_feed.get_pcr(spot_price=spot)
+                            # Record PCR for slope (rising vs falling) detection.
+                            _pcr_val = (self._pcr_data or {}).get("pcr")
+                            if _pcr_val is not None:
+                                self._pcr_history.append(
+                                    (datetime.datetime.now(), float(_pcr_val))
+                                )
+                        except Exception as _pcr_exc:
+                            logging.debug(f"PCR refresh skipped: {_pcr_exc}")
+
+                    # Signal now comes from the regime-correct strategy.
+                    signal = self.active_strategy.generate_signals(
+                        day_df_for_signal, self.day_sentiment,
+                        cpr_pivots=self.position_agent.cpr_pivots,
+                        vix_conditions=self.todays_conditions,
+                        is_expiry_day=getattr(self, "is_expiry_day", False),
+                    )
 
                     if signal == 'HOLD':
                         self._note_block("no_signal")
@@ -3793,6 +3907,24 @@ class TradingBotOrchestrator:
                                 trade_details['conviction'] = self.day_conviction_level
                                 trade_details['setup_score'] = getattr(self, '_last_score', None)
                                 trade_details['expiry_gamma'] = getattr(self, '_expiry_gamma_active', False)
+                                # STRUCTURE TARGET: the nearest favourable S/R
+                                # level (the option's natural profit objective).
+                                # manage() scales out / locks in when SPOT reaches
+                                # it — far better than a fixed premium %. Stored as
+                                # the underlying level so no delta modelling needed.
+                                try:
+                                    _entry_spot = float(day_df_for_signal["close"].iloc[-1])
+                                    _st = self._structure_target_for(signal, _entry_spot)
+                                    if _st is not None:
+                                        trade_details['structure_target_spot'] = round(_st[0], 2)
+                                        trade_details['structure_target_label'] = _st[1]
+                                        logging.info(
+                                            f"[Structure] target {_st[1]} @ spot "
+                                            f"{_st[0]:.0f} (entry spot {_entry_spot:.0f}, "
+                                            f"room {abs(_st[0]-_entry_spot):.0f} pts)."
+                                        )
+                                except Exception as _st_exc:
+                                    logging.debug(f"structure target calc skipped: {_st_exc}")
                                 if trade_details['hold_to_close']:
                                     logging.info(
                                         f"[HoldToClose] {signal} tagged to ride the trend "

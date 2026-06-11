@@ -128,14 +128,28 @@ setup_score:
   size_full_above: 85
   size_min_factor: 0.75
   counter_direction_value: 0.4
+  # Structure factor: NIFTY-point room to the nearest adverse S/R level scoring
+  # a full 1.0 (less room scales toward 0). Effective room = max(this, atr × mult).
+  structure_target_room_points: 25.0
+  structure_room_atr_mult: 2.0
+  pcr_slope_min: 0.01          # min |PCR change/min| for the slope factor to count
   weights:
     direction: 20
     htf_15m: 25
     pcr: 15
-    oi_wall: 15
+    structure: 15            # graded room to nearest S/R wall (replaces oi_wall veto)
     momentum: 15
     day_quality: 10
     exhaustion: 18           # penalise buying into an RSI divergence (momentum top/bottom)
+    pcr_slope: 10            # PCR rising/falling confirms the trade direction
+    flow_bias: 6            # FII+DII T-1 institutional bias (small tie-breaker)
+# Structure-target EXIT: bank the move at the nearest favourable S/R level the
+# market actually offered, instead of giving it back to the trail. Scales out a
+# slice if >1 lot held, then breakeven stop + tight trail on the runner.
+structure_exit:
+  enable: true
+  scale_out_pct: 50
+  tight_trail_pct_at_target: 8.0
 # In-trade CONFIRMED-REVERSAL exit: while holding, if an adverse RSI divergence is
 # confirmed by a structure break (close crosses VWAP/EMA-9 against the option), exit
 # EVEN AT A LOSS — the principled carve-out from indicator_exit_profit_only.
@@ -459,8 +473,8 @@ strategy_selector:
   # families, range-scalp rotation and fallback all respect it). default_strategy
   # replaces the old hardcoded Gemini_Default last resort (a chronic loser).
   default_strategy: Momentum_VWAP_RSI
+  # EMA_Cross_RSI culled: redundant with Momentum_VWAP_RSI and the laggiest signal.
   whitelist:
-    - EMA_Cross_RSI
     - Momentum_VWAP_RSI
     - VWAP_Reversion
     - Breakout_Prev_Day_HL

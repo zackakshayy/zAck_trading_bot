@@ -36,6 +36,20 @@ def _bias_from_net(net) -> str:
     return "NEUTRAL"
 
 
+def _with_combined(d: dict) -> dict:
+    """Add a combined FII+DII bias: agreement = strong signal, disagreement =
+    neutral (the two big players are on opposite sides, no edge). FII alone when
+    DII is absent."""
+    fii_b = str(d.get("bias") or "").upper()
+    dii_b = str(d.get("dii_bias") or "").upper()
+    if dii_b and dii_b in ("BULLISH", "BEARISH"):
+        combined = fii_b if fii_b == dii_b else "NEUTRAL"
+    else:
+        combined = fii_b
+    d["combined_bias"] = combined
+    return d
+
+
 def fetch_fii_bias(config: dict) -> "dict | None":
     """Best-effort FII bias. Local file first, then NSE. None when unavailable."""
     cfg = ((config or {}).get("fii") or {})
@@ -48,12 +62,15 @@ def fetch_fii_bias(config: dict) -> "dict | None":
     if isinstance(data, dict):
         bias = data.get("bias") or _bias_from_net(data.get("net_index_futures"))
         if bias:
-            return {
+            dii_net = data.get("dii_net")
+            return _with_combined({
                 "bias": str(bias).upper(),
                 "net_index_futures": data.get("net_index_futures"),
+                "dii_net": dii_net,
+                "dii_bias": _bias_from_net(dii_net) if dii_net is not None else None,
                 "note": data.get("note", ""),
                 "source": data.get("source", "local_file"),
-            }
+            })
 
     # 2) Best-effort NSE fetch (fragile — wrapped so failure is silent).
     if cfg.get("try_nse_fetch", False):
@@ -74,17 +91,27 @@ def fetch_fii_bias(config: dict) -> "dict | None":
             r = sess.get(url, headers=headers, timeout=8)
             r.raise_for_status()
             payload = r.json()
-            # Shape varies; pull the FII net derivative number defensively.
-            net = None
+            # Shape varies; pull FII and DII net numbers defensively. The
+            # fiidiiTradeReact endpoint returns BOTH categories in one payload.
+            net = dii_net = None
             if isinstance(payload, list):
                 for row in payload:
-                    if isinstance(row, dict) and "FII" in str(row.get("category", "")).upper():
-                        net = row.get("netValue") or row.get("net")
-                        break
+                    if not isinstance(row, dict):
+                        continue
+                    cat = str(row.get("category", "")).upper()
+                    val = row.get("netValue") or row.get("net")
+                    if "FII" in cat and net is None:
+                        net = val
+                    elif "DII" in cat and dii_net is None:
+                        dii_net = val
             if net is not None:
-                return {"bias": _bias_from_net(net),
-                        "net_index_futures": net, "note": "NSE fiidii",
-                        "source": "nse"}
+                return _with_combined({
+                    "bias": _bias_from_net(net),
+                    "net_index_futures": net,
+                    "dii_net": dii_net,
+                    "dii_bias": _bias_from_net(dii_net) if dii_net is not None else None,
+                    "note": "NSE fiidii", "source": "nse",
+                })
         except Exception as e:
             logging.debug(f"[FII] NSE fetch failed (non-fatal): {e}")
 

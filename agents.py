@@ -1411,6 +1411,10 @@ class PositionManagementAgent:
         self.active_trade['_pe_t1_hit']        = False
         self.active_trade['_pe_t2_hit']        = False
         self.active_trade['_pe_realized_pnl']  = 0.0
+        # Structure-target state: has SPOT reached the nearest favourable S/R
+        # level yet? When it does, manage() banks/locks the move the market
+        # actually offered (scale out if >1 lot, tighten + breakeven otherwise).
+        self.active_trade['_structure_hit']    = False
 
         # Snapshot the underlying spot price at entry for the give-up rule
         # (detects IV crush when spot moves in favour but premium stays flat).
@@ -1602,6 +1606,19 @@ class PositionManagementAgent:
                 is_paper_trade, underlying_hist_df, sentiment_agent, gemini_api_key,
                 exit_reason=("EXPIRY_GAMMA_TIME_EXIT" if self.active_trade.get('expiry_gamma')
                              else "TIME_EXIT"),
+            )
+
+        # 3b. STRUCTURE TARGET — spot reached the nearest favourable S/R level:
+        #     bank/lock the move the market offered (scale out if >1 lot, then
+        #     breakeven stop + tight trail on the runner). Runs before premium
+        #     partials and the SL check so the structure level takes priority.
+        st_result = await self._check_structure_target(
+            current_price, underlying_hist_df, is_paper_trade
+        )
+        if st_result == 'FULLY_EXITED':
+            return await self._book_completed_trade(
+                current_price, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_order_id=None, exit_reason='STRUCTURE_TARGET',
             )
 
         # 4. Partial exits (T1 / T2 premium targets) — before the SL check so that
@@ -2003,6 +2020,77 @@ class PositionManagementAgent:
         )
         self._save_state()
         return exit_price
+
+    async def _check_structure_target(self, current_price: float,
+                                       underlying_hist_df, is_paper_trade: bool) -> Optional[str]:
+        """
+        Structure-target management. When the UNDERLYING spot reaches the nearest
+        favourable S/R level recorded at entry (call wall / R1 / PDH for a CE;
+        put wall / S1 / PDL for a PE), the move the market was willing to give
+        has arrived. Rather than donate it back to the trailing stop, we:
+          • book `scale_out_pct` of the position if >1 lot is held, and
+          • move the stop to (at least) breakeven and tighten the trail,
+        letting any runner ride a genuine breakout while the gain is protected.
+
+        Fires once per trade. Returns 'FULLY_EXITED' if nothing remains, else None.
+        Spot-based (not premium-based) so no option-delta modelling is required.
+        """
+        cfg = (self.config.get('structure_exit') or {})
+        trade = self.active_trade
+        if not cfg.get('enable', True) or trade.get('_structure_hit'):
+            return None
+        target_spot = trade.get('structure_target_spot')
+        if not target_spot or underlying_hist_df is None or underlying_hist_df.empty:
+            return None
+        try:
+            current_spot = float(underlying_hist_df.iloc[-1]['close'])
+        except Exception:
+            return None
+
+        side = trade.get('type')  # 'BUY' (CE) or 'SELL' (PE)
+        reached = (current_spot >= float(target_spot)) if side == 'BUY' \
+            else (current_spot <= float(target_spot))
+        if not reached:
+            return None
+
+        trade['_structure_hit'] = True
+        label = trade.get('structure_target_label', 'STRUCTURE')
+        logging.info(
+            f"[Structure] spot {current_spot:.0f} reached target {label} "
+            f"@ {float(target_spot):.0f} — banking/locking the move."
+        )
+
+        # Scale out a slice if we actually hold more than one lot.
+        lot_size = int(trade.get('lot_size', 1) or 1)
+        remaining = int(trade.get('quantity', 0) or 0)
+        if remaining > lot_size:
+            frac = float(cfg.get('scale_out_pct', 50)) / 100.0
+            orig = int(trade.get('_pe_original_qty', remaining) or remaining)
+            qty_exit = max(lot_size, int((orig * frac) // lot_size) * lot_size)
+            qty_exit = min(qty_exit, remaining - lot_size)  # always keep ≥1 lot runner
+            if qty_exit >= lot_size:
+                await self._exit_partial_quantity(
+                    qty_exit, f'STRUCTURE_{label}', is_paper_trade, current_price
+                )
+
+        # Lock the gain: stop to at least breakeven, and tighten the trail so a
+        # reversal off the level can't give the whole move back.
+        entry = float(trade.get('entry_price', 0) or 0)
+        if entry > 0:
+            trade['trailing_stop_loss'] = max(float(trade.get('trailing_stop_loss', 0) or 0), entry)
+            trade['initial_stop_loss'] = max(float(trade.get('initial_stop_loss', 0) or 0), entry)
+        tight = float(cfg.get('tight_trail_pct_at_target', 8.0))
+        self.tsl_config = dict(self.tsl_config)
+        self.tsl_config['percentage'] = min(float(self.tsl_config.get('percentage', 15.0)), tight)
+        logging.info(
+            f"[Structure] stop ≥ breakeven {entry:.2f}, trail tightened to "
+            f"{self.tsl_config['percentage']:.0f}% on the runner."
+        )
+        self._save_state()
+
+        if int(trade.get('quantity', 0) or 0) <= 0:
+            return 'FULLY_EXITED'
+        return None
 
     async def _check_partial_exits(self, current_price: float,
                                     is_paper_trade: bool) -> Optional[str]:

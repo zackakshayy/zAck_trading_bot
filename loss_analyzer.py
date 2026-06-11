@@ -195,6 +195,7 @@ def _decode_exit_reason(reason: str) -> str:
         "TIME_EXIT": "Hard time exit (14:00)",
         "EXPIRY_GAMMA_TIME_EXIT": "Expiry gamma scalp time exit (14:30)",
         "PARTIAL_EXITS_COMPLETE": "Partial targets fully exited",
+        "STRUCTURE_TARGET": "Structure S/R target reached (full exit)",
         "PAPER_EXIT": "Paper-mode exit (specific trigger not recorded)",
         "PAPER": "Paper-mode exit",
         "UNKNOWN": "Unknown",
