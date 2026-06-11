@@ -1245,6 +1245,20 @@ class OrderExecutionAgent:
             risk_per_share = max(ref_price * sl_pct, min_sl_pts)
 
             lots_by_risk = int(risk_amount / max(risk_per_share * lot_size, 1e-6))
+            # RISK-FLOOR GUARD: if the (haircut) risk budget can't fund even ONE
+            # lot, the min-lot floor would silently risk FAR more than intended —
+            # the exact 4.4× overshoot that turned a 0.56%-risk setup into a 3%
+            # one. The conviction/score/counter-sentiment haircuts mean "size
+            # down toward zero"; when that drops below one lot, the right move is
+            # to SKIP, not to overshoot the cap. (Config: skip_sub_lot_trades.)
+            if lots_by_risk < 1 and self.flags.get("skip_sub_lot_trades", True):
+                one_lot_risk = risk_per_share * lot_size
+                logging.warning(
+                    f"Risk-floor skip: risk budget ₹{risk_amount:.0f} can't fund 1 lot "
+                    f"(1-lot risk ₹{one_lot_risk:.0f} = {one_lot_risk/max(risk_amount,1):.1f}× "
+                    f"the intended risk). Setup too weak to size — skipping {symbol}."
+                )
+                return None, 0, 0
             num_lots = max(1, lots_by_risk)
             quantity = num_lots * lot_size
 
@@ -1553,7 +1567,15 @@ class PositionManagementAgent:
         #    capture the afternoon trend continuation, instead of being cut early.
         hold_to_close = bool(self.active_trade.get('hold_to_close'))
         in_profit = float(current_price) > float(self.active_trade.get('entry_price', 0) or 0)
+        # Default hard exit is now CONFIGURABLE (trading_flags.hard_exit_time);
+        # was hardcoded to 14:00, which silently ignored the operator's setting.
         _hard_close_time = datetime.time(14, 0)
+        try:
+            _het = str((self.flags or {}).get('hard_exit_time', '14:00'))
+            hh, mm = [int(x) for x in _het.split(':')]
+            _hard_close_time = datetime.time(hh, mm)
+        except Exception:
+            pass
         if self.active_trade.get('expiry_gamma'):
             # 0-DTE gamma scalp: flat by hard_exit_time (last-hour gamma is violent).
             try:

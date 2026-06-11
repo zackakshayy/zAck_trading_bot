@@ -29,6 +29,7 @@ from indicator_calculator import calculate_all_indicators
 from market_context import MarketConditionIdentifier
 from rag_service import RAGService
 from pcr_feed import PCRFeed
+from premarket import PreMarketBriefing
 from infra import (
     is_nse_holiday,
     NSE_HOLIDAY_NAMES,
@@ -202,6 +203,7 @@ class TradingBotOrchestrator:
 
         # Defer initialization of session-dependent agents until after authentication
         self.market_condition_identifier = None
+        self.premarket = None
         self.order_agent = None
         self.position_agent = None
 
@@ -342,6 +344,7 @@ class TradingBotOrchestrator:
             self.order_agent = OrderExecutionAgent(self.kite, self.config)
             self.position_agent = PositionManagementAgent(self.kite, self.config, self.rag_service)
             self.pcr_feed = PCRFeed(self.kite, self.config)
+            self.premarket = PreMarketBriefing(self.kite, self.config)
             logging.info("Agents initialized successfully.")
             
             return True
@@ -1171,6 +1174,23 @@ class TradingBotOrchestrator:
         if cutoff and now >= cutoff:
             return f"past entry_cutoff_time {cutoff.strftime('%H:%M')}"
 
+        # ── Hard-exit guard ──────────────────────────────────────────────────
+        # NEVER enter a trade the hard time-exit will immediately close. The
+        # effective entry deadline = (applicable hard-exit time − buffer), so a
+        # new trade always has at least `min_minutes_before_hard_exit` to work.
+        # (This is the bug that let a 14:35 entry get killed by the 14:00 exit.)
+        he = self._parse_hhmm(flags.get('hard_exit_time', '14:00')) or datetime.time(14, 0)
+        if getattr(self, '_expiry_gamma_active', False):
+            _egt = self._parse_hhmm((self.config.get('expiry_gamma_scalp') or {}).get('hard_exit_time', '14:30'))
+            if _egt:
+                he = _egt
+        buf = int(flags.get('min_minutes_before_hard_exit', 15) or 0)
+        he_cutoff = (datetime.datetime.combine(datetime.date.today(), he)
+                     - datetime.timedelta(minutes=buf)).time()
+        if now >= he_cutoff:
+            return (f"within {buf}min of hard exit {he.strftime('%H:%M')} — "
+                    f"no time for a new trade to work")
+
         lunch_start = self._parse_hhmm(flags.get('lunch_pause_start'))
         lunch_end = self._parse_hhmm(flags.get('lunch_pause_end'))
         if lunch_start and lunch_end and lunch_start <= now < lunch_end:
@@ -1277,6 +1297,17 @@ class TradingBotOrchestrator:
             or datetime.time(8, 50)
         return start <= now_dt.time() < datetime.time(9, 15)
 
+    def _premarket_strategy_hint(self) -> dict:
+        """What the bot itself decided, appended to the pre-market brief."""
+        hint = {}
+        strat = getattr(self, 'active_strategy_name', None)
+        if strat and strat != "None":
+            hint['strategy'] = strat
+        sent = getattr(self, 'day_sentiment', '') or ''
+        if sent:
+            hint['regime'] = sent
+        return hint
+
     async def _wait_for_market_open(self):
         """
         Async sleep until 09:15:30 IST (a few seconds past open so the LTP
@@ -1296,6 +1327,19 @@ class TradingBotOrchestrator:
             remaining = (target - now).total_seconds()
             if remaining <= 0:
                 break
+            # Auto-refresh the pre-market brief at 09:00: by then NSE's event
+            # calendar has the day's filings and pre-open data has settled, so
+            # a bot started early (e.g. 08:50) gets a second, fresher brief.
+            if (now.time() >= datetime.time(9, 0)
+                    and self.premarket is not None
+                    and self.premarket.last_generated_at is not None
+                    and self.premarket.last_generated_at.time() < datetime.time(9, 0)
+                    and (self.config.get('premarket_briefing') or {}).get('enable', True)):
+                logging.info("09:00 reached — refreshing pre-market brief.")
+                try:
+                    await self.premarket.generate(self._premarket_strategy_hint())
+                except Exception as e:
+                    logging.warning(f"09:00 brief refresh failed (non-fatal): {e}")
             mins_left = int(remaining // 60)
             if mins_left != last_announced_min:
                 secs = int(remaining - mins_left * 60)
@@ -3444,6 +3488,16 @@ class TradingBotOrchestrator:
                 print("  Expiry-day overrides are disabled in config.yaml.")
             print("=" * 78 + "\n")
             logging.warning("Today is weekly expiry day; expiry-day overrides applied.")
+
+        # ---------- Pre-market intelligence brief ----------
+        # Top-5 component moves, corporate events, big-move risk, NIFTY S/R,
+        # and the strategy the bot picked in response. Best-effort: a failed
+        # section prints "[unavailable]" rather than blocking startup.
+        if (self.config.get('premarket_briefing') or {}).get('enable', True):
+            try:
+                await self.premarket.generate(self._premarket_strategy_hint())
+            except Exception as e:
+                logging.warning(f"Pre-market briefing failed (non-fatal): {e}")
 
         # If we started in pre-market, hold here until the actual open. All
         # setup (auth, sentiment, strategy pick, expiry detection) is done;
