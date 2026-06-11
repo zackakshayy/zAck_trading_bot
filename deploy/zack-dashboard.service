@@ -1,0 +1,14 @@
+[Unit]
+Description=zAck mobile dashboard (FastAPI PWA, Tailscale-only)
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/zack_trading_bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/zack_trading_bot/deploy/run_dashboard.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

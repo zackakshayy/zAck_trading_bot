@@ -1393,6 +1393,14 @@ class PositionManagementAgent:
         if not trade_details:
             return
         self.active_trade = trade_details
+        try:
+            from notify import send_push
+            send_push(self.config, f"zAck — entered {trade_details.get('type', '?')}",
+                      f"{trade_details.get('symbol', '?')} × {trade_details.get('quantity', '?')} "
+                      f"@ ₹{float(trade_details.get('entry_price', 0) or 0):.2f} "
+                      f"({trade_details.get('Strategy', '?')})", tags="chart_with_upwards_trend")
+        except Exception:
+            pass
         self.tsl_config = self.config.get("trailing_stop_loss", {})
         sl_price, _ = self._calculate_initial_sl()
         self.active_trade["initial_stop_loss"] = sl_price
@@ -2405,6 +2413,15 @@ class PositionManagementAgent:
         else:
             cost_breakdown, costs = {}, 0.0
         net_pnl = gross_pnl - costs
+        try:
+            from notify import send_push
+            _emoji = "moneybag" if net_pnl >= 0 else "small_red_triangle_down"
+            send_push(self.config,
+                      f"zAck — exit {'+' if net_pnl >= 0 else ''}₹{net_pnl:,.0f}",
+                      f"{trade['symbol']} closed ({exit_reason}). "
+                      f"Net ₹{net_pnl:,.2f} after ₹{costs:,.0f} costs.", tags=_emoji)
+        except Exception:
+            pass
 
         completed = {
             "Timestamp": datetime.datetime.now(),

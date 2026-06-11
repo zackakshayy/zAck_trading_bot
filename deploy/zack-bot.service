@@ -1,0 +1,20 @@
+[Unit]
+Description=zAck trading bot (headless)
+After=network-online.target tailscaled.service
+OnFailure=zack-fail-notify.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/zack_trading_bot
+Environment=BOT_HEADLESS=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/zack_trading_bot/venv/bin/python trading_bot.py
+# Crash → restart (reconcile_open_position resumes any open trade; the
+# broker-side SL-M protects the position while the process is down).
+Restart=on-failure
+RestartSec=15
+# The bot exits cleanly after market close — don't restart a clean exit.
+SuccessExitStatus=0
+
+[Install]
+WantedBy=default.target

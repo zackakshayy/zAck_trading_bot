@@ -587,3 +587,25 @@ zerodha:
   access_token: ${ZERODHA_ACCESS_TOKEN}
   api_key: ${ZERODHA_API_KEY}
   api_secret: ${ZERODHA_API_SECRET}
+
+# ── Server / mobile deployment ───────────────────────────────────────────────
+# headless: true on the cloud box — the daily Kite login arrives from your
+# phone via the dashboard's "Kite login" button instead of a terminal prompt.
+server:
+  headless: false
+  login_wait_minutes: 90
+
+# Push notifications to your phone (ntfy app — free, Android + iOS).
+# The topic name IS the credential: long random suffix, keep it private.
+ntfy:
+  enable: false
+  topic: ""
+  server: "https://ntfy.sh"
+
+# Mobile dashboard (dashboard.py). token gates all data endpoints; control_pin
+# gates the Arm/Kill buttons (empty = controls disabled). Env DASHBOARD_TOKEN
+# and DASHBOARD_PIN override these. See deploy/README.md for full setup.
+dashboard:
+  token: ""
+  control_pin: ""
+  bot_service: "zack-bot.service"

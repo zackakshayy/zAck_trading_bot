@@ -46,6 +46,8 @@ from infra import (
     load_week_trade_days,
     add_week_trade_day,
 )
+from typing import Optional
+from notify import send_push as notify_push
 import multiprocessing
 import warnings
 
@@ -328,40 +330,99 @@ class TradingBotOrchestrator:
         # Printed once after the first sentiment lock-in; not repeated on refreshes.
         self._override_hint_shown: bool = False
 
+    def _init_agents(self) -> None:
+        """Initialize session-dependent agents (requires a valid Kite session)."""
+        logging.info("Initializing session-dependent agents...")
+        self.market_condition_identifier = MarketConditionIdentifier(self.kite, self.config)
+        self.order_agent = OrderExecutionAgent(self.kite, self.config)
+        self.position_agent = PositionManagementAgent(self.kite, self.config, self.rag_service)
+        self.pcr_feed = PCRFeed(self.kite, self.config)
+        self.premarket = PreMarketBriefing(self.kite, self.config)
+        logging.info("Agents initialized successfully.")
+
+    def _is_headless(self) -> bool:
+        """Server mode: no terminal attached — the daily Kite login arrives from
+        the phone via the dashboard's /kite/callback instead of input()."""
+        return bool((self.config.get('server') or {}).get('headless')
+                    or os.environ.get('BOT_HEADLESS'))
+
+    def _adopt_access_token(self, access_token: str) -> bool:
+        """Set + validate an access token, persist it, init agents."""
+        try:
+            self.kite.set_access_token(access_token)
+            self.config['zerodha']['access_token'] = access_token
+            profile = self.kite.profile()
+            persist_access_token(access_token)
+            logging.info(f"Authentication successful. Connected as {profile.get('user_name', 'user')}.")
+            self._init_agents()
+            return True
+        except Exception as e:
+            logging.warning(f"Access token rejected: {e}")
+            return False
+
+    def _await_phone_login(self) -> Optional[str]:
+        """
+        Headless morning-login wait. The dashboard's /kite/callback writes
+        state/kite_auth.json after you tap the login link on your phone; this
+        polls for a token stamped TODAY, sending an ntfy reminder every 10 min.
+        Returns the access token, or None after server.login_wait_minutes.
+        """
+        srv = (self.config.get('server') or {})
+        wait_min = float(srv.get('login_wait_minutes', 90))
+        deadline = datetime.datetime.now() + datetime.timedelta(minutes=wait_min)
+        today = datetime.date.today().isoformat()
+        auth_file = state_path("kite_auth.json")
+        notify_push(self.config, "zAck — login needed",
+                    "Open the dashboard and tap 'Kite login' to arm today's session.",
+                    priority="high", tags="key")
+        logging.info(f"[HeadlessAuth] waiting up to {wait_min:.0f} min for the "
+                     f"phone login (state/kite_auth.json)...")
+        last_reminder = datetime.datetime.now()
+        while datetime.datetime.now() < deadline:
+            auth = read_json(auth_file, default=None) or {}
+            tok = auth.get("access_token")
+            if tok and auth.get("date") == today:
+                logging.info("[HeadlessAuth] token received from phone login.")
+                return tok
+            if (datetime.datetime.now() - last_reminder).total_seconds() >= 600:
+                notify_push(self.config, "zAck — still waiting for login",
+                            "Tap 'Kite login' in the dashboard to start the bot.",
+                            priority="high", tags="key")
+                last_reminder = datetime.datetime.now()
+            time.sleep(5)
+        logging.error(f"[HeadlessAuth] no login within {wait_min:.0f} min; giving up.")
+        notify_push(self.config, "zAck — NOT trading today",
+                    "No Kite login received — the bot gave up waiting.",
+                    priority="urgent", tags="x")
+        return None
+
     def authenticate(self, request_token_override=None):
         """
-        Handles user authentication. It can accept a token for API-driven flows
-        or prompt the user in console mode.
+        Handles authentication three ways:
+          1. request_token_override — API-driven flows.
+          2. Headless (server) mode — reuse a still-valid token from .env, else
+             wait for the phone login via the dashboard callback.
+          3. Console mode — print the login URL and prompt for request_token.
         """
-        logging.info("Attempting fresh authentication...")
+        logging.info("Attempting authentication...")
+        if not request_token_override and self._is_headless():
+            # Fast path: a token from earlier today may still be valid (.env).
+            existing = (os.environ.get('ZERODHA_ACCESS_TOKEN')
+                        or (self.config.get('zerodha') or {}).get('access_token') or '').strip()
+            if existing and self._adopt_access_token(existing):
+                return True
+            tok = self._await_phone_login()
+            return bool(tok and self._adopt_access_token(tok))
+
         if not request_token_override:
             logging.info(f"Login URL: {self.kite.login_url()}")
             request_token = input("Enter request_token: ")
         else:
             request_token = request_token_override
-            
+
         try:
             data = self.kite.generate_session(request_token, api_secret=self.config['zerodha']['api_secret'])
-            access_token = data['access_token']
-            
-            # Set token on the main Kite instance and persist to .env
-            self.kite.set_access_token(access_token)
-            self.config['zerodha']['access_token'] = access_token
-            persist_access_token(access_token)
-            
-            profile = self.kite.profile()
-            logging.info(f"Authentication successful. Connected as {profile.get('user_name', 'user')}.")
-            
-            # Initialize agents now that we have a valid session
-            logging.info("Initializing session-dependent agents...")
-            self.market_condition_identifier = MarketConditionIdentifier(self.kite, self.config)
-            self.order_agent = OrderExecutionAgent(self.kite, self.config)
-            self.position_agent = PositionManagementAgent(self.kite, self.config, self.rag_service)
-            self.pcr_feed = PCRFeed(self.kite, self.config)
-            self.premarket = PreMarketBriefing(self.kite, self.config)
-            logging.info("Agents initialized successfully.")
-            
-            return True
+            return self._adopt_access_token(data['access_token'])
         except Exception as e:
             logging.error(f"Authentication failed: {e}", exc_info=True)
             return False
@@ -1311,6 +1372,45 @@ class TradingBotOrchestrator:
             or datetime.time(8, 50)
         return start <= now_dt.time() < datetime.time(9, 15)
 
+    def _kill_switch_engaged(self) -> bool:
+        """True if the phone dashboard engaged today's kill switch
+        (state/kill_switch.json with active=true and today's date)."""
+        try:
+            ks = read_json(state_path("kill_switch.json"), default=None) or {}
+            return bool(ks.get("active")
+                        and ks.get("date") == datetime.date.today().isoformat())
+        except Exception:
+            return False
+
+    async def _handle_kill_switch(self, is_paper: bool) -> None:
+        """Flatten any open position at market, mark the switch handled, stop."""
+        logging.warning("KILL SWITCH engaged from the dashboard — flattening and stopping.")
+        try:
+            if (getattr(self, 'position_agent', None)
+                    and self.position_agent.active_trade):
+                await self.position_agent.exit_trade(
+                    is_paper, None, self.sentiment_agent,
+                    self.config.get('google_api', {}).get('api_key'),
+                    exit_reason="KILL_SWITCH",
+                )
+        except Exception as e:
+            logging.error(f"Kill-switch exit failed (position may still be open "
+                          f"— check Kite app!): {e}", exc_info=True)
+            notify_push(self.config, "zAck — KILL EXIT FAILED",
+                        "Could not flatten the position automatically. "
+                        "CHECK THE KITE APP NOW.", priority="urgent", tags="rotating_light")
+        try:
+            atomic_write_json(state_path("kill_switch.json"), {
+                "active": False, "date": datetime.date.today().isoformat(),
+                "handled_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+        except Exception:
+            pass
+        self.bot_state = "STOPPED"
+        notify_push(self.config, "zAck — stopped",
+                    "Kill switch handled: position flat, bot stopped for the day.",
+                    priority="high", tags="octagonal_sign")
+
     def _premarket_strategy_hint(self) -> dict:
         """What the bot itself decided, appended to the pre-market brief."""
         hint = {}
@@ -2098,6 +2198,10 @@ class TradingBotOrchestrator:
                     "trail":  active.get("trailing_stop_loss"),
                     "sl":     active.get("initial_stop_loss"),
                     "qty":    active.get("quantity"),
+                    "hwm":    active.get("high_water_mark"),
+                    "score":  active.get("setup_score"),
+                    "target_spot":  active.get("structure_target_spot"),
+                    "target_label": active.get("structure_target_label"),
                 } if active else None),
                 "completed_trades":   self.completed_trades,
                 "why_no_trade":       (self._no_trade_diagnosis()
@@ -3739,12 +3843,22 @@ class TradingBotOrchestrator:
 
         is_paper = self.config['trading_flags']['paper_trading']
         logging.debug(f"Bot running in {'PAPER TRADING' if is_paper else 'LIVE TRADING'} mode.")
+        notify_push(self.config, "zAck — online",
+                    f"Bot entered the trading loop in "
+                    f"{'PAPER' if is_paper else 'LIVE'} mode.", tags="rocket")
         if resumed:
             self.bot_state = "IN_POSITION"
             logging.info("Resuming management of pre-existing position.")
 
         while self.is_market_open():
             try:
+                # KILL SWITCH — engaged from the phone dashboard. Flattens any
+                # open position at market and stops the loop. Date-stamped so a
+                # stale file from yesterday can never block today's session.
+                if self._kill_switch_engaged():
+                    await self._handle_kill_switch(is_paper)
+                    break
+
                 if self.bot_state == "AWAITING_SIGNAL":
                     # Refresh capital baseline so the daily-loss limit and
                     # downstream sizing reflect any mid-day deposits/withdrawals.

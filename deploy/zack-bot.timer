@@ -1,0 +1,10 @@
+[Unit]
+Description=Start zAck bot on trading mornings (08:45 IST; bot itself skips NSE holidays)
+
+[Timer]
+OnCalendar=Mon..Fri 08:45
+Persistent=true
+Unit=zack-bot.service
+
+[Install]
+WantedBy=timers.target

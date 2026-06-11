@@ -1,0 +1,7 @@
+[Unit]
+Description=Push a phone alert when the zAck bot service fails
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/zack_trading_bot
+ExecStart=%h/zack_trading_bot/deploy/notify_fail.sh
