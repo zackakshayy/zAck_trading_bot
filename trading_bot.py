@@ -24,7 +24,8 @@ from reporting import (
     send_loss_analysis_email, send_token_expiry_alert, send_weekly_report,
 )
 from loss_analyzer import build_loss_report
-from indicators import calculate_cpr, is_trend_overextended, check_momentum_divergence
+from indicators import (calculate_cpr, is_trend_overextended,
+                        check_momentum_divergence, check_candle_confirmation)
 from indicator_calculator import calculate_all_indicators
 from market_context import MarketConditionIdentifier
 from rag_service import RAGService
@@ -188,6 +189,9 @@ class TradingBotOrchestrator:
         # each setup(); CPR lives on position_agent.cpr_pivots; walls in _pcr_data.
         self._prev_day_high: float | None = None
         self._prev_day_low: float | None = None
+        # Daily-chart trend (20-DMA + slope), set each setup() from daily bars.
+        # The playbook rule: never buy options against the daily trend.
+        self._daily_trend: str = "UNKNOWN"
         # PCR slope tracking — a short rolling history of (timestamp, pcr) so the
         # bot can tell a RISING PCR (put writers adding = support building) from a
         # FALLING one (puts unwinding = support evaporating), not just the level.
@@ -1759,7 +1763,9 @@ class TradingBotOrchestrator:
                     try:
                         hist = await asyncio.to_thread(
                             self.kite.historical_data,
-                            token, today - datetime.timedelta(days=10), today, "day",
+                            # 100 calendar days ≈ 65 trading days: enough for the
+                            # 20-DMA daily-trend read AND the prior-day CPR row.
+                            token, today - datetime.timedelta(days=100), today, "day",
                         )
                         break
                     except Exception as fetch_err:
@@ -1774,7 +1780,8 @@ class TradingBotOrchestrator:
                 day_df = pd.DataFrame(hist or [])
                 if not day_df.empty:
                     day_df["date_only"] = pd.to_datetime(day_df["date"]).dt.date
-                    prior = day_df[day_df["date_only"] < today].tail(1)
+                    completed_days = day_df[day_df["date_only"] < today]
+                    prior = completed_days.tail(1)
                     if not prior.empty:
                         self.position_agent.cpr_pivots = calculate_cpr(prior)
                         # Stash prev-day extremes for the structure map (PDH/PDL).
@@ -1788,6 +1795,39 @@ class TradingBotOrchestrator:
                         logging.debug(
                             "No prior-day data; CPR-dependent strategies will skip."
                         )
+                    # DAILY TREND — the playbook's "never buy options against the
+                    # daily trend". Price vs 20-DMA plus the DMA's own slope:
+                    #   above a rising DMA  → BULLISH (CE-friendly)
+                    #   below a falling DMA → BEARISH (PE-friendly)
+                    #   anything mixed      → NEUTRAL (hugging/turning — half credit)
+                    self._daily_trend = "UNKNOWN"
+                    try:
+                        sc_cfg = self.config.get('setup_score') or {}
+                        _ma_n = int(sc_cfg.get('daily_trend_ma_period', 20))
+                        _slope_n = int(sc_cfg.get('daily_trend_slope_bars', 5))
+                        closes = completed_days['close'].astype(float)
+                        if len(closes) >= _ma_n + _slope_n:
+                            ma = closes.rolling(_ma_n).mean()
+                            ma_now = float(ma.iloc[-1])
+                            ma_then = float(ma.iloc[-1 - _slope_n])
+                            px = float(closes.iloc[-1])
+                            if px > ma_now and ma_now > ma_then:
+                                self._daily_trend = "BULLISH"
+                            elif px < ma_now and ma_now < ma_then:
+                                self._daily_trend = "BEARISH"
+                            else:
+                                self._daily_trend = "NEUTRAL"
+                            logging.info(
+                                f"[DailyTrend] {self._daily_trend} — close {px:.0f} vs "
+                                f"{_ma_n}-DMA {ma_now:.0f} ({'rising' if ma_now > ma_then else 'falling/flat'})."
+                            )
+                        else:
+                            logging.debug(
+                                f"[DailyTrend] insufficient history "
+                                f"({len(closes)} < {_ma_n + _slope_n} days) — UNKNOWN."
+                            )
+                    except Exception as _dt_exc:
+                        logging.debug(f"[DailyTrend] computation failed: {_dt_exc}")
                 else:
                     logging.warning("Empty daily history; CPR pivots unavailable.")
             except Exception as e:
@@ -2933,6 +2973,8 @@ class TradingBotOrchestrator:
         "exhaustion": 18,  # NOT buying into an RSI divergence (momentum exhaustion)
         "pcr_slope": 10,   # PCR rising/falling confirms the trade direction
         "flow_bias":  6,   # FII+DII T-1 institutional bias (tie-breaker)
+        "daily_trend": 20, # aligned with the daily chart (never fight the river)
+        "candle":    12,   # last-bar candle/wick confirmation at structure levels
     }
 
     async def _setup_score(self, signal: str, df, is_counter_sentiment: bool) -> tuple:
@@ -3040,6 +3082,46 @@ class TradingBotOrchestrator:
             if fb_dir is not None:
                 factors['flow_bias'] = (1.0 if fb_dir == signal else 0.0, w)
 
+        # 10. DAILY TREND — the playbook's "never buy options against the daily
+        #     trend". Heavy weight: opposed scores 0 (near-veto), aligned 1.0,
+        #     NEUTRAL (price hugging a flat DMA) half credit. UNKNOWN excluded.
+        #     Mean-reversion strategies are exempt — their whole premise is
+        #     fading a stretch, so the daily filter would paralyse range days.
+        w = float(weights.get('daily_trend', 20))
+        if w > 0 and not _is_mr:
+            dt = getattr(self, '_daily_trend', 'UNKNOWN')
+            if dt in ('BULLISH', 'BEARISH'):
+                aligned = (signal == 'BUY' and dt == 'BULLISH') or \
+                          (signal == 'SELL' and dt == 'BEARISH')
+                factors['daily_trend'] = (1.0 if aligned else 0.0, w)
+            elif dt == 'NEUTRAL':
+                factors['daily_trend'] = (0.5, w)
+
+        # 11. CANDLE CONFIRMATION at structure — entry timing from the last bar:
+        #     doji → wait (0), wick rejection AT a support/resistance level or a
+        #     strong agreeing candle → confirm (1), strong opposing candle → 0.
+        #     Unreadable bar → excluded. Structure says WHERE, the candle says WHEN.
+        w = float(weights.get('candle', 12))
+        if w > 0 and df is not None and len(getattr(df, 'index', [])) > 0:
+            try:
+                _spot = float(df['close'].iloc[-1])
+                _kw = self._structure_kwargs()
+                _sup = structure.nearest_target(_spot, 'SELL', **_kw)   # nearest level below
+                _res = structure.nearest_target(_spot, 'BUY', **_kw)    # nearest level above
+                _prox = float(cfg.get('candle_level_proximity_points', 10.0))
+                c_val, c_reason = check_candle_confirmation(
+                    df, signal,
+                    support=(_sup[0] if _sup else None),
+                    resistance=(_res[0] if _res else None),
+                    proximity=_prox,
+                )
+                if c_val is not None:
+                    factors['candle'] = (c_val, w)
+                    if c_val != 0.5:
+                        logging.debug(f"[Candle] {signal}: {c_reason} → {c_val:.1f}")
+            except Exception:
+                pass
+
         total_w = sum(wt for _, wt in factors.values())
         score = (100.0 * sum(v * wt for v, wt in factors.values()) / total_w) if total_w else 100.0
         full_above = float(cfg.get('size_full_above', 85))
@@ -3065,6 +3147,18 @@ class TradingBotOrchestrator:
             return True
         score, size_factor, breakdown = await self._setup_score(signal, df, is_counter_sentiment)
         threshold = float(cfg.get('entry_threshold', 65))
+        # LATE-WINDOW selectivity (playbook: "2:00 PM onward — high conviction
+        # only"). After late_window_start, the bar rises instead of slamming
+        # shut: only setups clearing the higher threshold may still enter.
+        _lw = self._parse_hhmm(cfg.get('late_window_start', '14:00'))
+        if _lw and datetime.datetime.now().time() >= _lw:
+            late_thr = float(cfg.get('late_window_threshold', 80))
+            if late_thr > threshold:
+                threshold = late_thr
+                logging.debug(
+                    f"[SetupScore] late window (≥{_lw.strftime('%H:%M')}) — "
+                    f"threshold raised to {threshold:.0f} (high conviction only)."
+                )
         self._last_score = score
         if score >= threshold:
             self._last_score_size = size_factor
@@ -3162,6 +3256,34 @@ class TradingBotOrchestrator:
             return "SELL"
         return None
 
+    def _is_daily_trend_opposed(self, signal: str) -> bool:
+        """
+        Hard daily-trend gate (playbook golden rule: NEVER buy options against
+        the daily chart). Blocks a BUY into a BEARISH daily trend and a SELL
+        into a BULLISH one. Mean-reversion strategies are exempt — fading a
+        stretch is their premise. NEUTRAL/UNKNOWN never blocks. Config:
+        setup_score.daily_trend_hard_block (true). The weighted daily_trend
+        score factor still applies when this is disabled.
+        """
+        cfg = (self.config.get('setup_score') or {})
+        if not cfg.get('daily_trend_hard_block', True):
+            return False
+        dt = getattr(self, '_daily_trend', 'UNKNOWN')
+        if dt not in ('BULLISH', 'BEARISH'):
+            return False
+        is_mr = (getattr(self.active_strategy, 'is_reversal_trade', False)
+                 or self.active_strategy_name in self._MEAN_REVERSION_STRATEGIES)
+        if is_mr:
+            return False
+        opposed = (signal == 'BUY' and dt == 'BEARISH') or \
+                  (signal == 'SELL' and dt == 'BULLISH')
+        if opposed:
+            logging.warning(
+                f"[DailyTrend] {signal} blocked — daily chart is {dt} "
+                f"(never buy options against the river)."
+            )
+        return opposed
+
     def _is_oi_wall_blocked(self, signal: str) -> bool:
         """
         Playbook OI-wall gate: don't buy CALLS into a heavy call-OI wall (where
@@ -3201,6 +3323,7 @@ class TradingBotOrchestrator:
         "reentry_cooldown":"re-entry guard — same direction was just exited (cooldown active)",
         "score_below_threshold": "setup score below entry threshold — confluence too weak",
         "trap":            "false-breakout trap detected — stop-hunt pattern",
+        "daily_trend":     "signal fights the daily-chart trend (never buy against the river)",
         "confirm_15m":     "15-min higher-timeframe didn't confirm the signal",
         "no_trade_window": "outside the entry window (pre-open / lunch / past cutoff)",
         "max_trades":      "daily max-trades already reached",
@@ -3843,6 +3966,9 @@ class TradingBotOrchestrator:
                         # Trap detection — manipulative fake-breakout: hard no.
                         elif not force_mode_now and self._is_false_breakout(signal, day_df_for_signal):
                             self._note_block("trap")  # already logged inside helper
+                        # Daily-trend golden rule — never buy against the daily chart.
+                        elif not force_mode_now and self._is_daily_trend_opposed(signal):
+                            self._note_block("daily_trend")  # logged inside helper
                         # ── WEIGHTED SETUP SCORE gate (replaces the AND-stack) ──
                         elif not (await self._score_gate(signal, day_df_for_signal,
                                                           is_counter_sentiment, force_mode_now)):

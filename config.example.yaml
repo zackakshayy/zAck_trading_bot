@@ -133,6 +133,16 @@ setup_score:
   structure_target_room_points: 25.0
   structure_room_atr_mult: 2.0
   pcr_slope_min: 0.01          # min |PCR change/min| for the slope factor to count
+  # Daily trend (playbook: never buy options against the daily chart).
+  daily_trend_ma_period: 20    # daily closes vs this DMA
+  daily_trend_slope_bars: 5    # DMA must also be rising/falling over these days
+  daily_trend_hard_block: true # HARD-block counter-daily-trend entries (mean-reversion exempt);
+                               # false = weighted score factor only
+  # Candle confirmation at structure levels (entry timing).
+  candle_level_proximity_points: 10.0  # wick must touch within this of the level
+  # Late-window selectivity (playbook: after 14:00 high-conviction only).
+  late_window_start: "14:00"
+  late_window_threshold: 80    # raised score bar after late_window_start
   weights:
     direction: 20
     htf_15m: 25
@@ -143,6 +153,8 @@ setup_score:
     exhaustion: 18           # penalise buying into an RSI divergence (momentum top/bottom)
     pcr_slope: 10            # PCR rising/falling confirms the trade direction
     flow_bias: 6            # FII+DII T-1 institutional bias (small tie-breaker)
+    daily_trend: 20          # aligned with the daily chart trend (near-veto when opposed)
+    candle: 12               # last-bar candle/wick confirmation at structure levels
 # Structure-target EXIT: bank the move at the nearest favourable S/R level the
 # market actually offered, instead of giving it back to the trail. Scales out a
 # slice if >1 lot held, then breakeven stop + tight trail on the runner.

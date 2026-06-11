@@ -142,6 +142,75 @@ def check_momentum_divergence(price_series: pd.Series, oscillator_series: pd.Ser
 
     return "None"
 
+def check_candle_confirmation(df: pd.DataFrame, signal: str,
+                              support: float = None, resistance: float = None,
+                              proximity: float = 10.0):
+    """
+    Candle-quality read of the LAST bar, used as entry timing at structure levels.
+    Playbook semantics (5-min chart):
+      • Doji / indecision (tiny body)                  → WAIT       (0.0)
+      • Strong directional candle agreeing with signal → CONFIRM    (1.0)
+        (extra-strong when it CLOSES through the nearby level)
+      • Long lower wick AT support  + BUY  signal      → CONFIRM    (1.0)  [bounce]
+      • Long upper wick AT resistance + SELL signal    → CONFIRM    (1.0)  [rejection]
+      • Strong candle AGAINST the signal               → CONTRA     (0.0)
+      • Anything else                                  → NEUTRAL    (0.5)
+
+    Returns (value, reason) where value ∈ {0.0, 0.5, 1.0}; returns (None, reason)
+    when the bar can't be read (missing columns / zero range) so the caller can
+    EXCLUDE the factor rather than penalise.
+    """
+    try:
+        bar = df.iloc[-1]
+        o, h, l, c = float(bar['open']), float(bar['high']), float(bar['low']), float(bar['close'])
+    except Exception:
+        return None, "bar unreadable (missing OHLC)"
+    rng = h - l
+    if rng <= 0:
+        return None, "zero-range bar"
+
+    body = abs(c - o)
+    body_frac = body / rng
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    is_green = c > o
+
+    # 1. Doji / indecision: tiny body relative to range → wait.
+    if body_frac < 0.25:
+        # ... unless the wick itself is the signal: a hammer at support / a
+        # shooting star at resistance is a CONFIRMING rejection, not indecision.
+        near_support = support is not None and abs(l - float(support)) <= proximity
+        near_resistance = resistance is not None and abs(h - float(resistance)) <= proximity
+        if signal == 'BUY' and near_support and lower_wick >= 0.5 * rng:
+            return 1.0, f"hammer: long lower wick rejecting support {support:.0f}"
+        if signal == 'SELL' and near_resistance and upper_wick >= 0.5 * rng:
+            return 1.0, f"shooting star: upper wick rejecting resistance {resistance:.0f}"
+        return 0.0, "doji/indecision bar — wait"
+
+    # 2. Wick rejection at a structure level (body need not be tiny).
+    if signal == 'BUY' and support is not None:
+        if abs(l - float(support)) <= proximity and lower_wick >= 2.0 * body and lower_wick >= 0.4 * rng:
+            return 1.0, f"long lower wick bounce off support {support:.0f}"
+    if signal == 'SELL' and resistance is not None:
+        if abs(h - float(resistance)) <= proximity and upper_wick >= 2.0 * body and upper_wick >= 0.4 * rng:
+            return 1.0, f"long upper wick rejection at resistance {resistance:.0f}"
+
+    # 3. Strong directional candle (body dominates the range).
+    if body_frac >= 0.6:
+        agrees = (signal == 'BUY' and is_green) or (signal == 'SELL' and not is_green)
+        if agrees:
+            # Closing THROUGH the nearby level = breakout confirmation.
+            if signal == 'BUY' and resistance is not None and c > float(resistance) >= l:
+                return 1.0, f"strong green close above resistance {resistance:.0f}"
+            if signal == 'SELL' and support is not None and c < float(support) <= h:
+                return 1.0, f"strong red close below support {support:.0f}"
+            return 1.0, "strong directional candle agrees"
+        return 0.0, "strong candle AGAINST the signal"
+
+    # 4. Ordinary bar: neither confirming nor contradicting.
+    return 0.5, "no decisive candle"
+
+
 def is_trend_overextended(day_df: pd.DataFrame, lookback: int = 20, percent_move: float = 0.01, rsi_high: int = 70, rsi_low: int = 30):
     """Quantitatively defines an overextended trend."""
     if len(day_df) < lookback:
