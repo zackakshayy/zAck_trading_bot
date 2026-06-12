@@ -121,6 +121,7 @@ def persist_access_token(token: str, env_path: str = '.env'):
         lines.append(f'ZERODHA_ACCESS_TOKEN={token}\n')
     with open(env_path, 'w') as f:
         f.writelines(lines)
+    os.chmod(env_path, 0o600)  # owner-only: .env holds live credentials
     os.environ['ZERODHA_ACCESS_TOKEN'] = token
 
 class _StatusLineAwareHandler(logging.StreamHandler):
@@ -156,7 +157,10 @@ class TradingBotOrchestrator:
     """
     def __init__(self, config, manual_mode: bool = False):
         self.config = config
-        self.kite = KiteConnect(api_key=config['zerodha']['api_key'], timeout=120, debug=True)
+        # debug=True logs full HTTP requests/responses (token-bearing URLs) —
+        # never in normal runs. Opt in explicitly with KITE_DEBUG=1 when needed.
+        self.kite = KiteConnect(api_key=config['zerodha']['api_key'], timeout=120,
+                                debug=bool(os.environ.get('KITE_DEBUG')))
         self.active_strategy_name = "None"
         self.active_strategy = None
         # Manual strategy selection mode (--manual flag).
@@ -415,7 +419,10 @@ class TradingBotOrchestrator:
             return bool(tok and self._adopt_access_token(tok))
 
         if not request_token_override:
-            logging.info(f"Login URL: {self.kite.login_url()}")
+            # Print (don't log) the login URL: it carries the api_key as a query
+            # param, and log files shouldn't accumulate credential-bearing URLs.
+            print(f"\nLogin URL: {self.kite.login_url()}")
+            logging.info("Login URL printed to terminal (not logged — contains api_key).")
             request_token = input("Enter request_token: ")
         else:
             request_token = request_token_override
@@ -611,11 +618,21 @@ class TradingBotOrchestrator:
         return sig_dir != "NEUTRAL" and sig_dir == self._dir_of(self.day_sentiment)
 
     async def _current_vix(self) -> float:
-        """Best-effort live India VIX (0.0 on failure)."""
+        """Best-effort live India VIX (0.0 on failure). Cached for 10 s — the
+        gate checks, regime read and mode evaluation all consult VIX within the
+        same tick, and 2-3 separate LTP calls per iteration burned API quota
+        for identical data."""
+        now = time.monotonic()
+        cached_at, cached_vix = getattr(self, '_vix_cache', (0.0, 0.0))
+        if cached_vix > 0 and (now - cached_at) < 10.0:
+            return cached_vix
         try:
             tok = self.market_condition_identifier.vix_token
             data = await asyncio.to_thread(self.kite.ltp, str(tok))
-            return float((data or {}).get(str(tok), {}).get('last_price', 0) or 0)
+            vix = float((data or {}).get(str(tok), {}).get('last_price', 0) or 0)
+            if vix > 0:
+                self._vix_cache = (now, vix)
+            return vix
         except Exception:
             return 0.0
 
@@ -806,7 +823,7 @@ class TradingBotOrchestrator:
         # 3. Automated news-sentiment regime flip (BULL <-> BEAR)
         if cfg.get('on_sentiment_flip', True) and self._sentiment_baseline_auto:
             try:
-                new_auto = self.sentiment_agent.get_market_sentiment()
+                new_auto = await asyncio.to_thread(self.sentiment_agent.get_market_sentiment)
                 def _regime(s):
                     if s in ('Bullish', 'Very Bullish'): return 'BULL'
                     if s in ('Bearish', 'Very Bearish'): return 'BEAR'
@@ -847,7 +864,8 @@ class TradingBotOrchestrator:
             logging.debug(f"Could not snapshot baseline VIX: {e}")
             self._sentiment_baseline_vix = None
         try:
-            self._sentiment_baseline_auto = self.sentiment_agent.get_market_sentiment()
+            self._sentiment_baseline_auto = await asyncio.to_thread(
+                self.sentiment_agent.get_market_sentiment)
         except Exception as e:
             logging.debug(f"Could not snapshot baseline auto-sentiment: {e}")
             self._sentiment_baseline_auto = None
@@ -1205,9 +1223,7 @@ class TradingBotOrchestrator:
         if max_vix <= 0:
             return False
         try:
-            vix_token = self.market_condition_identifier.vix_token
-            ltp_data = await asyncio.to_thread(self.kite.ltp, str(vix_token))
-            vix = ltp_data[str(vix_token)]['last_price']
+            vix = await self._current_vix()   # 10s-cached — no duplicate LTP call
             if vix > max_vix:
                 logging.warning(f"VIX gate: {vix:.2f} > max {max_vix}. Blocking new entries.")
                 return True
@@ -1661,19 +1677,23 @@ class TradingBotOrchestrator:
                     and bars_for_selector is not None and not bars_for_selector.empty:
                 try:
                     _dq = self._classify_day_quality(bars_for_selector)
-                    _vix = await self._current_vix()
+                    # VIX and FII are independent network fetches — run them
+                    # concurrently instead of back-to-back (saves 1-2 s of
+                    # setup latency on every reassessment).
+                    _vix, _fii = await asyncio.gather(
+                        self._current_vix(),
+                        asyncio.to_thread(fetch_fii_bias, self.config),
+                        return_exceptions=True,
+                    )
+                    _vix = _vix if isinstance(_vix, (int, float)) else 0.0
                     self._today_vix = _vix
-                    # Best-effort FII positioning (informational; never gates).
-                    try:
-                        self._fii_bias = await asyncio.to_thread(fetch_fii_bias, self.config)
-                        if self._fii_bias:
-                            logging.info(
-                                f"[FII] {self._fii_bias.get('bias')} "
-                                f"(net={self._fii_bias.get('net_index_futures')}, "
-                                f"src={self._fii_bias.get('source')})"
-                            )
-                    except Exception:
-                        self._fii_bias = None
+                    self._fii_bias = _fii if isinstance(_fii, dict) else None
+                    if self._fii_bias:
+                        logging.info(
+                            f"[FII] {self._fii_bias.get('bias')} "
+                            f"(net={self._fii_bias.get('net_index_futures')}, "
+                            f"src={self._fii_bias.get('source')})"
+                        )
                     _evt_today = next(
                         (str(c) for c in todays_conditions if str(c).startswith('EVENT_')), None
                     )
@@ -2569,7 +2589,7 @@ class TradingBotOrchestrator:
 
         # 2. Automated read.
         try:
-            automated = self.sentiment_agent.get_market_sentiment()
+            automated = await asyncio.to_thread(self.sentiment_agent.get_market_sentiment)
         except Exception as e:
             logging.warning(f"Automated sentiment failed ({e}); defaulting to 'Neutral'.")
             automated = "Neutral"

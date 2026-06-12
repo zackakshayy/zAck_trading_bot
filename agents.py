@@ -1561,14 +1561,26 @@ class PositionManagementAgent:
 
         # 2. Pull current premium for trailing/software-SL/indicator checks.
         #    For a debit spread, current_price = long LTP − short LTP (net spread value).
-        current_price = safe_ltp(self.kite, f"NFO:{symbol}")
+        #    ONE batched, thread-wrapped ltp call for both legs: the previous two
+        #    sequential sync calls blocked the event loop and doubled API usage
+        #    on every manage() tick (the hottest path in the whole bot).
+        long_key = f"NFO:{symbol}"
+        short_sym = (self.active_trade.get("spread_short_symbol")
+                     if self.active_trade.get("is_spread") else None)
+        ltp_keys = [long_key] + ([f"NFO:{short_sym}"] if short_sym else [])
+        try:
+            ltp_data = await asyncio.to_thread(self.kite.ltp, ltp_keys)
+        except Exception as e:
+            logging.warning(f"LTP fetch failed for {symbol} ({e}); staying ACTIVE.")
+            return "ACTIVE"
+        current_price = (ltp_data or {}).get(long_key, {}).get("last_price")
         if current_price is None:
             logging.warning(f"Could not fetch LTP for {symbol}; staying ACTIVE.")
             return "ACTIVE"
+        current_price = float(current_price)
 
-        if self.active_trade.get("is_spread"):
-            short_sym   = self.active_trade.get("spread_short_symbol")
-            short_price = safe_ltp(self.kite, f"NFO:{short_sym}") if short_sym else None
+        if short_sym:
+            short_price = (ltp_data or {}).get(f"NFO:{short_sym}", {}).get("last_price")
             if short_price is not None:
                 current_price = max(0.0, float(current_price) - float(short_price))
             # If short LTP is unavailable, fall back to long LTP only (conservative).
@@ -2416,10 +2428,17 @@ class PositionManagementAgent:
         try:
             from notify import send_push
             _emoji = "moneybag" if net_pnl >= 0 else "small_red_triangle_down"
-            send_push(self.config,
-                      f"zAck — exit {'+' if net_pnl >= 0 else ''}₹{net_pnl:,.0f}",
-                      f"{trade['symbol']} closed ({exit_reason}). "
-                      f"Net ₹{net_pnl:,.2f} after ₹{costs:,.0f} costs.", tags=_emoji)
+            # Privacy: pushes transit the configured ntfy server (public ntfy.sh
+            # by default). ntfy.include_pnl: false strips rupee amounts and sends
+            # only the direction; the topic name remains the only credential.
+            if (self.config.get('ntfy') or {}).get('include_pnl', True):
+                _title = f"zAck — exit {'+' if net_pnl >= 0 else ''}₹{net_pnl:,.0f}"
+                _body = (f"{trade['symbol']} closed ({exit_reason}). "
+                         f"Net ₹{net_pnl:,.2f} after ₹{costs:,.0f} costs.")
+            else:
+                _title = f"zAck — exit {'profit' if net_pnl >= 0 else 'loss'}"
+                _body = f"{trade['symbol']} closed ({exit_reason})."
+            send_push(self.config, _title, _body, tags=_emoji)
         except Exception:
             pass
 

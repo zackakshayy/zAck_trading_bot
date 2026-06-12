@@ -601,6 +601,7 @@ ntfy:
   enable: false
   topic: ""
   server: "https://ntfy.sh"
+  include_pnl: true   # false = pushes say only profit/loss, no rupee amounts
 
 # Mobile dashboard (dashboard.py). token gates all data endpoints; control_pin
 # gates the Arm/Kill buttons (empty = controls disabled). Env DASHBOARD_TOKEN
