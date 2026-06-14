@@ -744,6 +744,8 @@ class OrderExecutionAgent:
             "entry_time":  datetime.datetime.now().isoformat(),
             "is_spread":   is_spread,
         }
+        if getattr(self, "_last_pick_greeks", None):
+            trade_dict["greeks_entry"] = self._last_pick_greeks
         if is_spread:
             trade_dict.update({
                 "spread_short_symbol":      short_symbol,
@@ -837,6 +839,8 @@ class OrderExecutionAgent:
             "entry_time":  datetime.datetime.now().isoformat(),
             "is_spread":   is_spread,
         }
+        if getattr(self, "_last_pick_greeks", None):
+            trade_dict["greeks_entry"] = self._last_pick_greeks
         if is_spread:
             trade_dict.update({
                 "spread_short_symbol":      short_symbol,
@@ -1085,9 +1089,30 @@ class OrderExecutionAgent:
             logging.warning(f"Chain analysis: zero reference price for {chosen['tradingsymbol']}.")
             return None
 
+        # Phase 1 — capture the chosen strike's greeks (already computed in the
+        # chain snapshot) so the trade carries delta/gamma/theta/vega/IV through
+        # to logs, the dashboard snapshot and the journal. Foundation for the
+        # theta-budget gate and greek P&L attribution.
+        def _gf(v):
+            try:
+                return round(float(v), 6) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        self._last_pick_greeks = {
+            "delta": _gf(chosen.get("delta")),
+            "gamma": _gf(chosen.get("gamma")),
+            "theta": _gf(chosen.get("theta")),
+            "vega":  _gf(chosen.get("vega")),
+            "iv":    _gf(chosen.get("iv")),
+            "strike": _gf(chosen.get("strike")),
+        }
+
         return chosen["tradingsymbol"], lot_size, ref_price
 
     async def _get_trade_details(self, direction, force_mode: bool = False):
+        # Cleared each attempt; the chain pick (re)populates it. A legacy/offset
+        # pick has no chain greeks, so it correctly stays None.
+        self._last_pick_greeks = None
         try:
             # Fetch underlying LTP and margins concurrently — independent calls.
             underlying_key = str(self.underlying_token)
@@ -1443,6 +1468,14 @@ class PositionManagementAgent:
             f"hard_SL={sl_price:.2f} partial_exits={'ON' if pe_eligible else 'OFF'} "
             f"entry_spot={self.active_trade.get('_entry_spot', 0):.2f}"
         )
+        _ge = self.active_trade.get('greeks_entry') or {}
+        if _ge:
+            _theta_day = (_ge.get('theta') or 0) * int(self.active_trade.get('quantity', 0) or 0)
+            logging.info(
+                f"[Greeks] entry δ={_ge.get('delta')} γ={_ge.get('gamma')} "
+                f"θ={_ge.get('theta')}/day vega={_ge.get('vega')} IV={_ge.get('iv')} "
+                f"· position theta ≈ ₹{_theta_day:.0f}/day"
+            )
         self._save_state()
 
     async def attach_broker_stop_loss(self, order_agent: OrderExecutionAgent):
@@ -2465,6 +2498,15 @@ class PositionManagementAgent:
             "initial_stop_loss": trade.get("initial_stop_loss"),
             "lot_size": trade.get("lot_size"),
         }
+        # Phase 1 — greeks captured at entry, journaled for later P&L attribution.
+        _ge = trade.get("greeks_entry") or {}
+        completed.update({
+            "EntryDelta": _ge.get("delta"),
+            "EntryGamma": _ge.get("gamma"),
+            "EntryTheta": _ge.get("theta"),
+            "EntryVega":  _ge.get("vega"),
+            "EntryIV":    _ge.get("iv"),
+        })
         if costs:
             logging.info(
                 f"[Costs] {trade['symbol']}: gross ₹{gross_pnl:,.2f} − costs "

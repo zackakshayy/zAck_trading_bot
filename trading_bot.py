@@ -2222,6 +2222,7 @@ class TradingBotOrchestrator:
                     "score":  active.get("setup_score"),
                     "target_spot":  active.get("structure_target_spot"),
                     "target_label": active.get("structure_target_label"),
+                    "greeks": active.get("greeks_entry"),
                 } if active else None),
                 "completed_trades":   self.completed_trades,
                 "why_no_trade":       (self._no_trade_diagnosis()
@@ -4267,6 +4268,8 @@ class TradingBotOrchestrator:
                             'vix':      round(float(getattr(self, '_today_vix', 0) or 0), 2),
                             'iv_percentile': getattr(getattr(self, 'order_agent', None), '_last_iv_percentile', None),
                             'fii_bias': (self._fii_bias or {}).get('bias') if self._fii_bias else None,
+                            'entry_iv':    status.get('EntryIV'),
+                            'entry_delta': status.get('EntryDelta'),
                         })
                         self._persist_ledger()   # survive same-day restarts
                         # Record the exit so the re-entry guard can stop the bot

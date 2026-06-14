@@ -81,7 +81,8 @@ def log_trade(trade_details):
         else:
             trade_details['ProfitLoss_Pct'] = 0.0
 
-        all_columns = ['Timestamp', 'OrderID', 'Symbol', 'TradeType', 'EntryPrice', 'ExitPrice', 'Quantity', 'ProfitLoss', 'ProfitLoss_Pct', 'Status', 'Strategy', 'Rationale']
+        all_columns = ['Timestamp', 'OrderID', 'Symbol', 'TradeType', 'EntryPrice', 'ExitPrice', 'Quantity', 'ProfitLoss', 'ProfitLoss_Pct', 'Status', 'Strategy', 'Rationale',
+                       'EntryDelta', 'EntryGamma', 'EntryTheta', 'EntryVega', 'EntryIV']
         
         # Ensure all keys exist in the dictionary to prevent errors
         for col in all_columns:
