@@ -247,6 +247,28 @@ def select_by_delta(chain_df: pd.DataFrame, option_type: str,
     return pool.sort_values("dist").iloc[0]
 
 
+def select_by_gamma_theta(chain_df: pd.DataFrame, option_type: str,
+                           delta_low: float, delta_high: float) -> Optional[pd.Series]:
+    """
+    Phase 5b — pick the strike with the best CONVEXITY PER UNIT OF DECAY
+    (gamma / |theta|) within the delta band. A long buyer wants the most gamma
+    (the move-capturing term) for the least theta (the rent). Restricted to the
+    same sane delta band as select_by_delta so it never drifts to a deep-OTM
+    lottery ticket or a deep-ITM no-gamma strike. Returns None without greeks.
+    """
+    if chain_df is None or chain_df.empty:
+        return None
+    df = chain_df[chain_df["instrument_type"] == option_type].copy()
+    df = df[df["delta"].notna() & df["gamma"].notna() & df["theta"].notna()]
+    if df.empty:
+        return None
+    df["abs_delta"] = df["delta"].abs()
+    band = df[(df["abs_delta"] >= delta_low) & (df["abs_delta"] <= delta_high)]
+    pool = (band if not band.empty else df).copy()
+    pool["gt"] = pool["gamma"] / pool["theta"].abs().clip(lower=1e-9)
+    return pool.sort_values("gt", ascending=False).iloc[0]
+
+
 def passes_liquidity(row: pd.Series, max_spread_pct: float, min_oi: int,
                       max_age_seconds: float) -> tuple:
     """Returns (ok: bool, reason: Optional[str]) — reason set only when ok=False."""

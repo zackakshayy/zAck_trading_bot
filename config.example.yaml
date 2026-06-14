@@ -543,6 +543,7 @@ option_filters:
   use_delta_targeting: true
   target_delta_low: 0.40
   target_delta_high: 0.55
+  use_gamma_theta_strike: false   # Phase 5b: pick max gamma/|theta| in the delta band (else delta-midpoint)
   # Risk-free rate used in Black-Scholes (India 10-yr ~7%).
   risk_free_rate: 0.07
   # How many strikes each side of ATM to fetch for the snapshot.
@@ -583,6 +584,35 @@ premarket_briefing:
   enable: true
   components: ["HDFCBANK", "RELIANCE", "ICICIBANK", "INFY", "TCS"]
   event_lookahead_days: 3
+# Phase 2 — theta-budget gate: refuse a long option whose expected (realized-vol)
+# move can't out-earn its decay before the hard time-exit. Skips when the
+# expected-gain / theta-cost ratio falls below the minimum. Graceful-bypass on
+# missing greeks/vol; force-mode bypasses.
+theta_budget:
+  enable: true
+  max_theta_pct_of_premium: 0.30  # skip if decay over the window > this % of premium
+  expiry_dte_exempt: 1            # DTE <= this is exempt (high theta is intended there)
+  trading_hours_per_day: 6.25     # NSE 09:15-15:30 — for the informational move/theta ratio
+# Phase 4 — skew gate: NIFTY puts are structurally dearer (crash-hedge demand);
+# don't overpay for the rich side. Skips when the 25-delta skew of the side being
+# bought exceeds this (in IV points; 0.04 = 4 vol points).
+skew_gate:
+  enable: true
+  max_adverse_skew: 0.04
+# Phase 4 — event-implied-move gate (event days only): if realized-vol's expected
+# move is far below the ATM straddle-implied move, the catalyst is already priced
+# in and buying it is a vega-crush bet. Quantifies the old binary pre-event sit-out.
+event_move_gate:
+  enable: true
+  min_expected_to_implied: 0.7
+# Phase 5a — gamma-scalp the winner: once estimated delta (entry δ + γ·move) grows
+# past delta_trigger on a WINNING trade, peel a slice and tighten the trail to lock
+# the convexity. Only acts with >1 lot held. Off by default (most aggressive).
+gamma_scalp:
+  enable: false
+  delta_trigger: 0.75
+  scale_out_pct: 50
+  tight_trail_pct: 10.0
 zerodha:
   access_token: ${ZERODHA_ACCESS_TOKEN}
   api_key: ${ZERODHA_API_KEY}

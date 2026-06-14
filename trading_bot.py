@@ -2432,6 +2432,16 @@ class TradingBotOrchestrator:
         if self._report_sent:
             return
         self._report_sent = True
+        # Phase 3 — greek P&L attribution breakdown for the day. Tells you whether
+        # today's edge came from direction/gamma (repeatable) or vega (vol luck).
+        attr = getattr(self, '_greek_attr_today', None)
+        if attr and any(abs(v) > 0.01 for v in attr.values()):
+            logging.info(
+                "[GreekAttribution] today's P&L by source — "
+                f"delta ₹{attr['delta']:,.0f} · gamma ₹{attr['gamma']:,.0f} · "
+                f"theta ₹{attr['theta']:,.0f} · vega ₹{attr['vega']:,.0f} · "
+                f"residual ₹{attr['residual']:,.0f}"
+            )
         try:
             send_daily_report(self.config, str(datetime.date.today()))
             logging.info("Daily report sent.")
@@ -4155,10 +4165,14 @@ class TradingBotOrchestrator:
 
                             # (15m confirmation is now a weighted factor inside the
                             # setup score — it no longer hard-blocks entries.)
+                            # Event day → the event-implied-move gate (Phase 4) checks
+                            # whether the catalyst is already priced into the straddle.
+                            _event_day = any(str(c).startswith('EVENT_')
+                                             for c in (getattr(self, 'todays_conditions', set()) or set()))
                             trade_details = (
-                                await self.order_agent.place_trade(signal, force_mode=force_mode_now)
+                                await self.order_agent.place_trade(signal, force_mode=force_mode_now, event_day=_event_day)
                                 if not is_paper
-                                else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now)
+                                else await self.order_agent.get_paper_trade_details(signal, force_mode=force_mode_now, event_day=_event_day)
                             )
                             if trade_details:
                                 trade_details['Strategy'] = self.active_strategy_name
@@ -4271,6 +4285,16 @@ class TradingBotOrchestrator:
                             'entry_iv':    status.get('EntryIV'),
                             'entry_delta': status.get('EntryDelta'),
                         })
+                        # Phase 3 — accumulate greek P&L attribution for the EOD breakdown.
+                        if not hasattr(self, '_greek_attr_today'):
+                            self._greek_attr_today = {'delta': 0.0, 'gamma': 0.0,
+                                                      'theta': 0.0, 'vega': 0.0, 'residual': 0.0}
+                        for _k, _col in (('delta', 'PnlDelta'), ('gamma', 'PnlGamma'),
+                                         ('theta', 'PnlTheta'), ('vega', 'PnlVega'),
+                                         ('residual', 'PnlResidual')):
+                            _v = status.get(_col)
+                            if _v is not None:
+                                self._greek_attr_today[_k] += float(_v)
                         self._persist_ledger()   # survive same-day restarts
                         # Record the exit so the re-entry guard can stop the bot
                         # from instantly re-buying the same direction it just got

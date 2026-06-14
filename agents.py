@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import math
 import time
 from typing import Optional
 
@@ -43,9 +44,11 @@ from option_chain import (
     build_chain_snapshot,
     fetch_chain_quote,
     find_atm_row,
+    implied_vol,
     passes_liquidity,
     realized_vol,
     select_by_delta,
+    select_by_gamma_theta,
 )
 from rag_service import RAGService
 
@@ -605,7 +608,7 @@ class OrderExecutionAgent:
 
     # ---------- entry ----------
 
-    async def place_trade(self, direction, force_mode: bool = False):
+    async def place_trade(self, direction, force_mode: bool = False, event_day: bool = False):
         """
         Places a LIMIT entry and returns a trade dict.
 
@@ -619,7 +622,7 @@ class OrderExecutionAgent:
         Falls back to a naked long option if the short leg is unavailable.
         `force_mode=True` propagates to chain analysis so IVR / IV-RV gates are bypassed.
         """
-        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
+        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode, event_day=event_day)
         if not symbol or not qty:
             return None
 
@@ -797,8 +800,8 @@ class OrderExecutionAgent:
         access_token = self.config["zerodha"]["access_token"]
         return await asyncio.to_thread(_execute_order_sync, api_key, access_token, sl_params)
 
-    async def get_paper_trade_details(self, direction, force_mode: bool = False):
-        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode)
+    async def get_paper_trade_details(self, direction, force_mode: bool = False, event_day: bool = False):
+        symbol, qty, lot_size = await self._get_trade_details(direction, force_mode=force_mode, event_day=event_day)
         if not symbol or not qty:
             return None
         ltp = safe_ltp(self.kite, f"NFO:{symbol}")
@@ -889,9 +892,177 @@ class OrderExecutionAgent:
         ]
         return df["tradingsymbol"].tolist()
 
+    async def _theta_budget_ok(self, spot, greeks, ref_price, dte_days, force_mode) -> bool:
+        """
+        Phase 2 — theta-budget gate. The decay you'll pay over the holding window
+        (entry → hard time-exit) must be a SANE fraction of the premium you're
+        paying. theta_cost = |theta/day| × (hours_left/24); theta_pct =
+        theta_cost / premium. When theta_pct exceeds max_theta_pct_of_premium the
+        option bleeds too fast for the time it has — skip. NEAR-EXPIRY (DTE ≤
+        expiry_dte_exempt) is exempt: high theta there is intentional (the
+        gamma-scalp is built for it). The expected-move-vs-theta ratio (realized
+        vol) is logged as decision context but is a loose floor only.
+        Graceful-bypass on missing data; force-mode bypasses.
+        """
+        cfg = (self.config.get("theta_budget") or {})
+        if not cfg.get("enable", True):
+            return True
+        theta = greeks.get("theta")
+        delta = greeks.get("delta")
+        if not theta or not ref_price or ref_price <= 0:
+            return True  # can't evaluate → don't block
+        try:
+            het = str((self.flags or {}).get("hard_exit_time", "14:00"))
+            hh, mm = (int(x) for x in het.split(":"))
+            now = datetime.datetime.now()
+            exit_dt = datetime.datetime.combine(now.date(), datetime.time(hh, mm))
+            hours_left = (exit_dt - now).total_seconds() / 3600.0
+        except Exception:
+            return True
+        if hours_left <= 0:
+            return True  # the no-trade window already handles this
+
+        theta_cost = abs(theta) * (hours_left / 24.0)        # premium points lost to decay
+        theta_pct = theta_cost / ref_price                   # as a fraction of premium
+
+        # Informational: expected realized-vol move over the window vs the decay.
+        ratio = None
+        try:
+            bars = await self._fetch_daily_bars()
+            rv = realized_vol(bars.sort_values("date")["close"].reset_index(drop=True),
+                              int((self.config.get("option_filters") or {}).get("rv_lookback_days", 20))) \
+                if (bars is not None and not bars.empty) else None
+            if rv and delta and theta_cost > 0:
+                trading_hours = float(cfg.get("trading_hours_per_day", 6.25))
+                t_years = (hours_left / trading_hours) / 252.0
+                expected_move = spot * rv * math.sqrt(max(t_years, 1e-12))
+                ratio = (abs(delta) * expected_move) / theta_cost
+        except Exception:
+            ratio = None
+
+        self._last_theta_budget = {
+            "hours_left": round(hours_left, 2),
+            "theta_cost_pts": round(theta_cost, 2),
+            "theta_pct": round(theta_pct, 3),
+            "move_ratio": round(ratio, 2) if ratio is not None else None,
+            "dte": dte_days,
+        }
+
+        exempt_dte = int(cfg.get("expiry_dte_exempt", 1))
+        if dte_days is not None and dte_days <= exempt_dte:
+            logging.info(f"Theta-budget: {dte_days}-DTE exempt (high theta intended) — "
+                         f"theta {theta_cost:.1f}pt = {theta_pct*100:.0f}% of premium.")
+            return True
+
+        max_pct = float(cfg.get("max_theta_pct_of_premium", 0.30))
+        if theta_pct > max_pct:
+            if force_mode:
+                logging.warning(f"FORCE-MODE: theta-budget gate BYPASSED "
+                                f"(theta {theta_pct*100:.0f}% > {max_pct*100:.0f}%).")
+                return True
+            logging.warning(
+                f"Theta-budget gate: decay over {hours_left:.1f}h = {theta_cost:.1f}pt "
+                f"= {theta_pct*100:.0f}% of the {ref_price:.0f} premium "
+                f"(> {max_pct*100:.0f}%). Bleeds too fast — skipping."
+                + (f" [move/theta {ratio:.1f}×]" if ratio is not None else "")
+            )
+            return False
+        logging.info(
+            f"Theta-budget OK: decay {theta_cost:.1f}pt = {theta_pct*100:.0f}% of premium"
+            + (f", move/theta {ratio:.1f}×." if ratio is not None else ".")
+        )
+        return True
+
+    @staticmethod
+    def _nearest_by_delta(df, target_abs_delta: float):
+        if df is None or df.empty:
+            return None
+        d = df[df["iv"].notna() & df["delta"].notna()].copy()
+        if d.empty:
+            return None
+        d["dd"] = (d["delta"].abs() - target_abs_delta).abs()
+        return d.sort_values("dd").iloc[0]
+
+    def _vol_surface_ok(self, chain, spot, atm_strike, option_type,
+                        T_years, event_day, force_mode) -> bool:
+        """
+        Phase 4 — two vol-surface gates from the chain the bot already fetched:
+
+        SKEW gate (always on): NIFTY puts are structurally dearer (crash-hedging
+        demand). Buying the rich side overpays for vol. Compute 25-delta put vs
+        call IV; if the side we're buying is richer than max_adverse_skew (in
+        vol points), demand more — skip unless forced.
+
+        EVENT-MOVE gate (event days only): the ATM straddle prices the move the
+        market expects to expiry. If realized-vol's expected move is far below
+        that, the catalyst is already priced in → buying it is a vega-crush bet.
+        Skip when expected/implied < min_expected_to_implied. Quantifies the old
+        binary pre-event sit-out. Graceful-bypass on missing data.
+        """
+        self._last_skew = None
+        self._last_implied_move = None
+        try:
+            ce = chain[chain["instrument_type"] == "CE"]
+            pe = chain[chain["instrument_type"] == "PE"]
+
+            # --- skew ---
+            sk_cfg = (self.config.get("skew_gate") or {})
+            if sk_cfg.get("enable", True):
+                c25 = self._nearest_by_delta(ce, 0.25)
+                p25 = self._nearest_by_delta(pe, 0.25)
+                if c25 is not None and p25 is not None:
+                    skew = float(p25["iv"]) - float(c25["iv"])  # >0 = puts richer
+                    self._last_skew = round(skew, 4)
+                    max_adverse = float(sk_cfg.get("max_adverse_skew", 0.04))
+                    # We buy CE on BUY (option_type CE), PE on SELL.
+                    buying_rich = ((option_type == "PE" and skew > max_adverse) or
+                                   (option_type == "CE" and -skew > max_adverse))
+                    if buying_rich:
+                        if force_mode:
+                            logging.warning(f"FORCE-MODE: skew gate BYPASSED (skew {skew:+.3f}).")
+                        else:
+                            logging.warning(
+                                f"Skew gate: buying the rich side — 25Δ skew {skew:+.3f} "
+                                f"(> {max_adverse}) for a {option_type}. Overpaying vol — skipping."
+                            )
+                            return False
+
+            # --- event-implied move ---
+            ev_cfg = (self.config.get("event_move_gate") or {})
+            if ev_cfg.get("enable", True) and event_day:
+                atm_ce = self._nearest_by_delta(ce, 0.50)
+                atm_pe = self._nearest_by_delta(pe, 0.50)
+                if atm_ce is not None and atm_pe is not None:
+                    def _px(r):
+                        return float(r["mid"]) if r.get("mid") and r["mid"] > 0 else float(r.get("last") or 0)
+                    straddle = _px(atm_ce) + _px(atm_pe)
+                    implied_move = straddle  # ≈ 1-σ move to expiry in points
+                    self._last_implied_move = round(implied_move, 1)
+                    bars = self._daily_bars_cache
+                    rv = realized_vol(bars.sort_values("date")["close"].reset_index(drop=True),
+                                      int((self.config.get("option_filters") or {}).get("rv_lookback_days", 20))) \
+                        if (bars is not None and not bars.empty) else None
+                    if rv and implied_move > 0:
+                        expected_to_expiry = spot * rv * math.sqrt(max(T_years, 1e-9))
+                        ratio = expected_to_expiry / implied_move
+                        min_ratio = float(ev_cfg.get("min_expected_to_implied", 0.7))
+                        if ratio < min_ratio:
+                            if force_mode:
+                                logging.warning(f"FORCE-MODE: event-move gate BYPASSED (ratio {ratio:.2f}).")
+                            else:
+                                logging.warning(
+                                    f"Event-move gate: straddle implies {implied_move:.0f}pt but "
+                                    f"realized expects {expected_to_expiry:.0f}pt ({ratio:.2f}× "
+                                    f"< {min_ratio}×). Move is priced in — skipping event-day buy."
+                                )
+                                return False
+        except Exception as e:
+            logging.debug(f"Vol-surface gate skipped (non-fatal): {e}")
+        return True
+
     async def _run_chain_analysis(self, spot: float, atm_strike: float,
                                    option_type: str, expiry_date,
-                                   force_mode: bool = False):
+                                   force_mode: bool = False, event_day: bool = False):
         """
         Builds a chain snapshot, runs IV-Rank and IV/RV gates, then picks a strike
         by delta band (with offset fallback) and a liquidity check.
@@ -1026,12 +1197,20 @@ class OrderExecutionAgent:
 
         # ---------- Strike selection: delta-targeted with offset fallback ----------
         chosen = None
-        if flt.get("use_delta_targeting", True):
-            chosen = select_by_delta(
-                chain, option_type,
-                float(flt.get("target_delta_low", 0.40)),
-                float(flt.get("target_delta_high", 0.55)),
-            )
+        _dlow = float(flt.get("target_delta_low", 0.40))
+        _dhigh = float(flt.get("target_delta_high", 0.55))
+        # Phase 5b — optionally pick the most convexity-per-decay (gamma/|theta|)
+        # strike within the delta band, instead of the band midpoint by delta.
+        if flt.get("use_gamma_theta_strike", False):
+            chosen = select_by_gamma_theta(chain, option_type, _dlow, _dhigh)
+            if chosen is not None:
+                logging.info(
+                    f"Gamma/theta-efficient pick: {chosen['tradingsymbol']} "
+                    f"strike={chosen['strike']} delta={chosen['delta']:.2f} "
+                    f"gamma/|theta|={float(chosen['gamma'])/max(abs(float(chosen['theta'])),1e-9):.4f}"
+                )
+        if chosen is None and flt.get("use_delta_targeting", True):
+            chosen = select_by_delta(chain, option_type, _dlow, _dhigh)
             if chosen is not None:
                 logging.info(
                     f"Delta-targeted pick: {chosen['tradingsymbol']} "
@@ -1105,11 +1284,23 @@ class OrderExecutionAgent:
             "vega":  _gf(chosen.get("vega")),
             "iv":    _gf(chosen.get("iv")),
             "strike": _gf(chosen.get("strike")),
+            "T":     _gf(T_years),          # years to expiry at entry (Phase 3 attribution)
+            "opt_type": option_type,
         }
+
+        # ---------- Phase 2: theta-budget gate ----------
+        if not await self._theta_budget_ok(spot, self._last_pick_greeks, ref_price,
+                                            dte_days, force_mode):
+            return None
+
+        # ---------- Phase 4: skew + event-implied-move gates ----------
+        if not self._vol_surface_ok(chain, spot, atm_strike, option_type,
+                                    T_years, event_day, force_mode):
+            return None
 
         return chosen["tradingsymbol"], lot_size, ref_price
 
-    async def _get_trade_details(self, direction, force_mode: bool = False):
+    async def _get_trade_details(self, direction, force_mode: bool = False, event_day: bool = False):
         # Cleared each attempt; the chain pick (re)populates it. A legacy/offset
         # pick has no chain greeks, so it correctly stays None.
         self._last_pick_greeks = None
@@ -1179,6 +1370,7 @@ class OrderExecutionAgent:
                     option_type=option_type,
                     expiry_date=expiry_date,
                     force_mode=force_mode,
+                    event_day=event_day,
                 )
                 if result is None:
                     # An enabled chain pipeline that refuses == skip the trade.
@@ -1448,6 +1640,7 @@ class PositionManagementAgent:
         # level yet? When it does, manage() banks/locks the move the market
         # actually offered (scale out if >1 lot, tighten + breakeven otherwise).
         self.active_trade['_structure_hit']    = False
+        self.active_trade['_gamma_scalped']    = False   # Phase 5a — one scalp/trade
 
         # Snapshot the underlying spot price at entry for the give-up rule
         # (detects IV crush when spot moves in favour but premium stays flat).
@@ -1672,6 +1865,16 @@ class PositionManagementAgent:
             return await self._book_completed_trade(
                 current_price, underlying_hist_df, sentiment_agent, gemini_api_key,
                 exit_order_id=None, exit_reason='STRUCTURE_TARGET',
+            )
+
+        # 3c. GAMMA-SCALP — peel a slice once the winner's delta has grown (Phase 5a).
+        gs_result = await self._check_gamma_scalp(
+            current_price, underlying_hist_df, is_paper_trade
+        )
+        if gs_result == 'FULLY_EXITED':
+            return await self._book_completed_trade(
+                current_price, underlying_hist_df, sentiment_agent, gemini_api_key,
+                exit_order_id=None, exit_reason='GAMMA_SCALP',
             )
 
         # 4. Partial exits (T1 / T2 premium targets) — before the SL check so that
@@ -2074,6 +2277,71 @@ class PositionManagementAgent:
         self._save_state()
         return exit_price
 
+    async def _check_gamma_scalp(self, current_price: float,
+                                  underlying_hist_df, is_paper_trade: bool) -> Optional[str]:
+        """
+        Phase 5a — gamma-scalp the winner. As the underlying moves in our favour,
+        gamma grows our delta: the position becomes increasingly directional and
+        increasingly exposed to a snap-back. A quant monetises that convexity by
+        peeling off a slice once delta has grown materially. We estimate current
+        delta cheaply from the ENTRY greeks — current_δ ≈ entry_δ + γ·dS — and
+        when |current_δ| crosses `delta_trigger` (in profit, >1 lot, once per
+        trade) we book `scale_out_pct` and tighten the trail. No live chain
+        re-fetch needed. Config: gamma_scalp.{enable, delta_trigger, scale_out_pct}.
+        Returns 'FULLY_EXITED' if nothing remains, else None.
+        """
+        cfg = (self.config.get("gamma_scalp") or {})
+        trade = self.active_trade
+        if not cfg.get("enable", False) or trade.get("_gamma_scalped"):
+            return None
+        g = trade.get("greeks_entry") or {}
+        delta0, gamma0 = g.get("delta"), g.get("gamma")
+        entry_spot = float(trade.get("_entry_spot", 0) or 0)
+        if delta0 is None or gamma0 is None or entry_spot <= 0:
+            return None
+        if underlying_hist_df is None or underlying_hist_df.empty:
+            return None
+        # Only scalp a WINNER (premium above entry).
+        if float(current_price) <= float(trade.get("entry_price", 0) or 0):
+            return None
+        try:
+            cur_spot = float(underlying_hist_df.iloc[-1]["close"])
+        except Exception:
+            return None
+        dS = cur_spot - entry_spot
+        est_delta = abs(float(delta0) + float(gamma0) * dS)
+        trigger = float(cfg.get("delta_trigger", 0.75))
+        if est_delta < trigger:
+            return None
+
+        trade["_gamma_scalped"] = True
+        lot_size = int(trade.get("lot_size", 1) or 1)
+        remaining = int(trade.get("quantity", 0) or 0)
+        logging.info(
+            f"[GammaScalp] estimated δ≈{est_delta:.2f} ≥ {trigger:.2f} "
+            f"(entry δ{delta0:+.2f} + γ{gamma0:.4f}×{dS:+.0f}pt) — booking a slice."
+        )
+        if remaining > lot_size:
+            frac = float(cfg.get("scale_out_pct", 50)) / 100.0
+            orig = int(trade.get("_pe_original_qty", remaining) or remaining)
+            qty_exit = max(lot_size, int((orig * frac) // lot_size) * lot_size)
+            qty_exit = min(qty_exit, remaining - lot_size)   # keep ≥1 lot runner
+            if qty_exit >= lot_size:
+                await self._exit_partial_quantity(qty_exit, "GAMMA_SCALP",
+                                                  is_paper_trade, current_price)
+        # Lock: stop to at least breakeven + tighten the trail on the runner.
+        entry = float(trade.get("entry_price", 0) or 0)
+        if entry > 0:
+            trade["trailing_stop_loss"] = max(float(trade.get("trailing_stop_loss", 0) or 0), entry)
+            trade["initial_stop_loss"] = max(float(trade.get("initial_stop_loss", 0) or 0), entry)
+        tight = float(cfg.get("tight_trail_pct", 10.0))
+        self.tsl_config = dict(self.tsl_config)
+        self.tsl_config["percentage"] = min(float(self.tsl_config.get("percentage", 15.0)), tight)
+        self._save_state()
+        if int(trade.get("quantity", 0) or 0) <= 0:
+            return "FULLY_EXITED"
+        return None
+
     async def _check_structure_target(self, current_price: float,
                                        underlying_hist_df, is_paper_trade: bool) -> Optional[str]:
         """
@@ -2430,6 +2698,75 @@ class PositionManagementAgent:
             exit_order_id=exit_order_id, exit_reason=exit_reason,
         )
 
+    def _attribute_pnl(self, trade, exit_price, underlying_df) -> dict:
+        """
+        Phase 3 — greek P&L attribution. Decomposes the (remaining-lot) gross P&L
+        into delta / gamma / theta / vega contributions using the ENTRY greeks,
+        the underlying move, the time held and a solved EXIT implied vol:
+
+            ΔPremium ≈ δ·dS + ½·γ·dS² + θ·dt + vega·dIV   (+ residual / curvature)
+
+        Tells you, over many trades, whether your edge is DIRECTION/GAMMA (real,
+        repeatable) or VEGA (a vol-spike you got lucky on). Best-effort: returns
+        {} when entry greeks are absent; vega falls into residual if the exit-IV
+        solve fails. NOTE: with T1/T2 partials this attributes the REMAINING lots
+        only (the partials are booked separately) — exact for single-lot trades.
+        """
+        g = trade.get("greeks_entry") or {}
+        delta, gamma, theta, vega = (g.get("delta"), g.get("gamma"),
+                                     g.get("theta"), g.get("vega"))
+        if delta is None:
+            return {}
+        try:
+            qty = int(trade.get("quantity", 0) or 0)
+            entry_px = float(trade.get("entry_price", 0) or 0)
+            entry_spot = float(trade.get("_entry_spot", 0) or 0)
+            try:
+                exit_spot = float(underlying_df.iloc[-1]["close"]) \
+                    if (underlying_df is not None and not underlying_df.empty) else entry_spot
+            except Exception:
+                exit_spot = entry_spot
+            dS = exit_spot - entry_spot
+            try:
+                et = datetime.datetime.fromisoformat(trade.get("entry_time"))
+                dt_days = max((datetime.datetime.now() - et).total_seconds() / 86400.0, 0.0)
+            except Exception:
+                dt_days = 0.0
+
+            delta_pnl = (delta or 0) * dS * qty
+            gamma_pnl = 0.5 * (gamma or 0) * dS * dS * qty
+            theta_pnl = (theta or 0) * dt_days * qty
+
+            vega_pnl = None
+            try:
+                strike = g.get("strike")
+                T0 = g.get("T")
+                opt = g.get("opt_type") or ("PE" if str(trade.get("symbol", "")).endswith("PE") else "CE")
+                rate = float((self.config.get("option_filters") or {}).get("risk_free_rate", 0.07))
+                if strike and T0 and entry_spot > 0 and exit_spot > 0 and exit_price > 0:
+                    T_exit = max((T0 or 0) - dt_days / 365.0, 1e-5)
+                    exit_iv = implied_vol(float(exit_price), exit_spot, float(strike),
+                                          T_exit, rate, opt)
+                    if exit_iv and g.get("iv"):
+                        # stored vega = ΔPremium per 0.01 (1 pt) IV move
+                        vega_pnl = (vega or 0) * ((exit_iv - g["iv"]) * 100.0) * qty
+            except Exception:
+                vega_pnl = None
+
+            explained = delta_pnl + gamma_pnl + theta_pnl + (vega_pnl or 0.0)
+            gross_remaining = (float(exit_price) - entry_px) * qty if exit_price > 0 else 0.0
+            residual = gross_remaining - explained
+            return {
+                "PnlDelta": round(delta_pnl, 1),
+                "PnlGamma": round(gamma_pnl, 1),
+                "PnlTheta": round(theta_pnl, 1),
+                "PnlVega":  round(vega_pnl, 1) if vega_pnl is not None else None,
+                "PnlResidual": round(residual, 1),
+            }
+        except Exception as e:
+            logging.debug(f"P&L attribution skipped (non-fatal): {e}")
+            return {}
+
     async def _book_completed_trade(self, exit_price, underlying_df, sentiment_agent,
                                     gemini_api_key, exit_order_id=None, exit_reason="UNKNOWN"):
         trade = self.active_trade
@@ -2507,6 +2844,8 @@ class PositionManagementAgent:
             "EntryVega":  _ge.get("vega"),
             "EntryIV":    _ge.get("iv"),
         })
+        # Phase 3 — decompose this trade's P&L into greek buckets.
+        completed.update(self._attribute_pnl(trade, exit_price, underlying_df))
         if costs:
             logging.info(
                 f"[Costs] {trade['symbol']}: gross ₹{gross_pnl:,.2f} − costs "

@@ -196,6 +196,7 @@ def _decode_exit_reason(reason: str) -> str:
         "EXPIRY_GAMMA_TIME_EXIT": "Expiry gamma scalp time exit (14:30)",
         "PARTIAL_EXITS_COMPLETE": "Partial targets fully exited",
         "STRUCTURE_TARGET": "Structure S/R target reached (full exit)",
+        "GAMMA_SCALP": "Gamma-scalp — delta grew, booked the convexity",
         "KILL_SWITCH": "Operator kill switch (flattened from the dashboard)",
         "PAPER_EXIT": "Paper-mode exit (specific trigger not recorded)",
         "PAPER": "Paper-mode exit",

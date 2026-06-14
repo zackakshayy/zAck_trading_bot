@@ -82,7 +82,8 @@ def log_trade(trade_details):
             trade_details['ProfitLoss_Pct'] = 0.0
 
         all_columns = ['Timestamp', 'OrderID', 'Symbol', 'TradeType', 'EntryPrice', 'ExitPrice', 'Quantity', 'ProfitLoss', 'ProfitLoss_Pct', 'Status', 'Strategy', 'Rationale',
-                       'EntryDelta', 'EntryGamma', 'EntryTheta', 'EntryVega', 'EntryIV']
+                       'EntryDelta', 'EntryGamma', 'EntryTheta', 'EntryVega', 'EntryIV',
+                       'PnlDelta', 'PnlGamma', 'PnlTheta', 'PnlVega', 'PnlResidual']
         
         # Ensure all keys exist in the dictionary to prevent errors
         for col in all_columns:
